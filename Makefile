@@ -1,4 +1,4 @@
-.PHONY: venv lint test clean
+.PHONY: venv lint test integration clean
 
 venv:
 	python3.11 -m venv .venv
@@ -11,6 +11,9 @@ lint:
 
 test:
 	.venv/bin/pytest --cov=netaudit --cov-fail-under=80
+
+integration:
+	.venv/bin/pytest -m integration -v
 
 clean:
 	rm -rf .venv __pycache__ .mypy_cache .ruff_cache .pytest_cache dist *.egg-info
