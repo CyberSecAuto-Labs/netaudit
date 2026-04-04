@@ -34,3 +34,7 @@ select = ["E", "F", "W", "I"]
 
 [tool.mypy]
 strict = true
+
+[tool.pytest.ini_options]
+markers = ["integration: mark test as requiring strace (Linux only)"]
+addopts = "-m 'not integration'"
