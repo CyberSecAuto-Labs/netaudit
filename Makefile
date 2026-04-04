@@ -10,7 +10,7 @@ lint:
 	.venv/bin/mypy netaudit/
 
 test:
-	.venv/bin/pytest --cov=netaudit
+	.venv/bin/pytest --cov=netaudit --cov-fail-under=80
 
 clean:
 	rm -rf .venv __pycache__ .mypy_cache .ruff_cache .pytest_cache dist *.egg-info
