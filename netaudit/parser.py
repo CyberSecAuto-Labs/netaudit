@@ -20,21 +20,23 @@ _RESULT = r"\)\s*=\s*(?P<result>-?\d+)"
 
 _RE_INET = re.compile(
     _HEADER
-    + r"connect\(\d+,\s*\{sa_family=(?P<family>AF_INET),"
-    + r'\s*sin_addr=inet_addr\("(?P<addr>[^"]+)"\),'
-    + r"\s*sin_port=htons\((?P<port>\d+)\)"
+    + r"connect\(\d+,\s*\{sa_family=(?P<family>AF_INET),(?P<struct>[^}]*)\}"
     + r".*?"
     + _RESULT,
 )
+# Field extractors for AF_INET struct — order varies across strace versions
+_RE_INET_ADDR = re.compile(r'sin_addr=inet_addr\("(?P<addr>[^"]+)"\)')
+_RE_INET_PORT = re.compile(r"sin_port=htons\((?P<port>\d+)\)")
 
 _RE_INET6 = re.compile(
     _HEADER
-    + r"connect\(\d+,\s*\{sa_family=(?P<family>AF_INET6),"
-    + r'\s*sin6_addr=inet_pton\(AF_INET6,\s*"(?P<addr>[^"]+)"\),'
-    + r"\s*sin6_port=htons\((?P<port>\d+)\)"
+    + r"connect\(\d+,\s*\{sa_family=(?P<family>AF_INET6),(?P<struct>[^}]*)\}"
     + r".*?"
     + _RESULT,
 )
+# Field extractors for AF_INET6 struct — order varies across strace versions
+_RE_INET6_ADDR = re.compile(r'sin6_addr=inet_pton\(AF_INET6,\s*"(?P<addr>[^"]+)"\)')
+_RE_INET6_PORT = re.compile(r"sin6_port=htons\((?P<port>\d+)\)")
 
 _RE_UNIX = re.compile(
     _HEADER
@@ -119,31 +121,39 @@ class StraceParser:
                 raw_line=line,
             )
 
-        # AF_INET
+        # AF_INET — extract addr/port from struct body (field order varies by strace version)
         m = _RE_INET.match(line)
         if m:
-            return ConnectEvent(
-                pid=int(m.group("pid")),
-                timestamp=_parse_ts(m.group("ts")),
-                family=m.group("family"),
-                addr=m.group("addr"),
-                port=int(m.group("port")),
-                result=_normalise_result(int(m.group("result")), line),
-                raw_line=line,
-            )
+            struct = m.group("struct")
+            addr_m = _RE_INET_ADDR.search(struct)
+            port_m = _RE_INET_PORT.search(struct)
+            if addr_m and port_m:
+                return ConnectEvent(
+                    pid=int(m.group("pid")),
+                    timestamp=_parse_ts(m.group("ts")),
+                    family=m.group("family"),
+                    addr=addr_m.group("addr"),
+                    port=int(port_m.group("port")),
+                    result=_normalise_result(int(m.group("result")), line),
+                    raw_line=line,
+                )
 
-        # AF_INET6
+        # AF_INET6 — extract addr/port from struct body (field order varies by strace version)
         m = _RE_INET6.match(line)
         if m:
-            return ConnectEvent(
-                pid=int(m.group("pid")),
-                timestamp=_parse_ts(m.group("ts")),
-                family=m.group("family"),
-                addr=m.group("addr"),
-                port=int(m.group("port")),
-                result=_normalise_result(int(m.group("result")), line),
-                raw_line=line,
-            )
+            struct = m.group("struct")
+            addr_m6 = _RE_INET6_ADDR.search(struct)
+            port_m6 = _RE_INET6_PORT.search(struct)
+            if addr_m6 and port_m6:
+                return ConnectEvent(
+                    pid=int(m.group("pid")),
+                    timestamp=_parse_ts(m.group("ts")),
+                    family=m.group("family"),
+                    addr=addr_m6.group("addr"),
+                    port=int(port_m6.group("port")),
+                    result=_normalise_result(int(m.group("result")), line),
+                    raw_line=line,
+                )
 
         # AF_UNIX (named path)
         m = _RE_UNIX.match(line)
