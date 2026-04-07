@@ -1,8 +1,8 @@
 site_name: netaudit
 site_description: CI-native network egress auditing via strace
 site_url: https://netaudit.readthedocs.io
-repo_url: https://github.com/Azakira/netaudit
-repo_name: Azakira/netaudit
+repo_url: https://github.com/CyberSecAuto-Labs/netaudit
+repo_name: CyberSecAuto-Labs/netaudit
 edit_uri: edit/main/docs/
 
 theme:

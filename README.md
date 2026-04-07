@@ -1,6 +1,6 @@
 # netaudit
 
-[![CI](https://github.com/Azakira/netaudit/actions/workflows/ci.yml/badge.svg)](https://github.com/Azakira/netaudit/actions/workflows/ci.yml)
+[![CI](https://github.com/CyberSecAuto-Labs/netaudit/actions/workflows/ci.yml/badge.svg)](https://github.com/CyberSecAuto-Labs/netaudit/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/netaudit)](https://pypi.org/project/netaudit/)
 [![Python](https://img.shields.io/pypi/pyversions/netaudit)](https://pypi.org/project/netaudit/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
