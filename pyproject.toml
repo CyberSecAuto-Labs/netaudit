@@ -25,6 +25,10 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
 ]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
+]
 
 [tool.ruff]
 line-length = 100

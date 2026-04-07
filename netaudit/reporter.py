@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 from dataclasses import dataclass, field
-from typing import TextIO
+from typing import Any, TextIO
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
@@ -89,3 +90,21 @@ class Reporter:
         if stream is not None:
             stream.write(result)
         return result
+
+    @staticmethod
+    def format_json(violations: list[Violation]) -> str:
+        """Render violations as a JSON string."""
+        data: dict[str, Any] = {
+            "violations": [
+                {
+                    "family": v.family,
+                    "addr": v.addr,
+                    "port": v.port,
+                    "count": v.count,
+                    "pids": sorted(v.pids),
+                }
+                for v in violations
+            ],
+            "summary": {"total": len(violations)},
+        }
+        return json.dumps(data, indent=2)
