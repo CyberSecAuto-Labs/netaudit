@@ -21,6 +21,9 @@ htmlcov/
 # netaudit
 .strace-out/
 
+# Docs
+site/
+
 # Distribution
 *.whl
 *.tar.gz
