@@ -7,7 +7,7 @@ The allowlist is a YAML file that declares which network connections your proces
 ```yaml
 version: 1
 allowlist:
-  - comment: "Human-readable note (optional)"
+  - name: "Human-readable note (optional)"
     family: AF_INET
     addr: 10.0.0.1
     port: 443
@@ -25,13 +25,13 @@ Allow connections to a specific IPv4 address or CIDR range.
 
 ```yaml
 # Exact address
-- comment: "Internal proxy"
+- name: "Internal proxy"
   family: AF_INET
   addr: 10.0.0.1
   port: 9393
 
 # CIDR range (any port)
-- comment: "RFC-1918 private range"
+- name: "RFC-1918 private range"
   family: AF_INET
   cidr: 10.0.0.0/8
 ```
@@ -47,7 +47,7 @@ Fields:
 ### `AF_INET6` — IPv6
 
 ```yaml
-- comment: "IPv6 public DNS"
+- name: "IPv6 public DNS"
   family: AF_INET6
   addr: "2001:4860:4860::8888"
   port: 53
@@ -62,7 +62,7 @@ Fields:
 Allow Unix socket connections matching a glob pattern.
 
 ```yaml
-- comment: "GVM management socket"
+- name: "GVM management socket"
   family: AF_UNIX
   path_prefix: /run/gvmd/
 
@@ -87,7 +87,7 @@ Fields:
 Allow all AF_NETLINK connections (used by glibc resolver internals).
 
 ```yaml
-- comment: "glibc resolver"
+- name: "glibc resolver"
   family: AF_NETLINK
 ```
 
@@ -121,17 +121,17 @@ allowlist:
 ```yaml title="netaudit.yaml"
 version: 1
 allowlist:
-  - comment: "PyPI"
+  - name: "PyPI"
     family: AF_INET
     cidr: 151.101.0.0/16
     port: 443
 
-  - comment: "Internal artifact registry"
+  - name: "Internal artifact registry"
     family: AF_INET
     addr: 10.1.2.3
     port: 8081
 
-  - comment: "IPv6 PyPI mirror"
+  - name: "IPv6 PyPI mirror"
     family: AF_INET6
     addr: "2a04:4e42::223"
     port: 443

@@ -27,7 +27,7 @@ sudo dnf install strace       # RHEL/Fedora
 ```yaml
 version: 1
 allowlist:
-  - comment: "Internal API"
+  - name: "Internal API"
     family: AF_INET
     addr: 10.0.0.1
     port: 8080
