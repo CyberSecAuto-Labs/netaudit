@@ -206,7 +206,21 @@ def pytest_configure(config: pytest.Config) -> None:
         _ENV_STRACE_OUT: strace_path,
         _ENV_MARKERS_OUT: markers_path,
     }
-    cmd = ["strace", "-e", "trace=connect", "-f", "-tt", "-o", strace_path] + sys.argv
+    # Reconstruct as `python -m pytest <args>` so the command is valid regardless
+    # of whether pytest was invoked via its entry-point script or `python -m pytest`
+    # (in the latter case sys.argv[0] is the non-executable __main__.py path).
+    cmd = [
+        "strace",
+        "-e",
+        "trace=connect",
+        "-f",
+        "-tt",
+        "-o",
+        strace_path,
+        sys.executable,
+        "-m",
+        "pytest",
+    ] + sys.argv[1:]
     os.execvpe("strace", cmd, env)
     # unreachable — execvpe replaces the current process image
 

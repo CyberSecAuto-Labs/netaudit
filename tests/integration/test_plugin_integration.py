@@ -22,7 +22,7 @@ class TestPluginSession:
                     s.close()
             """
         )
-        result = pytester.runpytest("--netaudit")
+        result = pytester.runpytest_subprocess("--netaudit")
         result.assert_outcomes(passed=1)
         assert result.ret == 0
 
@@ -41,7 +41,7 @@ class TestPluginSession:
                     s.close()
             """
         )
-        result = pytester.runpytest("--netaudit")
+        result = pytester.runpytest_subprocess("--netaudit")
         assert result.ret != 0
         result.stdout.fnmatch_lines(["*netaudit*violation*"])
 
@@ -70,7 +70,7 @@ allowlist:
                     s.close()
             """
         )
-        result = pytester.runpytest("--netaudit", "--netaudit-allowlist", str(allowlist))
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-allowlist", str(allowlist))
         result.assert_outcomes(passed=1)
         assert result.ret == 0
 
@@ -92,11 +92,12 @@ allowlist:
                     s.close()
             """
         )
-        result = pytester.runpytest("--netaudit")
+        result = pytester.runpytest_subprocess("--netaudit")
         assert result.ret != 0
         result.stdout.fnmatch_lines(["*test_violator*"])
 
-    def test_no_tests_no_violations(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile("# empty test file")
-        result = pytester.runpytest("--netaudit")
+    def test_no_network_calls_no_violations(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile("def test_pure(): pass")
+        result = pytester.runpytest_subprocess("--netaudit")
+        result.assert_outcomes(passed=1)
         assert result.ret == 0

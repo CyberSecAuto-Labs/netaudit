@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -342,6 +343,10 @@ class TestPytestConfigure:
         assert args[0] == "strace"
         assert "-e" in args
         assert "trace=connect" in args
+        # Command must invoke python -m pytest (not sys.argv[0] directly)
+        assert sys.executable in args
+        assert "-m" in args
+        assert "pytest" in args
         assert _ENV_STRACE_OUT in env
         assert _ENV_MARKERS_OUT in env
 

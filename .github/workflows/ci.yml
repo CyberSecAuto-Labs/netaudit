@@ -42,7 +42,7 @@ jobs:
       - name: Install dev dependencies
         run: pip install -e ".[dev]"
       - name: Run tests
-        run: pytest --cov=netaudit --cov-fail-under=80
+        run: pytest -m 'not integration' --cov=netaudit --cov-fail-under=80
 
   integration:
     name: Integration Tests (strace)
