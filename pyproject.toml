@@ -9,6 +9,21 @@ description = "CI-native network egress auditing via strace"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
+authors = [{ name = "CyberSecAuto-Labs" }]
+keywords = ["strace", "network", "security", "ci", "auditing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+]
+urls = { Homepage = "https://github.com/CyberSecAuto-Labs/netaudit", Documentation = "https://netaudit.readthedocs.io" }
 dependencies = [
     "click>=8.0",
     "pyyaml>=6.0",
@@ -16,6 +31,9 @@ dependencies = [
 
 [project.scripts]
 netaudit = "netaudit.cli:main"
+
+[project.entry-points."pytest11"]
+netaudit = "netaudit.integrations.pytest_plugin"
 
 [project.optional-dependencies]
 dev = [

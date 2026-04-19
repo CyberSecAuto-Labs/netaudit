@@ -43,4 +43,5 @@ nav:
   - Overview: index.md
   - CLI Reference: cli-reference.md
   - Allowlist DSL: allowlist-dsl.md
+  - pytest Plugin: pytest-plugin.md
   - Architecture: architecture.md
