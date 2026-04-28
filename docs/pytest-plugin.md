@@ -16,12 +16,13 @@ pytest --netaudit
 
 ## Permanent activation
 
-Add to `pyproject.toml` to avoid passing `--netaudit` every time:
+Add to `pyproject.toml` to avoid passing flags every time:
 
 ```toml
 [tool.netaudit]
 enabled = true
 allowlist = "netaudit.yaml"
+verbose = true   # optional: show all events, not just violations
 ```
 
 !!! note
@@ -45,6 +46,32 @@ The plugin resolves the allowlist in this priority order:
 |---|---|
 | `--netaudit` | Enable network auditing for this session |
 | `--netaudit-allowlist YAML` | Path to allowlist YAML file |
+| `--netaudit-verbose` | Show all network events (allowed and violations) with rule names |
+
+## Verbose mode
+
+Pass `--netaudit-verbose` (or set `verbose = true` in `[tool.netaudit]`) to see every `connect()` event — not just violations. Allowed events are annotated with the matching rule name; violations are marked `VIOLATION`. The session still fails if any violations are found.
+
+```
+============================================================
+  netaudit: verbose network event report
+============================================================
+
+  [tests/test_api.py::test_fetch_data]
+FAMILY       ADDR:PORT                      STATUS     RULE
+------------ ------------------------------ ---------- ------------------------
+AF_INET      127.0.0.1:5432                OK         loopback (IPv4)
+AF_INET      93.184.216.34:443             VIOLATION  -
+============================================================
+```
+
+Resolution order for `verbose`:
+
+| Priority | Source |
+|---|---|
+| 1 | `--netaudit-verbose` CLI flag |
+| 2 | `verbose = true` in `[tool.netaudit]` in `pyproject.toml` |
+| 3 | Default: off |
 
 ## Output
 
