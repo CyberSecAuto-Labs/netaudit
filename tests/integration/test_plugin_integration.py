@@ -105,7 +105,19 @@ allowlist:
 
 class TestPluginVerbose:
     def test_verbose_flag_shows_table_headers(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile("def test_pure(): pass")
+        pytester.makepyfile(
+            """
+            def test_loopback():
+                import socket
+                s = socket.socket()
+                try:
+                    s.connect(("127.0.0.1", 9))
+                except OSError:
+                    pass
+                finally:
+                    s.close()
+            """
+        )
         result = pytester.runpytest_subprocess("--netaudit", "--netaudit-verbose")
         result.assert_outcomes(passed=1)
         assert result.ret == 0
@@ -150,7 +162,19 @@ class TestPluginVerbose:
         result.stdout.fnmatch_lines(["*VIOLATION*"])
 
     def test_verbose_via_pyproject_toml(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile("def test_pure(): pass")
+        pytester.makepyfile(
+            """
+            def test_loopback():
+                import socket
+                s = socket.socket()
+                try:
+                    s.connect(("127.0.0.1", 9))
+                except OSError:
+                    pass
+                finally:
+                    s.close()
+            """
+        )
         pytester.makefile(
             ".toml",
             pyproject="[tool.netaudit]\nverbose = true\n",
