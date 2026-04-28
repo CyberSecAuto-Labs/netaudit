@@ -183,3 +183,77 @@ class TestAllowListFromYaml:
         # Built-ins still active
         assert al.is_allowed(_event("AF_INET", "127.0.0.1", 80))
         assert not al.is_allowed(_event("AF_INET", "8.8.8.8", 53))
+
+
+class TestRuleName:
+    def test_ipv4_rule_default_name(self) -> None:
+        assert IPv4Rule("10.0.0.0/8").name == ""
+
+    def test_ipv4_rule_custom_name(self) -> None:
+        assert IPv4Rule("10.0.0.0/8", name="internal").name == "internal"
+
+    def test_ipv6_rule_name(self) -> None:
+        assert IPv6Rule("::1/128", name="loopback").name == "loopback"
+
+    def test_unix_rule_name(self) -> None:
+        assert UnixSocketRule("*", name="all unix").name == "all unix"
+
+    def test_netlink_rule_name(self) -> None:
+        assert NetlinkRule(name="netlink").name == "netlink"
+
+    def test_builtin_names(self) -> None:
+        from netaudit.allowlist import _BUILTIN_RULES
+
+        names = [r.name for r in _BUILTIN_RULES]
+        assert "loopback (IPv4)" in names
+        assert "loopback (IPv6)" in names
+        assert "unix (builtin)" in names
+        assert "netlink (builtin)" in names
+
+    def test_rule_from_dict_passes_name(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "allowlist.yaml"
+        yaml_file.write_text(
+            "version: 1\nallowlist:\n  - name: MyRule\n    family: AF_INET\n    addr: 1.2.3.4\n"
+        )
+        al = AllowList.from_yaml(yaml_file)
+        rule = al.match(_event("AF_INET", "1.2.3.4"))
+        assert rule is not None
+        assert rule.name == "MyRule"
+
+    def test_rule_from_dict_no_name_defaults_empty(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "allowlist.yaml"
+        yaml_file.write_text("version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n")
+        al = AllowList.from_yaml(yaml_file)
+        rule = al.match(_event("AF_INET", "1.2.3.4"))
+        assert rule is not None
+        assert rule.name == ""
+
+
+class TestAllowListMatch:
+    def test_match_returns_rule(self) -> None:
+        al = AllowList.empty()
+        rule = al.match(_event("AF_INET", "127.0.0.1", 80))
+        assert rule is not None
+        assert rule.name == "loopback (IPv4)"
+
+    def test_match_returns_none_for_violation(self) -> None:
+        al = AllowList.empty()
+        assert al.match(_event("AF_INET", "198.51.100.1", 443)) is None
+
+    def test_match_unix_builtin(self) -> None:
+        al = AllowList.empty()
+        rule = al.match(_event("AF_UNIX", "/run/foo.sock"))
+        assert rule is not None
+        assert rule.name == "unix (builtin)"
+
+    def test_match_netlink_builtin(self) -> None:
+        al = AllowList.empty()
+        rule = al.match(_event("AF_NETLINK"))
+        assert rule is not None
+        assert rule.name == "netlink (builtin)"
+
+    def test_match_custom_rule_name(self) -> None:
+        al = AllowList([IPv4Rule("10.0.0.0/8", name="private")], includes_builtins=False)
+        rule = al.match(_event("AF_INET", "10.1.2.3"))
+        assert rule is not None
+        assert rule.name == "private"

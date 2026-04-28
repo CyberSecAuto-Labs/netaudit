@@ -55,6 +55,7 @@ Full docs at **[netaudit.readthedocs.io](https://netaudit.readthedocs.io)**:
 - [CLI Reference](docs/cli-reference.md)
 - [Allowlist DSL](docs/allowlist-dsl.md)
 - [Architecture](docs/architecture.md)
+- [pytest Plugin](docs/pytest-plugin.md)
 
 ## How it works
 

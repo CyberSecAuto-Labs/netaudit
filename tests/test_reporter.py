@@ -1,6 +1,7 @@
 """Tests for netaudit.reporter."""
 
 import io
+import json
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
@@ -126,3 +127,85 @@ class TestReporterFormat:
         v.pids.add(1)
         v.count = 1
         assert "<unknown>" in str(v)
+
+
+class TestReporterFormatVerbose:
+    def test_header_present(self) -> None:
+        al = AllowList.empty()
+        result = Reporter.format_verbose([], al)
+        assert "FAMILY" in result
+        assert "ADDR:PORT" in result
+        assert "STATUS" in result
+        assert "RULE" in result
+
+    def test_allowed_event_shows_ok_and_rule(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "127.0.0.1", 80)]
+        result = Reporter.format_verbose(events, al)
+        assert "OK" in result
+        assert "loopback (IPv4)" in result
+
+    def test_violation_event_shows_violation(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "198.51.100.1", 443)]
+        result = Reporter.format_verbose(events, al)
+        assert "VIOLATION" in result
+
+    def test_unix_event_shows_builtin_name(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_UNIX", "/run/foo.sock")]
+        result = Reporter.format_verbose(events, al)
+        assert "unix (builtin)" in result
+
+    def test_writes_to_stream(self) -> None:
+        al = AllowList.empty()
+        stream = io.StringIO()
+        Reporter.format_verbose([], al, stream=stream)
+        assert stream.getvalue() != ""
+
+    def test_empty_events_only_header(self) -> None:
+        al = AllowList.empty()
+        result = Reporter.format_verbose([], al)
+        lines = [ln for ln in result.splitlines() if ln.strip()]
+        assert len(lines) == 2  # header + separator
+
+
+class TestReporterFormatJsonVerbose:
+    def test_include_allowed_adds_events_key(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "127.0.0.1", 80), _event("AF_INET", "198.51.100.1", 443)]
+        violations = Reporter.check(events, al)
+        data = json.loads(
+            Reporter.format_json(violations, events=events, allowlist=al, include_allowed=True)
+        )
+        assert "events" in data
+        assert len(data["events"]) == 2
+
+    def test_allowed_entry_has_status_and_rule(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "127.0.0.1", 80)]
+        violations = Reporter.check(events, al)
+        data = json.loads(
+            Reporter.format_json(violations, events=events, allowlist=al, include_allowed=True)
+        )
+        entry = data["events"][0]
+        assert entry["status"] == "allowed"
+        assert entry["rule"] == "loopback (IPv4)"
+
+    def test_violation_entry_has_status_and_null_rule(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "198.51.100.1", 443)]
+        violations = Reporter.check(events, al)
+        data = json.loads(
+            Reporter.format_json(violations, events=events, allowlist=al, include_allowed=True)
+        )
+        entry = data["events"][0]
+        assert entry["status"] == "violation"
+        assert entry["rule"] is None
+
+    def test_no_include_allowed_omits_events_key(self) -> None:
+        al = AllowList.empty()
+        events = [_event("AF_INET", "127.0.0.1", 80)]
+        violations = Reporter.check(events, al)
+        data = json.loads(Reporter.format_json(violations))
+        assert "events" not in data
