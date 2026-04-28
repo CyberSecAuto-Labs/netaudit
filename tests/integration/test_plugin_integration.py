@@ -101,3 +101,61 @@ allowlist:
         result = pytester.runpytest_subprocess("--netaudit")
         result.assert_outcomes(passed=1)
         assert result.ret == 0
+
+
+class TestPluginVerbose:
+    def test_verbose_flag_shows_table_headers(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile("def test_pure(): pass")
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-verbose")
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*FAMILY*ADDR*STATUS*"])
+
+    def test_verbose_shows_allowed_events(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            def test_loopback():
+                import socket
+                s = socket.socket()
+                try:
+                    s.connect(("127.0.0.1", 9))
+                except OSError:
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-verbose")
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*OK*"])
+
+    def test_verbose_violations_still_fail(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-verbose")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*VIOLATION*"])
+
+    def test_verbose_via_pyproject_toml(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile("def test_pure(): pass")
+        pytester.makefile(
+            ".toml",
+            pyproject="[tool.netaudit]\nverbose = true\n",
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*FAMILY*ADDR*STATUS*"])
