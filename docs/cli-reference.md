@@ -27,6 +27,7 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 |--------|---------|-------------|
 | `--allowlist YAML` | `netaudit.yaml` in cwd | Path to allowlist file |
 | `--format {text,json}` | `text` | Output format |
+| `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -45,6 +46,9 @@ netaudit run -- pytest
 
 # Explicit allowlist, JSON output
 netaudit run --allowlist ci-allowlist.yaml --format json -- make test
+
+# Show every network call with its matching rule
+netaudit run --verbose -- curl https://example.com
 
 # Trace a single curl call
 netaudit run -- curl https://example.com
@@ -66,6 +70,7 @@ netaudit analyze [OPTIONS] STRACE_LOG
 |--------|---------|-------------|
 | `--allowlist YAML` | `netaudit.yaml` in cwd | Path to allowlist file |
 | `--format {text,json}` | `text` | Output format |
+| `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -80,6 +85,9 @@ netaudit analyze [OPTIONS] STRACE_LOG
 ```bash
 # Analyze a previously captured trace
 netaudit analyze /tmp/strace-output.log
+
+# Show every event, annotated with rule names
+netaudit analyze --verbose /tmp/strace-output.log
 
 # JSON report from CI artifact
 netaudit analyze --format json trace.log > report.json
@@ -98,6 +106,19 @@ netaudit analyze --format json trace.log > report.json
 ============================================================
 ```
 
+## Verbose text output format (`--verbose`)
+
+Shows every network event — allowed and violating alike — annotated with the matching rule name.
+
+```
+FAMILY       ADDR:PORT                      STATUS     RULE
+------------ ------------------------------ ---------- ------------------------
+AF_INET      127.0.0.1:80                   OK         loopback (IPv4)
+AF_UNIX      /run/dbus/system_bus_socket    OK         unix (builtin)
+AF_NETLINK   -                              OK         netlink (builtin)
+AF_INET      93.184.216.34:443              VIOLATION  -
+```
+
 ## JSON output format
 
 ```json
@@ -114,5 +135,22 @@ netaudit analyze --format json trace.log > report.json
   "summary": {
     "total": 1
   }
+}
+```
+
+## Verbose JSON output format (`--verbose --format json`)
+
+Adds an `"events"` array containing every network event with `"status"` and `"rule"` fields.
+
+```json
+{
+  "events": [
+    {"family": "AF_INET", "addr": "127.0.0.1", "port": 80, "status": "allowed", "rule": "loopback (IPv4)"},
+    {"family": "AF_INET", "addr": "93.184.216.34", "port": 443, "status": "violation", "rule": null}
+  ],
+  "violations": [
+    {"family": "AF_INET", "addr": "93.184.216.34", "port": 443, "count": 1, "pids": [1234]}
+  ],
+  "summary": {"total": 1}
 }
 ```

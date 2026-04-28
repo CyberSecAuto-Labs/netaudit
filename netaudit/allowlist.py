@@ -17,6 +17,8 @@ from netaudit.parser import ConnectEvent
 
 
 class Rule(Protocol):
+    name: str
+
     def matches(self, event: ConnectEvent) -> bool: ...
 
 
@@ -28,8 +30,9 @@ class Rule(Protocol):
 class IPv4Rule:
     """Allow connections whose destination falls within a CIDR block."""
 
-    def __init__(self, cidr: str) -> None:
+    def __init__(self, cidr: str, name: str = "") -> None:
         self._network = ipaddress.IPv4Network(cidr, strict=False)
+        self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
         if event.family != "AF_INET" or event.addr is None:
@@ -43,8 +46,9 @@ class IPv4Rule:
 class IPv6Rule:
     """Allow connections whose destination falls within an IPv6 CIDR block."""
 
-    def __init__(self, cidr: str) -> None:
+    def __init__(self, cidr: str, name: str = "") -> None:
         self._network = ipaddress.IPv6Network(cidr, strict=False)
+        self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
         if event.family != "AF_INET6" or event.addr is None:
@@ -58,8 +62,9 @@ class IPv6Rule:
 class UnixSocketRule:
     """Allow Unix socket connections whose path matches a glob pattern."""
 
-    def __init__(self, path_glob: str) -> None:
+    def __init__(self, path_glob: str, name: str = "") -> None:
         self._glob = path_glob
+        self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
         if event.family != "AF_UNIX" or event.addr is None:
@@ -70,6 +75,9 @@ class UnixSocketRule:
 class NetlinkRule:
     """Allow all AF_NETLINK connections (glibc resolver internals etc.)."""
 
+    def __init__(self, name: str = "") -> None:
+        self.name = name
+
     def matches(self, event: ConnectEvent) -> bool:
         return event.family == "AF_NETLINK"
 
@@ -79,10 +87,10 @@ class NetlinkRule:
 # ---------------------------------------------------------------------------
 
 _BUILTIN_RULES: list[Rule] = [
-    IPv4Rule("127.0.0.0/8"),  # IPv4 loopback
-    IPv6Rule("::1/128"),  # IPv6 loopback
-    UnixSocketRule("*"),  # all AF_UNIX
-    NetlinkRule(),  # all AF_NETLINK
+    IPv4Rule("127.0.0.0/8", name="loopback (IPv4)"),
+    IPv6Rule("::1/128", name="loopback (IPv6)"),
+    UnixSocketRule("*", name="unix (builtin)"),
+    NetlinkRule(name="netlink (builtin)"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -91,18 +99,19 @@ _BUILTIN_RULES: list[Rule] = [
 
 
 def _rule_from_dict(entry: dict[str, Any]) -> Rule:
+    name = entry.get("name", "")
     family = entry.get("family", "")
     if family == "AF_INET":
         cidr = entry.get("cidr") or f"{entry['addr']}/32"
-        return IPv4Rule(cidr)
+        return IPv4Rule(cidr, name=name)
     if family == "AF_INET6":
         cidr = entry.get("cidr") or f"{entry['addr']}/128"
-        return IPv6Rule(cidr)
+        return IPv6Rule(cidr, name=name)
     if family == "AF_UNIX":
         glob = entry.get("path_glob") or entry.get("path_prefix", "") + "*"
-        return UnixSocketRule(glob)
+        return UnixSocketRule(glob, name=name)
     if family == "AF_NETLINK":
-        return NetlinkRule()
+        return NetlinkRule(name=name)
     raise ValueError(f"Unknown family in allowlist entry: {family!r}")
 
 
@@ -126,5 +135,12 @@ class AllowList:
         """Allowlist with only built-in rules."""
         return cls([], includes_builtins=True)
 
+    def match(self, event: ConnectEvent) -> Rule | None:
+        """Return the first rule that matches *event*, or ``None``."""
+        for rule in self._rules:
+            if rule.matches(event):
+                return rule
+        return None
+
     def is_allowed(self, event: ConnectEvent) -> bool:
-        return any(rule.matches(event) for rule in self._rules)
+        return self.match(event) is not None

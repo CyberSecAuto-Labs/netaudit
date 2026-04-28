@@ -15,6 +15,8 @@ allowlist:
 
 The top-level `version` key must be `1`. Each entry in `allowlist` is a rule.
 
+The optional `name` field is a human-readable label for the rule. It is displayed in `--verbose` output next to each allowed connection, making it easy to trace which rule permitted a given call.
+
 ---
 
 ## Rule types

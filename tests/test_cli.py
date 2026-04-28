@@ -209,3 +209,90 @@ class TestMetaCommands:
         assert result.exit_code == 0
         assert "run" in result.output
         assert "analyze" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --verbose flag
+# ---------------------------------------------------------------------------
+
+
+class TestVerboseFlag:
+    def test_analyze_verbose_shows_table(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        result = CliRunner().invoke(main, ["analyze", "--verbose", str(log)])
+
+        assert result.exit_code == 0
+        assert "FAMILY" in result.output
+        assert "STATUS" in result.output
+
+    def test_analyze_verbose_allowed_event_shows_ok(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        result = CliRunner().invoke(main, ["analyze", "-v", str(log)])
+
+        assert "OK" in result.output
+        assert "unix (builtin)" in result.output
+
+    def test_analyze_verbose_violation_shows_violation(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+
+        result = CliRunner().invoke(main, ["analyze", "--verbose", str(log)])
+
+        assert result.exit_code == 1
+        assert "VIOLATION" in result.output
+
+    def test_analyze_verbose_json_includes_events(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        result = CliRunner().invoke(main, ["analyze", "--verbose", "--format", "json", str(log)])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert "events" in data
+        assert data["events"][0]["status"] == "allowed"
+
+    def test_run_verbose_shows_table(self, tmp_path: Path) -> None:
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(_STRACE_LOG_CLEAN)
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0)
+
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+        ):
+            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
+            with patch("pathlib.Path.unlink"):
+                result = CliRunner().invoke(main, ["run", "--verbose", "--", "echo", "hi"])
+
+        assert result.exit_code == 0
+        assert "FAMILY" in result.output
+        assert "STATUS" in result.output
+
+    def test_run_verbose_json_includes_events(self, tmp_path: Path) -> None:
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(_STRACE_LOG_VIOLATION)
+
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0)
+
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+        ):
+            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
+            with patch("pathlib.Path.unlink"):
+                result = CliRunner().invoke(
+                    main, ["run", "--verbose", "--format", "json", "--", "curl", "8.8.8.8"]
+                )
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert "events" in data
+        assert data["events"][0]["status"] == "violation"

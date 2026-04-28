@@ -10,7 +10,7 @@ import click
 
 from netaudit import __version__
 from netaudit.allowlist import AllowList
-from netaudit.parser import StraceParser
+from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import Reporter, Violation
 from netaudit.runner import StraceNotFoundError, StraceRunner
 
@@ -31,10 +31,24 @@ def _load_allowlist(allowlist: str | None) -> AllowList:
     return AllowList.empty()
 
 
-def _emit(violations: list[Violation], fmt: str) -> None:
-
+def _emit(
+    violations: list[Violation],
+    fmt: str,
+    verbose: bool = False,
+    events: list[ConnectEvent] | None = None,
+    allowlist: AllowList | None = None,
+) -> None:
     if fmt == "json":
-        click.echo(Reporter.format_json(violations))
+        click.echo(
+            Reporter.format_json(
+                violations,
+                events=events if verbose else None,
+                allowlist=allowlist if verbose else None,
+                include_allowed=verbose,
+            )
+        )
+    elif verbose and events is not None and allowlist is not None:
+        Reporter.format_verbose(events, allowlist, stream=sys.stdout)
     else:
         Reporter.format(violations, stream=sys.stdout)
 
@@ -60,8 +74,9 @@ def main() -> None:
     show_default=True,
     help="Output format.",
 )
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Show all network events.")
 @click.argument("command", nargs=-1, required=True)
-def run_cmd(allowlist: str | None, fmt: str, command: tuple[str, ...]) -> None:
+def run_cmd(allowlist: str | None, fmt: str, verbose: bool, command: tuple[str, ...]) -> None:
     """Trace COMMAND under strace and report network violations."""
     try:
         runner = StraceRunner()
@@ -78,7 +93,7 @@ def run_cmd(allowlist: str | None, fmt: str, command: tuple[str, ...]) -> None:
         runner.run(list(command), strace_out)
         events = StraceParser().parse_stream(strace_out.read_text().splitlines())
         violations = Reporter.check(events, al)
-        _emit(violations, fmt)
+        _emit(violations, fmt, verbose=verbose, events=events, allowlist=al)
         sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
         strace_out.unlink(missing_ok=True)
@@ -99,11 +114,12 @@ def run_cmd(allowlist: str | None, fmt: str, command: tuple[str, ...]) -> None:
     show_default=True,
     help="Output format.",
 )
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Show all network events.")
 @click.argument("strace_log", type=click.Path(exists=True, dir_okay=False))
-def analyze_cmd(allowlist: str | None, fmt: str, strace_log: str) -> None:
+def analyze_cmd(allowlist: str | None, fmt: str, verbose: bool, strace_log: str) -> None:
     """Analyze an existing strace log file for network violations."""
     al = _load_allowlist(allowlist)
     events = StraceParser().parse_stream(Path(strace_log).read_text().splitlines())
     violations = Reporter.check(events, al)
-    _emit(violations, fmt)
+    _emit(violations, fmt, verbose=verbose, events=events, allowlist=al)
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
