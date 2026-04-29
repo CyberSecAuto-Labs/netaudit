@@ -115,6 +115,31 @@ def _attribute_violations(
     return {nodeid: _group_events(evts) for nodeid, evts in by_test.items()}
 
 
+def _resolve_verbose(config: pytest.Config) -> bool:
+    """Resolve verbose: CLI flag > pyproject.toml > default (off)."""
+    try:
+        if bool(config.getoption("--netaudit-verbose")):
+            return True
+    except (ValueError, pytest.UsageError):
+        pass
+
+    pyproject = Path("pyproject.toml")
+    if pyproject.exists():
+        try:
+            import tomllib
+
+            data = tomllib.loads(pyproject.read_text())
+            tool_cfg = data.get("tool") or {}
+            netaudit_cfg = tool_cfg.get("netaudit") or {} if isinstance(tool_cfg, dict) else {}
+            verbose = netaudit_cfg.get("verbose")
+            if isinstance(verbose, bool):
+                return verbose
+        except Exception:
+            pass
+
+    return False
+
+
 def _resolve_allowlist(config: pytest.Config) -> AllowList:
     """Resolve allowlist: CLI flag > pyproject.toml > netaudit.yaml > builtins."""
     cli_path: str | None = config.getoption("--netaudit-allowlist")
@@ -140,6 +165,43 @@ def _resolve_allowlist(config: pytest.Config) -> AllowList:
         return AllowList.from_yaml(default)
 
     return AllowList.empty()
+
+
+def _emit_attributed_verbose(
+    events: list[ConnectEvent],
+    allowlist: AllowList,
+    test_ranges: list[_TestRange],
+    session: pytest.Session,
+) -> None:
+    """Emit verbose table (all events) grouped by test range.
+
+    All events — allowed and violating — are shown, annotated with rule names.
+    Exit code is set to ``TESTS_FAILED`` if any violations are present.
+    """
+    by_test: dict[str, list[ConnectEvent]] = {}
+    for event in events:
+        attributed = False
+        for tr in test_ranges:
+            if tr.start <= event.timestamp <= tr.end:
+                by_test.setdefault(tr.nodeid, []).append(event)
+                attributed = True
+                break
+        if not attributed:
+            by_test.setdefault("<session>", []).append(event)
+
+    has_violations = any(not allowlist.is_allowed(e) for e in events)
+
+    border = "=" * 60
+    print(f"\n{border}")
+    print("  netaudit: verbose network event report")
+    print(border)
+    for nodeid, test_events in sorted(by_test.items()):
+        print(f"\n  [{nodeid}]")
+        Reporter.format_verbose(test_events, allowlist, stream=sys.stdout)
+    print(f"{border}\n")
+
+    if has_violations:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _emit_attributed(
@@ -178,6 +240,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         metavar="YAML",
         default=None,
         help="Allowlist YAML file (overrides pyproject.toml and netaudit.yaml).",
+    )
+    group.addoption(
+        "--netaudit-verbose",
+        action="store_true",
+        default=False,
+        help="Show all network events (allowed and violations) with rule names.",
     )
 
 
@@ -262,16 +330,23 @@ def pytest_sessionfinish(
 
         events = StraceParser().parse_stream(strace_file.read_text().splitlines())
         allowlist = _resolve_allowlist(session.config)
+        verbose = _resolve_verbose(session.config)
 
         markers_file = Path(markers_path_str) if markers_path_str else None
         if markers_file and markers_file.exists():
             test_ranges = _parse_markers(markers_file)
-            violations_by_test = _attribute_violations(events, allowlist, test_ranges)
-            if violations_by_test:
-                _emit_attributed(violations_by_test, session)
+            if verbose:
+                _emit_attributed_verbose(events, allowlist, test_ranges, session)
+            else:
+                violations_by_test = _attribute_violations(events, allowlist, test_ranges)
+                if violations_by_test:
+                    _emit_attributed(violations_by_test, session)
         else:
             violations = Reporter.check(events, allowlist)
-            Reporter.format(violations, stream=sys.stdout)
+            if verbose:
+                Reporter.format_verbose(events, allowlist, stream=sys.stdout)
+            else:
+                Reporter.format(violations, stream=sys.stdout)
             if violations:
                 session.exitstatus = pytest.ExitCode.TESTS_FAILED
     finally:

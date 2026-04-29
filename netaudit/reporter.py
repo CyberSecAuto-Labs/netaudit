@@ -92,19 +92,78 @@ class Reporter:
         return result
 
     @staticmethod
-    def format_json(violations: list[Violation]) -> str:
-        """Render violations as a JSON string."""
+    def format_verbose(
+        events: list[ConnectEvent],
+        allowlist: AllowList,
+        stream: TextIO | None = None,
+    ) -> str:
+        """Render all events as a table annotated with OK/VIOLATION and rule name."""
+        col_family = 12
+        col_addr = 30
+        col_status = 10
+
+        def _addr_str(event: ConnectEvent) -> str:
+            if event.addr is None:
+                return "-"
+            if event.port is not None:
+                return f"{event.addr}:{event.port}"
+            return event.addr
+
+        header = f"{'FAMILY':<{col_family}} {'ADDR:PORT':<{col_addr}} {'STATUS':<{col_status}} RULE"
+        sep = f"{'-' * col_family} {'-' * col_addr} {'-' * col_status} {'-' * 24}"
+
+        buf = io.StringIO()
+        buf.write(header + "\n")
+        buf.write(sep + "\n")
+        for event in events:
+            rule = allowlist.match(event)
+            status = "OK" if rule is not None else "VIOLATION"
+            rule_name = rule.name if rule is not None else "-"
+            addr = _addr_str(event)
+            row = (
+                f"{event.family:<{col_family}} {addr:<{col_addr}}"
+                f" {status:<{col_status}} {rule_name}"
+            )
+            buf.write(row + "\n")
+
+        result = buf.getvalue()
+        if stream is not None:
+            stream.write(result)
+        return result
+
+    @staticmethod
+    def format_json(
+        violations: list[Violation],
+        events: list[ConnectEvent] | None = None,
+        allowlist: AllowList | None = None,
+        include_allowed: bool = False,
+    ) -> str:
+        """Render violations (and optionally all events) as a JSON string."""
+        violations_data = [
+            {
+                "family": v.family,
+                "addr": v.addr,
+                "port": v.port,
+                "count": v.count,
+                "pids": sorted(v.pids),
+            }
+            for v in violations
+        ]
         data: dict[str, Any] = {
-            "violations": [
-                {
-                    "family": v.family,
-                    "addr": v.addr,
-                    "port": v.port,
-                    "count": v.count,
-                    "pids": sorted(v.pids),
-                }
-                for v in violations
-            ],
+            "violations": violations_data,
             "summary": {"total": len(violations)},
         }
+        if include_allowed and events is not None and allowlist is not None:
+            annotated = []
+            for event in events:
+                rule = allowlist.match(event)
+                entry: dict[str, Any] = {
+                    "family": event.family,
+                    "addr": event.addr,
+                    "port": event.port,
+                    "status": "allowed" if rule is not None else "violation",
+                    "rule": rule.name if rule is not None else None,
+                }
+                annotated.append(entry)
+            data["events"] = annotated
         return json.dumps(data, indent=2)

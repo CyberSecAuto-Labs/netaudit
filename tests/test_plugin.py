@@ -15,10 +15,12 @@ from netaudit.integrations.pytest_plugin import (
     _ENV_STRACE_OUT,
     _attribute_violations,
     _emit_attributed,
+    _emit_attributed_verbose,
     _group_events,
     _now_ts,
     _parse_markers,
     _resolve_allowlist,
+    _resolve_verbose,
     _TestRange,
     pytest_addoption,
     pytest_configure,
@@ -284,11 +286,12 @@ class TestPytestAddoption:
         parser.getgroup.return_value = group
         pytest_addoption(parser)
         parser.getgroup.assert_called_once_with("netaudit", "Network egress auditing")
-        # --netaudit and --netaudit-allowlist
-        assert group.addoption.call_count == 2
+        # --netaudit, --netaudit-allowlist, --netaudit-verbose
+        assert group.addoption.call_count == 3
         option_names = [c.args[0] for c in group.addoption.call_args_list]
         assert "--netaudit" in option_names
         assert "--netaudit-allowlist" in option_names
+        assert "--netaudit-verbose" in option_names
 
 
 # ---------------------------------------------------------------------------
@@ -520,5 +523,254 @@ class TestPytestSessionfinish:
         pytest_sessionfinish(session=session, exitstatus=0)
 
         out = capsys.readouterr().out
+        assert "198.51.100.1" in out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# _resolve_verbose
+# ---------------------------------------------------------------------------
+
+
+def _mock_config_verbose(verbose: bool = False, allowlist_opt: str | None = None) -> MagicMock:
+    config = MagicMock(spec=["getoption"])
+
+    def _getoption(name: str) -> object:
+        if name == "--netaudit-verbose":
+            return verbose
+        return allowlist_opt
+
+    config.getoption.side_effect = _getoption
+    return config
+
+
+class TestResolveVerbose:
+    def test_cli_flag_true_returns_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = _mock_config_verbose(verbose=True)
+        assert _resolve_verbose(config) is True  # type: ignore[arg-type]
+
+    def test_cli_flag_false_returns_false_by_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = _mock_config_verbose(verbose=False)
+        assert _resolve_verbose(config) is False  # type: ignore[arg-type]
+
+    def test_pyproject_toml_verbose_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nverbose = true\n")
+        config = _mock_config_verbose(verbose=False)
+        assert _resolve_verbose(config) is True  # type: ignore[arg-type]
+
+    def test_pyproject_toml_verbose_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nverbose = false\n")
+        config = _mock_config_verbose(verbose=False)
+        assert _resolve_verbose(config) is False  # type: ignore[arg-type]
+
+    def test_cli_flag_overrides_pyproject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nverbose = false\n")
+        config = _mock_config_verbose(verbose=True)
+        assert _resolve_verbose(config) is True  # type: ignore[arg-type]
+
+    def test_option_not_registered_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = MagicMock(spec=["getoption"])
+        config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_verbose(config) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _emit_attributed_verbose
+# ---------------------------------------------------------------------------
+
+
+class TestEmitAttributedVerbose:
+    def _make_event(self, addr: str, ts: float) -> ConnectEvent:
+        return ConnectEvent(
+            pid=1,
+            timestamp=ts,
+            family="AF_INET",
+            addr=addr,
+            port=80,
+            result=0,
+            raw_line="",
+        )
+
+    def test_table_headers_present(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = self._make_event("1.2.3.4", ts=10.5)
+        al = AllowList([], includes_builtins=False)
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        out = capsys.readouterr().out
+        assert "FAMILY" in out
+        assert "ADDR:PORT" in out
+        assert "STATUS" in out
+
+    def test_allowed_event_shown_with_ok_status(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = self._make_event("127.0.0.1", ts=10.5)
+        al = AllowList.empty()  # builtins allow loopback
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        out = capsys.readouterr().out
+        assert "OK" in out
+        assert "127.0.0.1" in out
+
+    def test_violation_sets_exit_code(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = self._make_event("1.2.3.4", ts=10.5)
+        al = AllowList([], includes_builtins=False)
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_no_violations_does_not_set_exit_code(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = self._make_event("127.0.0.1", ts=10.5)
+        al = AllowList.empty()
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        assert session.exitstatus != pytest.ExitCode.TESTS_FAILED
+
+    def test_nodeid_in_output(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="tests/test_foo.py::test_bar", start=10.0, end=11.0)]
+        event = self._make_event("1.2.3.4", ts=10.5)
+        al = AllowList([], includes_builtins=False)
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        out = capsys.readouterr().out
+        assert "tests/test_foo.py::test_bar" in out
+
+    def test_unattributed_event_goes_to_session_bucket(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ranges: list[_TestRange] = []
+        event = self._make_event("1.2.3.4", ts=10.5)
+        al = AllowList([], includes_builtins=False)
+        session = MagicMock()
+        _emit_attributed_verbose([event], al, ranges, session)
+        out = capsys.readouterr().out
+        assert "<session>" in out
+
+
+# ---------------------------------------------------------------------------
+# pytest_sessionfinish — verbose paths
+# ---------------------------------------------------------------------------
+
+
+_STRACE_LOOPBACK = (
+    "1234 12:00:00.000000 connect(3, {sa_family=AF_INET, "
+    'sin_port=htons(80), sin_addr=inet_addr("127.0.0.1")}, 16) = 0\n'
+)
+
+
+class TestPytestSessionfinishVerbose:
+    def _make_session(self, verbose: bool = True) -> MagicMock:
+        config = _mock_config_verbose(verbose=verbose)
+        session = MagicMock()
+        session.config = config
+        return session
+
+    def test_verbose_with_markers_shows_table_headers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        markers_file = tmp_path / "markers"
+        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.chdir(tmp_path)
+
+        session = self._make_session(verbose=True)
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert "FAMILY" in out
+        assert "198.51.100.1" in out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_verbose_without_markers_shows_table(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        session = self._make_session(verbose=True)
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert "FAMILY" in out
+        assert "198.51.100.1" in out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_verbose_mode_shows_allowed_events(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_LOOPBACK)
+        markers_file = tmp_path / "markers"
+        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.chdir(tmp_path)
+
+        session = self._make_session(verbose=True)
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert "127.0.0.1" in out
+        assert "OK" in out
+        assert session.exitstatus != pytest.ExitCode.TESTS_FAILED
+
+    def test_non_verbose_mode_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        markers_file = tmp_path / "markers"
+        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.chdir(tmp_path)
+
+        session = self._make_session(verbose=False)
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert "FAMILY" not in out
         assert "198.51.100.1" in out
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
