@@ -1,3 +1,3 @@
 """netaudit — CI-native network egress auditing via strace."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
