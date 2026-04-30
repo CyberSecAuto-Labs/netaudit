@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+_TERMINATE_TIMEOUT = 5  # seconds to wait for graceful shutdown before SIGKILL
+
 
 class StraceNotFoundError(RuntimeError):
     """Raised when strace is not available on PATH."""
@@ -22,8 +24,22 @@ class StraceProcess:
         self._proc = proc
 
     def stop(self) -> subprocess.CompletedProcess[bytes]:
-        """Wait for the process to finish and return a CompletedProcess."""
-        stdout, stderr = self._proc.communicate()
+        """Wait for the process to finish and return a CompletedProcess.
+
+        On ``KeyboardInterrupt`` (Ctrl-C) the child is sent SIGTERM and given
+        ``_TERMINATE_TIMEOUT`` seconds to exit before being forcibly killed.
+        The interrupt is re-raised after cleanup so the caller can propagate it.
+        """
+        try:
+            stdout, stderr = self._proc.communicate()
+        except KeyboardInterrupt:
+            self._proc.terminate()
+            try:
+                stdout, stderr = self._proc.communicate(timeout=_TERMINATE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                stdout, stderr = self._proc.communicate()
+            raise
         return subprocess.CompletedProcess(
             args=self._proc.args,
             returncode=self._proc.returncode,

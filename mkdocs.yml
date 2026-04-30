@@ -44,4 +44,6 @@ nav:
   - CLI Reference: cli-reference.md
   - Allowlist DSL: allowlist-dsl.md
   - pytest Plugin: pytest-plugin.md
+  - Docker: docker.md
   - Architecture: architecture.md
+  - Contributing: contributing.md

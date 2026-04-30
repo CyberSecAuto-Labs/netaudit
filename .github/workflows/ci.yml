@@ -58,3 +58,15 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run integration tests
         run: pytest -m integration -v
+
+  docker:
+    name: Docker smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t netaudit:ci .
+      - name: Smoke test — run exits cleanly with no violations
+        run: |
+          docker run --rm --cap-add SYS_PTRACE netaudit:ci \
+            run -- curl -s -o /dev/null https://example.com
