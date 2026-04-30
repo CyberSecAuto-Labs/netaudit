@@ -163,6 +163,41 @@ class TestStraceParser:
         assert parser.parse_stream([]) == []
 
     # ------------------------------------------------------------------
+    # Hardening: long lines, binary paths, permission-error lines
+    # ------------------------------------------------------------------
+
+    def test_long_line_returns_none(self, parser: StraceParser) -> None:
+        # Lines longer than _MAX_LINE_LEN must be skipped without error.
+        long_line = "1 12:00:00.000001 " + "x" * 5000
+        assert parser.parse_line(long_line) is None
+
+    def test_line_at_limit_boundary(self, parser: StraceParser) -> None:
+        # A line just at the limit (4096 chars) should also return None since
+        # it won't match a valid strace pattern.
+        boundary_line = "A" * 4096
+        assert parser.parse_line(boundary_line) is None
+
+    def test_permission_error_line_returns_none(self, parser: StraceParser) -> None:
+        line = "strace: attach: ptrace(PTRACE_SEIZE, 1234, 0, 0): Operation not permitted"
+        assert parser.parse_line(line) is None
+
+    def test_strace_process_exited_line_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 +++ exited with 0 +++"
+        assert parser.parse_line(line) is None
+
+    def test_unix_path_with_control_chars_sanitised(self, parser: StraceParser) -> None:
+        # strace may emit control characters in short AF_UNIX paths; they should
+        # be stripped so downstream code receives a clean string.
+        line = (
+            "9 12:00:00.000001 connect(5, {sa_family=AF_UNIX,"
+            ' sun_path="\x01\x02/run/foo.sock"}, 20) = 0'
+        )
+        event = parser.parse_line(line)
+        if event is not None:
+            assert "\x01" not in (event.addr or "")
+            assert "\x02" not in (event.addr or "")
+
+    # ------------------------------------------------------------------
     # Timestamp parsing
     # ------------------------------------------------------------------
 

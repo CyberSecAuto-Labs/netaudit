@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
+
+# Lines longer than this are skipped — they can't be valid strace output and
+# would trigger catastrophic regex backtracking on malformed input.
+_MAX_LINE_LEN = 4096
 
 # ---------------------------------------------------------------------------
 # Regexes
@@ -70,6 +75,17 @@ def _normalise_result(result: int, raw_line: str) -> int:
     return result
 
 
+def _sanitise_path(path: str) -> str:
+    """Strip control characters from an AF_UNIX path.
+
+    strace renders binary bytes as \\xNN escape sequences, so the string we
+    receive is already printable ASCII.  However, strace on some kernels emits
+    raw control characters for very short paths; remove them defensively so
+    downstream code doesn't choke on non-printable content.
+    """
+    return "".join(ch for ch in path if not unicodedata.category(ch).startswith("C"))
+
+
 def _parse_ts(ts: str) -> float:
     """Convert HH:MM:SS.ffffff to seconds-since-midnight float."""
     h, m, rest = ts.split(":")
@@ -103,6 +119,11 @@ class StraceParser:
     def parse_line(self, line: str) -> ConnectEvent | None:
         """Return a ConnectEvent for *line*, or None if unrecognised."""
         line = line.rstrip()
+
+        # Guard against extremely long lines (e.g. from corrupted output files)
+        # before running regexes that could backtrack catastrophically.
+        if len(line) > _MAX_LINE_LEN:
+            return None
 
         # Skip unfinished lines (the resumed counterpart carries the result)
         if "<unfinished ...>" in line:
@@ -162,7 +183,7 @@ class StraceParser:
                 pid=int(m.group("pid")),
                 timestamp=_parse_ts(m.group("ts")),
                 family=m.group("family"),
-                addr=m.group("path"),
+                addr=_sanitise_path(m.group("path")),
                 port=None,
                 result=int(m.group("result")),
                 raw_line=line,
