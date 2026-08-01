@@ -65,10 +65,10 @@ Central data type:
 class ConnectEvent:
     pid: int
     timestamp: float
-    family: str       # "AF_INET", "AF_INET6", "AF_UNIX", "AF_NETLINK", ...
+    family: str  # "AF_INET", "AF_INET6", "AF_UNIX", "AF_NETLINK", ...
     addr: str | None  # IP address or socket path
     port: int | None  # TCP/UDP port; None for unix/netlink
-    result: int       # 0 = success; negative errno
+    result: int  # 0 = success; negative errno
     raw_line: str
 ```
 
