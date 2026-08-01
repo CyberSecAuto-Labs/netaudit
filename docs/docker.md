@@ -1,7 +1,7 @@
 # Docker
 
 `netaudit` is available as a Docker image from the GitHub Container Registry (GHCR).
-The image is built on `python:3.12-slim` with `strace` pre-installed, so no local
+The image is built on `python:3.14-slim` with `strace` pre-installed, so no local
 setup is required.
 
 ## Quick start
