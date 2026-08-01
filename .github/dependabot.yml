@@ -9,7 +9,6 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - dependencies
-      - python
     commit-message:
       prefix: chore
       include: scope
@@ -26,7 +25,6 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - dependencies
-      - github-actions
     commit-message:
       prefix: ci
     groups:
@@ -43,6 +41,5 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-      - docker
     commit-message:
       prefix: chore
