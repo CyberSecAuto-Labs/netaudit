@@ -5,9 +5,21 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
-from netaudit.reporter import Reporter, Violation, supports_color
+from netaudit.reporter import (
+    Destination,
+    LoadedReport,
+    MergedDestination,
+    Reporter,
+    Violation,
+    build_run_metadata,
+    load_report,
+    merge_reports,
+    supports_color,
+)
 
 
 def _event(
@@ -475,3 +487,403 @@ class TestFormatSuggestions:
             self._violations(_event("AF_INET", "198.51.100.1", 443)), stream=buf
         )
         assert buf.getvalue() == out
+
+
+# ---------------------------------------------------------------------------
+# Report envelope (schema version + provenance)
+# ---------------------------------------------------------------------------
+
+
+class TestReportVersion:
+    def test_report_carries_schema_version(self) -> None:
+        data = json.loads(Reporter.format_json([]))
+        assert data["version"] == 1
+
+    def test_existing_keys_unchanged(self) -> None:
+        data = json.loads(Reporter.format_json([]))
+        assert "violations" in data
+        assert "summary" in data
+
+
+class TestBuildRunMetadata:
+    def test_includes_timestamp_in_iso_8601_with_timezone(self) -> None:
+        from datetime import datetime
+
+        meta = build_run_metadata()
+        parsed = datetime.fromisoformat(meta["timestamp"])
+        assert parsed.tzinfo is not None
+
+    def test_includes_hostname_and_version(self) -> None:
+        from netaudit import __version__
+
+        meta = build_run_metadata()
+        assert meta["netaudit_version"] == __version__
+        assert isinstance(meta["hostname"], str)
+        assert meta["hostname"]
+
+    def test_command_recorded_as_list(self) -> None:
+        meta = build_run_metadata(command=["pytest", "tests/"])
+        assert meta["command"] == ["pytest", "tests/"]
+
+    def test_command_absent_when_not_supplied(self) -> None:
+        assert "command" not in build_run_metadata()
+
+    def test_allowlist_path_recorded(self) -> None:
+        assert build_run_metadata(allowlist="netaudit.yaml")["allowlist"] == "netaudit.yaml"
+
+    def test_source_recorded_for_offline_analysis(self) -> None:
+        """`analyze` has no traced command — it has a log it read."""
+        meta = build_run_metadata(source="/tmp/trace.log")
+        assert meta["source"] == "/tmp/trace.log"
+        assert "command" not in meta
+
+
+class TestReportProvenance:
+    def test_run_block_embedded_when_supplied(self) -> None:
+        meta = build_run_metadata(command=["pytest"], allowlist="netaudit.yaml")
+        data = json.loads(Reporter.format_json([], run=meta))
+        assert data["run"]["command"] == ["pytest"]
+        assert data["run"]["allowlist"] == "netaudit.yaml"
+
+    def test_run_block_absent_when_not_supplied(self) -> None:
+        assert "run" not in json.loads(Reporter.format_json([]))
+
+    def test_provenance_survives_a_round_trip(self) -> None:
+        """A saved report must still say where it came from when read back."""
+        meta = build_run_metadata(command=["pytest"])
+        text = Reporter.format_json([], run=meta)
+        assert json.loads(text)["run"]["command"] == ["pytest"]
+
+
+# ---------------------------------------------------------------------------
+# Loading and merging saved reports
+# ---------------------------------------------------------------------------
+
+
+class TestLoadReport:
+    def _write(self, path: Path, **over: object) -> Path:
+        doc: dict[str, object] = {
+            "version": 1,
+            "run": {"timestamp": "2026-08-23T00:00:00+00:00"},
+            "violations": [],
+            "summary": {
+                "total": 1,
+                "by_destination": [
+                    {"family": "AF_INET", "addr": "1.2.3.4", "port": 80, "count": 3, "pids": [1]}
+                ],
+            },
+        }
+        doc.update(over)
+        path.write_text(json.dumps(doc))
+        return path
+
+    def test_loads_destinations(self, tmp_path: Path) -> None:
+        rpt = load_report(self._write(tmp_path / "r.json"))
+        assert len(rpt.destinations) == 1
+        assert rpt.destinations[0].addr == "1.2.3.4"
+        assert rpt.destinations[0].count == 3
+
+    def test_label_is_the_file_name(self, tmp_path: Path) -> None:
+        assert load_report(self._write(tmp_path / "ci-42.json")).label == "ci-42.json"
+
+    def test_tests_attribution_preserved(self, tmp_path: Path) -> None:
+        rpt = load_report(
+            self._write(
+                tmp_path / "r.json",
+                summary={
+                    "total": 1,
+                    "by_destination": [
+                        {
+                            "family": "AF_INET",
+                            "addr": "1.2.3.4",
+                            "port": 80,
+                            "count": 1,
+                            "pids": [1],
+                            "tests": ["test_a"],
+                        }
+                    ],
+                },
+            )
+        )
+        assert rpt.destinations[0].tests == {"test_a"}
+
+    def test_unknown_schema_version_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="version"):
+            load_report(self._write(tmp_path / "r.json", version=99))
+
+    def test_missing_version_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "r.json"
+        p.write_text(json.dumps({"violations": [], "summary": {"by_destination": []}}))
+        with pytest.raises(ValueError, match="version"):
+            load_report(p)
+
+    def test_malformed_json_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "r.json"
+        p.write_text("{not json")
+        with pytest.raises(ValueError, match="r.json"):
+            load_report(p)
+
+    def test_clean_report_loads_with_no_destinations(self, tmp_path: Path) -> None:
+        rpt = load_report(
+            self._write(tmp_path / "r.json", summary={"total": 0, "by_destination": []})
+        )
+        assert rpt.destinations == []
+
+
+class TestMergeReports:
+    def _report(self, label: str, *dests: dict[str, object]) -> "LoadedReport":
+        return LoadedReport(
+            label=label,
+            run={},
+            destinations=[
+                Destination(
+                    family=str(d.get("family", "AF_INET")),
+                    addr=str(d["addr"]),
+                    port=d.get("port"),  # type: ignore[arg-type]
+                    count=int(d.get("count", 1)),
+                    tests=set(d.get("tests", set())),  # type: ignore[arg-type]
+                )
+                for d in dests
+            ],
+        )
+
+    def test_same_destination_across_reports_is_one_entry(self) -> None:
+        merged = merge_reports(
+            [
+                self._report("a.json", {"addr": "1.2.3.4", "port": 80, "count": 2}),
+                self._report("b.json", {"addr": "1.2.3.4", "port": 80, "count": 3}),
+            ]
+        )
+        assert len(merged) == 1
+        assert merged[0].count == 5
+
+    def test_source_reports_are_tracked(self) -> None:
+        merged = merge_reports(
+            [
+                self._report("a.json", {"addr": "1.2.3.4", "port": 80}),
+                self._report("b.json", {"addr": "1.2.3.4", "port": 80}),
+            ]
+        )
+        assert merged[0].reports == ["a.json", "b.json"]
+
+    def test_distinct_ports_stay_separate(self) -> None:
+        merged = merge_reports(
+            [
+                self._report(
+                    "a.json", {"addr": "1.2.3.4", "port": 80}, {"addr": "1.2.3.4", "port": 443}
+                )
+            ]
+        )
+        assert len(merged) == 2
+
+    def test_tests_unioned_across_reports(self) -> None:
+        merged = merge_reports(
+            [
+                self._report("a.json", {"addr": "1.2.3.4", "port": 80, "tests": {"test_a"}}),
+                self._report("b.json", {"addr": "1.2.3.4", "port": 80, "tests": {"test_b"}}),
+            ]
+        )
+        assert merged[0].tests == {"test_a", "test_b"}
+
+    def test_sorted_by_count_descending(self) -> None:
+        merged = merge_reports(
+            [
+                self._report(
+                    "a.json",
+                    {"addr": "1.1.1.1", "port": 80, "count": 1},
+                    {"addr": "2.2.2.2", "port": 80, "count": 9},
+                )
+            ]
+        )
+        assert merged[0].addr == "2.2.2.2"
+
+    def test_total_report_count_recorded(self) -> None:
+        merged = merge_reports(
+            [
+                self._report("a.json", {"addr": "1.2.3.4", "port": 80}),
+                self._report("b.json"),
+                self._report("c.json"),
+            ]
+        )
+        assert merged[0].total_reports == 3
+
+    def test_empty_input(self) -> None:
+        assert merge_reports([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Evidence-annotated suggestions
+# ---------------------------------------------------------------------------
+
+
+def _merged(
+    addr: str = "1.2.3.4",
+    port: int | None = 80,
+    count: int = 5,
+    reports: list[str] | None = None,
+    total: int = 3,
+    tests: set[str] | None = None,
+) -> "MergedDestination":
+    return MergedDestination(
+        family="AF_INET",
+        addr=addr,
+        port=port,
+        count=count,
+        tests=tests or set(),
+        reports=reports if reports is not None else ["a.json", "b.json", "c.json"],
+        total_reports=total,
+    )
+
+
+class TestFormatSuggestionsWithEvidence:
+    def test_rule_annotated_with_count_and_report_ratio(self) -> None:
+        out = Reporter.format_suggestions_with_evidence([_merged(count=47)])
+        assert "47 calls" in out
+        assert "3/3 runs" in out
+
+    def test_rule_lists_source_reports(self) -> None:
+        out = Reporter.format_suggestions_with_evidence([_merged(reports=["ci-7.json"], total=1)])
+        assert "ci-7.json" in out
+
+    def test_tests_named_when_attribution_survived(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(tests={"test_sync", "test_fetch"})]
+        )
+        assert "test_fetch" in out
+        assert "test_sync" in out
+
+    def test_no_tests_clause_when_attribution_absent(self) -> None:
+        assert "tests:" not in Reporter.format_suggestions_with_evidence([_merged()])
+
+    def test_external_every_run_is_flagged(self) -> None:
+        """The beacon signature: consistent, high-volume, undeclared, public."""
+        out = Reporter.format_suggestions_with_evidence([_merged(addr="185.199.108.153")])
+        assert "external host reached on every run (3/3)" in out
+        assert "never declared" in out
+
+    def test_external_intermittent_is_flagged(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(addr="185.199.108.153", reports=["a.json"], total=3)]
+        )
+        assert "external host reached in 1 of 3 runs" in out
+
+    def test_external_single_report_is_flagged_without_a_ratio(self) -> None:
+        """With one report the run pattern carries no information; externality still does."""
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(addr="185.199.108.153", reports=["a.json"], total=1)]
+        )
+        assert "! external host — never declared" in out
+        assert "every run" not in out
+
+    def test_internal_destination_is_not_flagged(self) -> None:
+        out = Reporter.format_suggestions_with_evidence([_merged(addr="10.0.0.5")])
+        assert "!" not in out
+        assert "never declared" not in out
+
+    def test_scope_tagged_in_the_evidence_line(self) -> None:
+        assert "internal" in Reporter.format_suggestions_with_evidence([_merged(addr="10.0.0.5")])
+        assert "external" in Reporter.format_suggestions_with_evidence([_merged(addr="8.8.8.8")])
+
+    def test_non_routable_documentation_range_counts_as_internal(self) -> None:
+        """TEST-NET addresses are not globally routable, so they are not 'external'."""
+        out = Reporter.format_suggestions_with_evidence([_merged(addr="198.51.100.1")])
+        assert "internal" in out
+        assert "never declared" not in out
+
+    def test_ipv6_externality_is_classified(self) -> None:
+        public = Reporter.format_suggestions_with_evidence(
+            [
+                MergedDestination(
+                    family="AF_INET6",
+                    addr="2606:4700::1111",
+                    port=443,
+                    count=1,
+                    reports=["a.json"],
+                    total_reports=1,
+                )
+            ]
+        )
+        assert "external" in public
+        private = Reporter.format_suggestions_with_evidence(
+            [
+                MergedDestination(
+                    family="AF_INET6",
+                    addr="2001:db8::1",
+                    port=443,
+                    count=1,
+                    reports=["a.json"],
+                    total_reports=1,
+                )
+            ]
+        )
+        assert "internal" in private
+
+    def test_unix_socket_path_is_not_treated_as_external(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [
+                MergedDestination(
+                    family="AF_UNIX",
+                    addr="/run/x.sock",
+                    port=None,
+                    count=1,
+                    reports=["a.json"],
+                    total_reports=1,
+                )
+            ]
+        )
+        assert "never declared" not in out
+
+    def test_header_frames_output_as_a_question_not_a_recommendation(self) -> None:
+        out = Reporter.format_suggestions_with_evidence([_merged()])
+        assert "Undeclared egress observed" in out
+        assert "not a recommendation" in out
+
+    def test_header_states_run_and_connection_totals(self) -> None:
+        out = Reporter.format_suggestions_with_evidence([_merged(count=47)])
+        assert "3 runs" in out
+        assert "47 connections" in out
+
+    def test_sorted_loudest_first(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(addr="1.1.1.1", count=90), _merged(addr="2.2.2.2", count=2)]
+        )
+        assert out.index("1.1.1.1") < out.index("2.2.2.2")
+
+    def test_output_is_still_valid_yaml(self) -> None:
+        """Evidence lives in comments so a copy-paste keeps it and the YAML still loads."""
+        import yaml as _yaml
+
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(count=47, tests={"test_a"}), _merged(addr="9.9.9.9", port=53, count=1)]
+        )
+        rules = _yaml.safe_load(out)
+        assert isinstance(rules, list)
+        assert len(rules) == 2
+        assert rules[0]["addr"] == "1.2.3.4"
+        assert rules[0]["port"] == 80
+
+    def test_evidence_survives_yaml_round_trip_as_comments(self) -> None:
+        import yaml as _yaml
+
+        out = Reporter.format_suggestions_with_evidence([_merged(count=47)])
+        # Comments are not data — they must not leak into the parsed rule.
+        rule = _yaml.safe_load(out)[0]
+        assert "47 calls" not in str(rule)
+        assert "47 calls" in out
+
+    def test_empty_input_returns_empty_string(self) -> None:
+        assert Reporter.format_suggestions_with_evidence([]) == ""
+
+    def test_ipv6_address_is_quoted(self) -> None:
+        import yaml as _yaml
+
+        dest = MergedDestination(
+            family="AF_INET6",
+            addr="2001:db8::1",
+            port=8080,
+            count=1,
+            reports=["a.json"],
+            total_reports=1,
+        )
+        rules = _yaml.safe_load(Reporter.format_suggestions_with_evidence([dest]))
+        assert rules[0]["addr"] == "2001:db8::1"
