@@ -183,3 +183,66 @@ class TestPluginVerbose:
         result.assert_outcomes(passed=1)
         assert result.ret == 0
         result.stdout.fnmatch_lines(["*FAMILY*ADDR*STATUS*"])
+
+
+class TestPluginAutoEnable:
+    """`enabled = true` in pyproject.toml activates auditing without --netaudit."""
+
+    def test_pyproject_enabled_traces_without_cli_flag(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        pytester.makepyprojecttoml("[tool.netaudit]\nenabled = true\n")
+        result = pytester.runpytest_subprocess()
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*netaudit*violation*"])
+
+    def test_pyproject_enabled_false_does_not_trace(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        pytester.makepyprojecttoml("[tool.netaudit]\nenabled = false\n")
+        result = pytester.runpytest_subprocess()
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+
+    def test_no_pyproject_config_does_not_trace(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        result = pytester.runpytest_subprocess()
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
