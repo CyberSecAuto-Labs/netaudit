@@ -37,9 +37,25 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 
 | Code | Meaning |
 |------|---------|
-| 0 | Command exited cleanly with no violations |
-| 1 | One or more network violations detected |
+| 0 | Command succeeded and made no unallowed connections |
 | 2 | `strace` binary not found on PATH |
+| 3 | Command succeeded, but unallowed connections were detected |
+| *other* | The traced command's own exit code, passed through unchanged |
+
+`run` wraps another process, so most of the exit-code space belongs to that process.
+Violations therefore get a reserved code of their own (**3**) rather than `1`, which is
+free to mean "the wrapped command failed".
+
+**A failing command takes precedence over violations.** A command that died part-way may
+have produced an incomplete trace, so its failure is the more reliable signal — but any
+violations found are still printed. When the traced command exits non-zero, netaudit
+writes `netaudit: traced command exited with N` to stderr and records
+`run.command_exit_code` in the JSON report, so the value is never lost.
+
+!!! note "Ambiguity when the command uses 2 or 3"
+    Codes `2` and `3` are netaudit's own. If the traced command itself exits with one of
+    them, the meaning is ambiguous from the code alone — the stderr line and the report
+    tell you which happened.
 
 ### Examples
 
@@ -270,7 +286,7 @@ Rules are scoped as narrowly as the observed connection allows — exact address
 exact port when the connection had one. Paste them under the `allowlist:` key of your
 config to turn a violation into an explicit, reviewable exception.
 
-Suggestions never change the exit code: a run with violations still exits 1.
+Suggestions never change the exit code: a run with violations still exits 3.
 With `--format json` they appear under the `suggested_rules` key instead.
 
 ## Coloured output

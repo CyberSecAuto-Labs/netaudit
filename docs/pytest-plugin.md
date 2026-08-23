@@ -171,7 +171,9 @@ Violations that happen outside of any test (e.g. during session setup) are group
 1. On first entry to `pytest_configure`, the plugin re-execs the current process under `strace -e trace=connect -f -tt -o <tmpfile>`, setting an environment variable so the second invocation knows it is already traced.
 2. During the test run, `pytest_runtest_protocol` writes `START`/`END` timestamp markers around each test to a sidecar file.
 3. In `pytest_sessionfinish`, the plugin reads the strace log, cross-references it with the marker file, validates each `connect()` event against the allowlist, and reports attributed violations.
-4. If any violations are found, the session exit code is set to non-zero.
+4. If any violations are found, the session is marked failed. netaudit only *escalates* a
+   passing session — it never overwrites a more severe pytest status such as an internal
+   or usage error, so a violation cannot mask a worse failure.
 
 ## Example allowlist
 

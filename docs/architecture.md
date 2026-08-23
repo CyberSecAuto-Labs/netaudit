@@ -142,7 +142,10 @@ Two Click commands:
 
 Both accept `--allowlist` (defaults to `netaudit.yaml` in cwd) and `--format {text,json}`.
 
-Exit codes: **0** clean, **1** violations, **2** strace missing.
+Exit codes: **0** clean, **2** strace missing, **3** violations, anything else the traced
+command's own status passed through. `run` shares its exit space with the process it wraps,
+so violations take a reserved code and a failing command is never masked; `analyze` and
+`undeclared` wrap nothing and use **1** for findings.
 
 ---
 
