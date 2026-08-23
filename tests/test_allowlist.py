@@ -257,3 +257,101 @@ class TestAllowListMatch:
         rule = al.match(_event("AF_INET", "10.1.2.3"))
         assert rule is not None
         assert rule.name == "private"
+
+
+# ---------------------------------------------------------------------------
+# Port scoping
+# ---------------------------------------------------------------------------
+
+
+class TestIPv4RulePort:
+    def test_port_scoped_rule_matches_that_port(self) -> None:
+        rule = IPv4Rule("198.51.100.1/32", port=443)
+        assert rule.matches(_event("AF_INET", "198.51.100.1", 443)) is True
+
+    def test_port_scoped_rule_rejects_other_ports(self) -> None:
+        """The whole point of the fix: `port: 443` must not allow port 22."""
+        rule = IPv4Rule("198.51.100.1/32", port=443)
+        assert rule.matches(_event("AF_INET", "198.51.100.1", 22)) is False
+
+    def test_rule_without_port_allows_any_port(self) -> None:
+        rule = IPv4Rule("198.51.100.1/32")
+        assert rule.matches(_event("AF_INET", "198.51.100.1", 22)) is True
+        assert rule.matches(_event("AF_INET", "198.51.100.1", 443)) is True
+
+    def test_port_scoped_rule_rejects_event_without_port(self) -> None:
+        rule = IPv4Rule("198.51.100.1/32", port=443)
+        assert rule.matches(_event("AF_INET", "198.51.100.1", None)) is False
+
+    def test_port_applies_across_a_cidr_block(self) -> None:
+        rule = IPv4Rule("10.0.0.0/8", port=9393)
+        assert rule.matches(_event("AF_INET", "10.1.2.3", 9393)) is True
+        assert rule.matches(_event("AF_INET", "10.1.2.3", 80)) is False
+
+
+class TestIPv6RulePort:
+    def test_port_scoped_rule_matches_that_port(self) -> None:
+        rule = IPv6Rule("::1/128", port=8080)
+        assert rule.matches(_event("AF_INET6", "::1", 8080)) is True
+
+    def test_port_scoped_rule_rejects_other_ports(self) -> None:
+        rule = IPv6Rule("::1/128", port=8080)
+        assert rule.matches(_event("AF_INET6", "::1", 9090)) is False
+
+    def test_rule_without_port_allows_any_port(self) -> None:
+        assert IPv6Rule("::1/128").matches(_event("AF_INET6", "::1", 9090)) is True
+
+
+class TestPortFromYaml:
+    def _load(self, tmp_path: Path, body: str) -> AllowList:
+        y = tmp_path / "netaudit.yaml"
+        y.write_text(body)
+        return AllowList.from_yaml(y)
+
+    def test_port_is_enforced_from_yaml(self, tmp_path: Path) -> None:
+        al = self._load(
+            tmp_path,
+            'version: 1\nallowlist:\n  - name: "only 443"\n'
+            "    family: AF_INET\n    addr: 198.51.100.1\n    port: 443\n",
+        )
+        assert al.is_allowed(_event("AF_INET", "198.51.100.1", 443)) is True
+        assert al.is_allowed(_event("AF_INET", "198.51.100.1", 22)) is False
+
+    def test_omitted_port_allows_any(self, tmp_path: Path) -> None:
+        al = self._load(
+            tmp_path,
+            "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 198.51.100.1\n",
+        )
+        assert al.is_allowed(_event("AF_INET", "198.51.100.1", 22)) is True
+
+    def test_ipv6_port_from_yaml(self, tmp_path: Path) -> None:
+        # Not ::1 — the built-in loopback rule allows that on any port.
+        al = self._load(
+            tmp_path,
+            "version: 1\nallowlist:\n  - family: AF_INET6\n"
+            '    addr: "2001:db8::1"\n    port: 8080\n',
+        )
+        assert al.is_allowed(_event("AF_INET6", "2001:db8::1", 8080)) is True
+        assert al.is_allowed(_event("AF_INET6", "2001:db8::1", 9090)) is False
+
+    def test_numeric_string_port_is_accepted(self, tmp_path: Path) -> None:
+        al = self._load(
+            tmp_path,
+            'version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: "443"\n',
+        )
+        assert al.is_allowed(_event("AF_INET", "1.2.3.4", 443)) is True
+        assert al.is_allowed(_event("AF_INET", "1.2.3.4", 22)) is False
+
+    def test_non_numeric_port_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="port"):
+            self._load(
+                tmp_path,
+                "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: https\n",
+            )
+
+    def test_out_of_range_port_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="port"):
+            self._load(
+                tmp_path,
+                "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: 99999\n",
+            )

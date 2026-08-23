@@ -28,14 +28,21 @@ class Rule(Protocol):
 
 
 class IPv4Rule:
-    """Allow connections whose destination falls within a CIDR block."""
+    """Allow connections whose destination falls within a CIDR block.
 
-    def __init__(self, cidr: str, name: str = "") -> None:
+    When *port* is given the rule is scoped to that port only; when omitted any
+    port on the matching address is allowed.
+    """
+
+    def __init__(self, cidr: str, name: str = "", port: int | None = None) -> None:
         self._network = ipaddress.IPv4Network(cidr, strict=False)
         self.name = name
+        self.port = port
 
     def matches(self, event: ConnectEvent) -> bool:
         if event.family != "AF_INET" or event.addr is None:
+            return False
+        if self.port is not None and event.port != self.port:
             return False
         try:
             return ipaddress.IPv4Address(event.addr) in self._network
@@ -44,14 +51,21 @@ class IPv4Rule:
 
 
 class IPv6Rule:
-    """Allow connections whose destination falls within an IPv6 CIDR block."""
+    """Allow connections whose destination falls within an IPv6 CIDR block.
 
-    def __init__(self, cidr: str, name: str = "") -> None:
+    When *port* is given the rule is scoped to that port only; when omitted any
+    port on the matching address is allowed.
+    """
+
+    def __init__(self, cidr: str, name: str = "", port: int | None = None) -> None:
         self._network = ipaddress.IPv6Network(cidr, strict=False)
         self.name = name
+        self.port = port
 
     def matches(self, event: ConnectEvent) -> bool:
         if event.family != "AF_INET6" or event.addr is None:
+            return False
+        if self.port is not None and event.port != self.port:
             return False
         try:
             return ipaddress.IPv6Address(event.addr) in self._network
@@ -98,15 +112,33 @@ _BUILTIN_RULES: list[Rule] = [
 # ---------------------------------------------------------------------------
 
 
+def _parse_port(value: Any) -> int | None:
+    """Validate an allowlist ``port`` field, returning None when absent.
+
+    Rejects unparseable and out-of-range values loudly: a port that is silently
+    dropped would widen the allowlist beyond what the file declares.
+    """
+    if value is None:
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid port in allowlist entry: {value!r}") from None
+    if not 0 <= port <= 65535:
+        raise ValueError(f"Out-of-range port in allowlist entry: {port}")
+    return port
+
+
 def _rule_from_dict(entry: dict[str, Any]) -> Rule:
     name = entry.get("name", "")
     family = entry.get("family", "")
+    port = _parse_port(entry.get("port"))
     if family == "AF_INET":
         cidr = entry.get("cidr") or f"{entry['addr']}/32"
-        return IPv4Rule(cidr, name=name)
+        return IPv4Rule(cidr, name=name, port=port)
     if family == "AF_INET6":
         cidr = entry.get("cidr") or f"{entry['addr']}/128"
-        return IPv6Rule(cidr, name=name)
+        return IPv6Rule(cidr, name=name, port=port)
     if family == "AF_UNIX":
         glob = entry.get("path_glob") or entry.get("path_prefix", "") + "*"
         return UnixSocketRule(glob, name=name)
