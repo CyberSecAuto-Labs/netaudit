@@ -20,6 +20,7 @@ from netaudit.integrations.pytest_plugin import (
     _now_ts,
     _parse_markers,
     _resolve_allowlist,
+    _resolve_enabled,
     _resolve_verbose,
     _TestRange,
     pytest_addoption,
@@ -218,6 +219,16 @@ class TestResolveAllowlist:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
+        config = _mock_config()
+        al = _resolve_allowlist(config)  # type: ignore[arg-type]
+        assert isinstance(al, AllowList)
+
+    def test_malformed_pyproject_allowlist_falls_back_to_builtins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken allowlist path in pyproject.toml must not break collection."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nallowlist = "missing.yaml"\n')
         config = _mock_config()
         al = _resolve_allowlist(config)  # type: ignore[arg-type]
         assert isinstance(al, AllowList)
@@ -774,3 +785,176 @@ class TestPytestSessionfinishVerbose:
         assert "FAMILY" not in out
         assert "198.51.100.1" in out
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# _resolve_enabled
+# ---------------------------------------------------------------------------
+
+
+def _mock_config_enabled(cli_flag: bool = False) -> MagicMock:
+    config = MagicMock(spec=["getoption"])
+
+    def _getoption(name: str) -> object:
+        if name == "--netaudit":
+            return cli_flag
+        return None
+
+    config.getoption.side_effect = _getoption
+    return config
+
+
+class TestResolveEnabled:
+    def test_cli_flag_true_returns_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = _mock_config_enabled(cli_flag=True)
+        assert _resolve_enabled(config) is True  # type: ignore[arg-type]
+
+    def test_no_flag_and_no_pyproject_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+    def test_pyproject_enabled_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is True  # type: ignore[arg-type]
+
+    def test_pyproject_enabled_false(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = false\n")
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+    def test_cli_flag_overrides_pyproject_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = false\n")
+        config = _mock_config_enabled(cli_flag=True)
+        assert _resolve_enabled(config) is True  # type: ignore[arg-type]
+
+    def test_pyproject_without_netaudit_section_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+    def test_non_bool_enabled_value_is_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nenabled = "yes"\n')
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+    def test_malformed_pyproject_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit\nenabled = true\n")
+        config = _mock_config_enabled(cli_flag=False)
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+    def test_option_not_registered_ignores_pyproject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A nested session without the plugin registered must never auto-enable.
+
+        Falling through to pyproject.toml here would re-exec a pytester
+        subprocess under strace just because the cwd opts in.
+        """
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        config = MagicMock(spec=["getoption"])
+        config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# pytest_configure — auto-enable via pyproject.toml
+# ---------------------------------------------------------------------------
+
+
+class TestPytestConfigureAutoEnable:
+    def _capture_execvpe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> list[tuple[str, list[str], dict[str, str]]]:
+        calls: list[tuple[str, list[str], dict[str, str]]] = []
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/strace" if x == "strace" else None)
+        monkeypatch.setattr(os, "execvpe", lambda n, a, e: calls.append((n, a, e)))
+        return calls
+
+    def test_reexecs_when_pyproject_enabled_without_cli_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        calls = self._capture_execvpe(monkeypatch)
+
+        pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+        assert len(calls) == 1
+        assert calls[0][0] == "strace"
+
+    def test_does_not_reexec_when_pyproject_enabled_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = false\n")
+        calls = self._capture_execvpe(monkeypatch)
+
+        pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+        assert calls == []
+
+    def test_does_not_reexec_when_no_config_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        calls = self._capture_execvpe(monkeypatch)
+
+        pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+        assert calls == []
+
+    def test_cli_flag_still_reexecs_without_pyproject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        calls = self._capture_execvpe(monkeypatch)
+
+        pytest_configure(_mock_config_enabled(cli_flag=True))  # type: ignore[arg-type]
+
+        assert len(calls) == 1
+
+    def test_auto_enabled_does_not_reexec_when_already_under_strace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        calls = self._capture_execvpe(monkeypatch)
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/fake.strace")
+
+        pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+        assert calls == []
+
+    def test_auto_enabled_raises_usage_error_when_strace_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: None)
+
+        with pytest.raises(pytest.UsageError, match="strace"):
+            pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]

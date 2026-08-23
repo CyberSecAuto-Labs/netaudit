@@ -17,10 +17,11 @@ import os
 import shutil
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 
 import pytest
 
@@ -115,6 +116,41 @@ def _attribute_violations(
     return {nodeid: _group_events(evts) for nodeid, evts in by_test.items()}
 
 
+def _pyproject_netaudit() -> dict[str, Any]:
+    """Read the ``[tool.netaudit]`` table from *pyproject.toml* in the cwd.
+
+    Returns an empty mapping when the file is absent, unreadable, malformed,
+    or carries no ``[tool.netaudit]`` table — configuration is best-effort and
+    must never break collection.
+    """
+    pyproject = Path("pyproject.toml")
+    if not pyproject.exists():
+        return {}
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except Exception:
+        return {}
+    tool_cfg = data.get("tool")
+    if not isinstance(tool_cfg, dict):
+        return {}
+    netaudit_cfg = tool_cfg.get("netaudit")
+    return netaudit_cfg if isinstance(netaudit_cfg, dict) else {}
+
+
+def _resolve_enabled(config: pytest.Config) -> bool:
+    """Resolve enabled: CLI flag > pyproject.toml > default (off)."""
+    try:
+        if bool(config.getoption("--netaudit")):
+            return True
+    except (ValueError, pytest.UsageError):
+        # Option not registered — the plugin is not active in this process
+        # (e.g. a nested pytester session). Never auto-enable in that case.
+        return False
+
+    enabled = _pyproject_netaudit().get("enabled")
+    return enabled if isinstance(enabled, bool) else False
+
+
 def _resolve_verbose(config: pytest.Config) -> bool:
     """Resolve verbose: CLI flag > pyproject.toml > default (off)."""
     try:
@@ -123,21 +159,8 @@ def _resolve_verbose(config: pytest.Config) -> bool:
     except (ValueError, pytest.UsageError):
         pass
 
-    pyproject = Path("pyproject.toml")
-    if pyproject.exists():
-        try:
-            import tomllib
-
-            data = tomllib.loads(pyproject.read_text())
-            tool_cfg = data.get("tool") or {}
-            netaudit_cfg = tool_cfg.get("netaudit") or {} if isinstance(tool_cfg, dict) else {}
-            verbose = netaudit_cfg.get("verbose")
-            if isinstance(verbose, bool):
-                return verbose
-        except Exception:
-            pass
-
-    return False
+    verbose = _pyproject_netaudit().get("verbose")
+    return verbose if isinstance(verbose, bool) else False
 
 
 def _resolve_allowlist(config: pytest.Config) -> AllowList:
@@ -146,18 +169,12 @@ def _resolve_allowlist(config: pytest.Config) -> AllowList:
     if cli_path is not None:
         return AllowList.from_yaml(Path(cli_path))
 
-    pyproject = Path("pyproject.toml")
-    if pyproject.exists():
+    al_path = _pyproject_netaudit().get("allowlist")
+    if isinstance(al_path, str):
         try:
-            import tomllib
-
-            data = tomllib.loads(pyproject.read_text())
-            tool_cfg = data.get("tool") or {}
-            netaudit_cfg = tool_cfg.get("netaudit") or {} if isinstance(tool_cfg, dict) else {}
-            al_path = netaudit_cfg.get("allowlist")
-            if isinstance(al_path, str):
-                return AllowList.from_yaml(Path(al_path))
+            return AllowList.from_yaml(Path(al_path))
         except Exception:
+            # Unreadable/malformed allowlist — fall through to the defaults below.
             pass
 
     default = Path(_DEFAULT_ALLOWLIST)
@@ -250,13 +267,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Re-exec the current process under strace when --netaudit is first seen."""
-    try:
-        enabled: bool = bool(config.getoption("--netaudit"))
-    except ValueError:
-        return  # option not yet registered (e.g. nested pytester session)
+    """Re-exec the current process under strace when auditing is enabled.
 
-    if not enabled or os.environ.get(_ENV_STRACE_OUT):
+    Enabled via ``--netaudit`` or ``enabled = true`` in ``[tool.netaudit]``.
+    """
+    if not _resolve_enabled(config) or os.environ.get(_ENV_STRACE_OUT):
         return  # disabled or already running under strace
 
     if shutil.which("strace") is None:
