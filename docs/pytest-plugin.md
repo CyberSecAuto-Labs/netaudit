@@ -85,6 +85,12 @@ Resolution order for `verbose`:
 | 2 | `verbose = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
 
+## Coloured output
+
+Violations are printed in red when the terminal supports it. The plugin follows
+pytest's own `--color` option — `--color=no` disables it, `--color=yes` forces it on
+even when output is captured — and the `NO_COLOR` environment variable.
+
 ## Output
 
 Violations are attributed to the individual test that triggered them:
