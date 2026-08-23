@@ -29,6 +29,7 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | `--format {text,json}` | `text` | Output format |
 | `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--no-color` | off | Disable coloured output |
+| `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -73,6 +74,7 @@ netaudit analyze [OPTIONS] STRACE_LOG
 | `--format {text,json}` | `text` | Output format |
 | `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--no-color` | off | Disable coloured output |
+| `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -173,6 +175,27 @@ The non-verbose report is already one row per destination, so no summary is adde
 
 In `--format json` the same data is always available under `summary.by_destination`,
 regardless of `--verbose`.
+
+## Suggesting rules
+
+`--suggest-rules` prints a ready-to-paste allowlist block for every violation:
+
+```console
+$ netaudit analyze --suggest-rules trace.log
+...
+# Suggested rules to allow these connections:
+  - name: "allow 198.51.100.1:443"
+    family: AF_INET
+    addr: 198.51.100.1
+    port: 443
+```
+
+Rules are scoped as narrowly as the observed connection allows — exact address, and
+exact port when the connection had one. Paste them under the `allowlist:` key of your
+config to turn a violation into an explicit, reviewable exception.
+
+Suggestions never change the exit code: a run with violations still exits 1.
+With `--format json` they appear under the `suggested_rules` key instead.
 
 ## Coloured output
 

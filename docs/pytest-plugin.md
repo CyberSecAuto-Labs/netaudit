@@ -59,6 +59,7 @@ The plugin resolves the allowlist in this priority order:
 | `--netaudit` | Enable network auditing for this session |
 | `--netaudit-allowlist YAML` | Path to allowlist YAML file |
 | `--netaudit-verbose` | Show all network events (allowed and violations) with rule names |
+| `--netaudit-suggest-rules` | Print allowlist YAML that would permit each violation |
 
 ## Verbose mode
 
@@ -107,6 +108,18 @@ rather than "which tests hit this host?":
 ADDR:PORT                       COUNT  TESTS
 ------------------------------ ------  ------------------------
 198.51.100.1:443                    3  test_api.py::test_fetch, test_api.py::test_sync
+```
+
+## Suggesting rules
+
+Pass `--netaudit-suggest-rules`, or set `suggest_rules = true` in `[tool.netaudit]`,
+to append copy-paste-ready allowlist YAML to the report. A destination reached by
+several tests yields a single rule, not one per test.
+
+```toml
+[tool.netaudit]
+enabled = true
+suggest_rules = true
 ```
 
 ## Coloured output
