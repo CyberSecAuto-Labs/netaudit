@@ -27,7 +27,7 @@ import pytest
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
-from netaudit.reporter import Reporter, Violation
+from netaudit.reporter import _BOLD, _RED, Reporter, Violation, _paint, supports_color
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
@@ -137,6 +137,19 @@ def _pyproject_netaudit() -> dict[str, Any]:
     return netaudit_cfg if isinstance(netaudit_cfg, dict) else {}
 
 
+def _resolve_color(session: pytest.Session) -> bool:
+    """Colour follows pytest's own ``--color`` option (yes/no/auto)."""
+    try:
+        mode = session.config.getoption("color", "auto")
+    except (ValueError, pytest.UsageError):
+        return False
+    if mode == "yes":
+        return True
+    if mode == "no":
+        return False
+    return supports_color(sys.stdout)
+
+
 def _resolve_enabled(config: pytest.Config) -> bool:
     """Resolve enabled: CLI flag > pyproject.toml > default (off)."""
     try:
@@ -207,6 +220,7 @@ def _emit_attributed_verbose(
             by_test.setdefault("<session>", []).append(event)
 
     has_violations = any(not allowlist.is_allowed(e) for e in events)
+    color = _resolve_color(session)
 
     border = "=" * 60
     print(f"\n{border}")
@@ -214,7 +228,7 @@ def _emit_attributed_verbose(
     print(border)
     for nodeid, test_events in sorted(by_test.items()):
         print(f"\n  [{nodeid}]")
-        Reporter.format_verbose(test_events, allowlist, stream=sys.stdout)
+        Reporter.format_verbose(test_events, allowlist, stream=sys.stdout, color=color)
     print(f"{border}\n")
 
     if has_violations:
@@ -226,15 +240,16 @@ def _emit_attributed(
     session: pytest.Session,
 ) -> None:
     total = sum(len(vs) for vs in violations_by_test.values())
+    color = _resolve_color(session)
     border = "=" * 60
     print(f"\n{border}")
     noun = "violation" if total == 1 else "violations"
-    print(f"  netaudit: {total} {noun} detected")
+    print(_paint(f"  netaudit: {total} {noun} detected", _BOLD + _RED, color))
     print(border)
     for nodeid, violations in sorted(violations_by_test.items()):
         print(f"\n  [{nodeid}]")
         for v in violations:
-            print(f"    {v}")
+            print("    " + _paint(str(v), _RED, color))
     print(f"{border}\n")
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

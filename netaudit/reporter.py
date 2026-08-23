@@ -4,11 +4,41 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
+
+# ---------------------------------------------------------------------------
+# Colour
+# ---------------------------------------------------------------------------
+
+_RESET = "\033[0m"
+_RED = "\033[31m"
+_GREEN = "\033[32m"
+_BOLD = "\033[1m"
+
+
+def supports_color(stream: TextIO | None = None) -> bool:
+    """True when ANSI colour should be written to *stream* (default: stdout).
+
+    Honours the `NO_COLOR <https://no-color.org/>`_ convention: the variable
+    disables colour when present *and non-empty*, whatever its value.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    target = sys.stdout if stream is None else stream
+    isatty = getattr(target, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _paint(text: str, code: str, color: bool) -> str:
+    """Wrap *text* in an ANSI *code* when *color* is on, else return it plain."""
+    return f"{code}{text}{_RESET}" if color else text
+
 
 # ---------------------------------------------------------------------------
 # Violation
@@ -69,21 +99,26 @@ class Reporter:
         return list(violations.values())
 
     @staticmethod
-    def format(violations: list[Violation], stream: TextIO | None = None) -> str:
+    def format(
+        violations: list[Violation],
+        stream: TextIO | None = None,
+        color: bool = False,
+    ) -> str:
         """Render violations as a human-readable box. Returns the string and
         optionally writes it to *stream*."""
         buf = io.StringIO()
         if not violations:
-            buf.write("netaudit: no violations\n")
+            buf.write(_paint("netaudit: no violations", _GREEN, color) + "\n")
         else:
             count = len(violations)
             noun = "violation" if count == 1 else "violations"
             border = "=" * 60
+            heading = f"  netaudit: {count} {noun} detected"
             buf.write(f"\n{border}\n")
-            buf.write(f"  netaudit: {count} {noun} detected\n")
+            buf.write(_paint(heading, _BOLD + _RED, color) + "\n")
             buf.write(f"{border}\n")
             for v in violations:
-                buf.write(f"  {v}\n")
+                buf.write("  " + _paint(str(v), _RED, color) + "\n")
             buf.write(f"{border}\n\n")
 
         result = buf.getvalue()
@@ -96,6 +131,7 @@ class Reporter:
         events: list[ConnectEvent],
         allowlist: AllowList,
         stream: TextIO | None = None,
+        color: bool = False,
     ) -> str:
         """Render all events as a table annotated with OK/VIOLATION and rule name."""
         col_family = 12
@@ -120,10 +156,11 @@ class Reporter:
             status = "OK" if rule is not None else "VIOLATION"
             rule_name = rule.name if rule is not None else "-"
             addr = _addr_str(event)
-            row = (
-                f"{event.family:<{col_family}} {addr:<{col_addr}}"
-                f" {status:<{col_status}} {rule_name}"
+            # Pad first, then paint — ANSI codes must not count toward the width.
+            status_cell = _paint(
+                f"{status:<{col_status}}", _GREEN if rule is not None else _RED, color
             )
+            row = f"{event.family:<{col_family}} {addr:<{col_addr}} {status_cell} {rule_name}"
             buf.write(row + "\n")
 
         result = buf.getvalue()
