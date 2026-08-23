@@ -85,6 +85,18 @@ Resolution order for `verbose`:
 | 2 | `verbose = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
 
+## Summary table
+
+After the per-test violations, a summary maps each destination to the tests that
+reached it — the inverse of the detail block, which answers "what did this test do?"
+rather than "which tests hit this host?":
+
+```
+ADDR:PORT                       COUNT  TESTS
+------------------------------ ------  ------------------------
+198.51.100.1:443                    3  test_api.py::test_fetch, test_api.py::test_sync
+```
+
 ## Coloured output
 
 Violations are printed in red when the terminal supports it. The plugin follows

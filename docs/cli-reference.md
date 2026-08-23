@@ -157,6 +157,23 @@ Adds an `"events"` array containing every network event with `"status"` and `"ru
 }
 ```
 
+## Summary table
+
+With `--verbose`, a compact per-destination overview follows the event table:
+
+```
+ADDR:PORT                       COUNT  PIDS
+------------------------------ ------  ------------------------
+198.51.100.1:443                    3  100, 101
+203.0.113.7:80                      1  102
+```
+
+Destinations are sorted loudest-first, so the noisiest offender is the top row.
+The non-verbose report is already one row per destination, so no summary is added there.
+
+In `--format json` the same data is always available under `summary.by_destination`,
+regardless of `--verbose`.
+
 ## Coloured output
 
 Violations are printed in red and clean results in green when stdout is a terminal.
