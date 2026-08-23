@@ -44,7 +44,7 @@ Fields:
 |-------|----------|-------------|
 | `addr` | one of `addr`/`cidr` | Exact IPv4 address |
 | `cidr` | one of `addr`/`cidr` | IPv4 CIDR block |
-| `port` | no | If omitted, any port is allowed |
+| `port` | no | Restricts the rule to a single port. If omitted, any port is allowed |
 
 ### `AF_INET6` — IPv6
 
@@ -138,3 +138,25 @@ allowlist:
     addr: "2a04:4e42::223"
     port: 443
 ```
+
+## Port scoping
+
+A rule that declares `port` matches **only** that port:
+
+```yaml
+- name: "Internal proxy"
+  family: AF_INET
+  addr: 10.0.0.1
+  port: 9393     # 10.0.0.1:9393 is allowed; 10.0.0.1:22 is a violation
+```
+
+Omit `port` to allow any port on the address or CIDR block. A `port` that is not a
+whole number in the range 0–65535 is rejected when the file is loaded, rather than
+being ignored — a silently dropped port would make the allowlist broader than it reads.
+
+!!! warning "Behaviour change in 0.6.0"
+    Before 0.6.0 the `port` field was parsed but never enforced, so a rule declaring
+    `port: 9393` in fact allowed **every** port on that address. Allowlists relying on
+    that behaviour will now report violations for the ports they never explicitly
+    allowed. Either add the missing ports or drop `port` from the rule to restore the
+    old, broader match.
