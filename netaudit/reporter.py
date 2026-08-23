@@ -209,12 +209,49 @@ class Reporter:
         return result
 
     @staticmethod
+    def format_suggestions(
+        violations: list[Violation],
+        stream: TextIO | None = None,
+        color: bool = False,
+    ) -> str:
+        """Emit allowlist YAML that would permit each violating connection.
+
+        Output is a bare rule list, ready to paste under the ``allowlist:`` key of
+        a netaudit config. Rules are scoped as narrowly as the event allows —
+        exact address and, where the connection had one, exact port.
+        """
+        if not violations:
+            return ""
+
+        buf = io.StringIO()
+        buf.write(_paint("# Suggested rules to allow these connections:", _BOLD, color) + "\n")
+        for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
+            if v.family == "AF_UNIX":
+                buf.write(f'  - name: "allow {v.addr}"\n')
+                buf.write("    family: AF_UNIX\n")
+                buf.write(f"    path_glob: {v.addr}\n")
+                continue
+            # Quote IPv6 literals — bare colons are not valid YAML scalars here.
+            addr = f'"{v.addr}"' if v.family == "AF_INET6" else str(v.addr)
+            buf.write(f'  - name: "allow {v._addr_str()}"\n')
+            buf.write(f"    family: {v.family}\n")
+            buf.write(f"    addr: {addr}\n")
+            if v.port is not None:
+                buf.write(f"    port: {v.port}\n")
+
+        result = buf.getvalue()
+        if stream is not None:
+            stream.write(result)
+        return result
+
+    @staticmethod
     def format_json(
         violations: list[Violation],
         events: list[ConnectEvent] | None = None,
         allowlist: AllowList | None = None,
         include_allowed: bool = False,
         tests_by_key: dict[_ViolationKey, set[str]] | None = None,
+        suggest_rules: bool = False,
     ) -> str:
         """Render violations (and optionally all events) as a JSON string."""
         violations_data = [
@@ -244,6 +281,20 @@ class Reporter:
             "violations": violations_data,
             "summary": {"total": len(violations), "by_destination": by_destination},
         }
+        if suggest_rules:
+            data["suggested_rules"] = [
+                {
+                    k: val
+                    for k, val in (
+                        ("name", f"allow {v._addr_str()}"),
+                        ("family", v.family),
+                        ("addr", v.addr),
+                        ("port", v.port),
+                    )
+                    if val is not None
+                }
+                for v in sorted(violations, key=lambda x: (-x.count, x._addr_str()))
+            ]
         if include_allowed and events is not None and allowlist is not None:
             annotated = []
             for event in events:

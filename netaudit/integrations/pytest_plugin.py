@@ -197,6 +197,18 @@ def _merge_by_destination(
     return list(merged.values()), tests_by_key
 
 
+def _resolve_suggest_rules(config: pytest.Config) -> bool:
+    """Resolve suggest-rules: CLI flag > pyproject.toml > default (off)."""
+    try:
+        if bool(config.getoption("--netaudit-suggest-rules")):
+            return True
+    except (ValueError, pytest.UsageError):
+        return False
+
+    value = _pyproject_netaudit().get("suggest_rules")
+    return value if isinstance(value, bool) else False
+
+
 def _resolve_color(session: pytest.Session) -> bool:
     """Colour follows pytest's own ``--color`` option (yes/no/auto)."""
     try:
@@ -299,6 +311,7 @@ def _emit_attributed(
     violations_by_test: dict[str, list[Violation]],
     session: pytest.Session,
     locations: dict[str, str] | None = None,
+    suggest_rules: bool = False,
 ) -> None:
     total = sum(len(vs) for vs in violations_by_test.values())
     color = _resolve_color(session)
@@ -318,6 +331,11 @@ def _emit_attributed(
     merged, tests_by_key = _merge_by_destination(violations_by_test)
     print()
     Reporter.format_summary(merged, tests_by_key=tests_by_key, stream=sys.stdout, color=color)
+    if suggest_rules:
+        # `merged` is already one entry per destination, so the same host hit by
+        # several tests yields a single rule rather than one per test.
+        print()
+        Reporter.format_suggestions(merged, stream=sys.stdout, color=color)
     print(f"{border}\n")
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
@@ -340,6 +358,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         metavar="YAML",
         default=None,
         help="Allowlist YAML file (overrides pyproject.toml and netaudit.yaml).",
+    )
+    group.addoption(
+        "--netaudit-suggest-rules",
+        action="store_true",
+        default=False,
+        help="Print copy-paste-ready allowlist YAML for each violation.",
     )
     group.addoption(
         "--netaudit-verbose",
@@ -442,7 +466,12 @@ def pytest_sessionfinish(
                     locations = {
                         tr.nodeid: tr.location for tr in test_ranges if tr.location is not None
                     }
-                    _emit_attributed(violations_by_test, session, locations=locations)
+                    _emit_attributed(
+                        violations_by_test,
+                        session,
+                        locations=locations,
+                        suggest_rules=_resolve_suggest_rules(session.config),
+                    )
         else:
             violations = Reporter.check(events, allowlist)
             if verbose:

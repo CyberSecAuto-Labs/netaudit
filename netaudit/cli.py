@@ -43,6 +43,7 @@ def _emit(
     events: list[ConnectEvent] | None = None,
     allowlist: AllowList | None = None,
     color: bool = False,
+    suggest_rules: bool = False,
 ) -> None:
     if fmt == "json":
         # JSON is machine-readable — never colourised.
@@ -52,6 +53,7 @@ def _emit(
                 events=events if verbose else None,
                 allowlist=allowlist if verbose else None,
                 include_allowed=verbose,
+                suggest_rules=suggest_rules,
             )
         )
     elif verbose and events is not None and allowlist is not None:
@@ -63,6 +65,10 @@ def _emit(
         Reporter.format_summary(violations, stream=sys.stdout, color=color)
     else:
         Reporter.format(violations, stream=sys.stdout, color=color)
+
+    if fmt != "json" and suggest_rules and violations:
+        print()
+        Reporter.format_suggestions(violations, stream=sys.stdout, color=color)
 
 
 @click.group()
@@ -93,12 +99,19 @@ def main() -> None:
     default=False,
     help="Disable coloured output (also honours the NO_COLOR environment variable).",
 )
+@click.option(
+    "--suggest-rules",
+    is_flag=True,
+    default=False,
+    help="Print copy-paste-ready allowlist YAML for each violation.",
+)
 @click.argument("command", nargs=-1, required=True)
 def run_cmd(
     allowlist: str | None,
     fmt: str,
     verbose: bool,
     no_color: bool,
+    suggest_rules: bool,
     command: tuple[str, ...],
 ) -> None:
     """Trace COMMAND under strace and report network violations."""
@@ -124,6 +137,7 @@ def run_cmd(
             events=events,
             allowlist=al,
             color=_resolve_color(no_color),
+            suggest_rules=suggest_rules,
         )
         sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
@@ -152,9 +166,20 @@ def run_cmd(
     default=False,
     help="Disable coloured output (also honours the NO_COLOR environment variable).",
 )
+@click.option(
+    "--suggest-rules",
+    is_flag=True,
+    default=False,
+    help="Print copy-paste-ready allowlist YAML for each violation.",
+)
 @click.argument("strace_log", type=click.Path(exists=True, dir_okay=False))
 def analyze_cmd(
-    allowlist: str | None, fmt: str, verbose: bool, no_color: bool, strace_log: str
+    allowlist: str | None,
+    fmt: str,
+    verbose: bool,
+    no_color: bool,
+    suggest_rules: bool,
+    strace_log: str,
 ) -> None:
     """Analyze an existing strace log file for network violations."""
     al = _load_allowlist(allowlist)
@@ -167,5 +192,6 @@ def analyze_cmd(
         events=events,
         allowlist=al,
         color=_resolve_color(no_color),
+        suggest_rules=suggest_rules,
     )
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
