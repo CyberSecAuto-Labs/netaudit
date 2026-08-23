@@ -44,6 +44,9 @@ netaudit analyze /tmp/trace.log
 
 # Machine-readable output
 netaudit run --format json -- pytest
+
+# Suggest allowlist rules for anything that was blocked
+netaudit run --suggest-rules -- pytest
 ```
 
 Exit codes:
