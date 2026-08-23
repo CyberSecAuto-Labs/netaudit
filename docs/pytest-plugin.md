@@ -25,9 +25,21 @@ allowlist = "netaudit.yaml"
 verbose = true   # optional: show all events, not just violations
 ```
 
-!!! note
-    `enabled = true` in pyproject.toml is not yet auto-detected — pass `--netaudit`
-    on the command line or in `addopts`. This will be wired up in a future release.
+With `enabled = true`, a plain `pytest` audits the run — no `--netaudit` flag and no
+`addopts` entry needed. Setting `enabled = false` (or omitting the key) keeps the
+plugin inactive; `--netaudit` still works and overrides the file.
+
+Resolution order for `enabled`:
+
+| Priority | Source |
+|---|---|
+| 1 | `--netaudit` CLI flag |
+| 2 | `enabled = true` in `[tool.netaudit]` in `pyproject.toml` |
+| 3 | Default: off |
+
+The `pyproject.toml` is read from the current working directory. Because activation
+re-executes the test process under strace, it is resolved before collection starts —
+so `enabled` must live in `pyproject.toml`, not in a conftest or an ini option.
 
 ## Allowlist resolution
 
