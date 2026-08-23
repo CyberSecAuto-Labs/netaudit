@@ -210,6 +210,17 @@ def _resolve_suggest_rules(config: pytest.Config) -> bool:
     return value if isinstance(value, bool) else False
 
 
+def _fail_session(session: pytest.Session) -> None:
+    """Mark the session failed without downgrading a more severe status.
+
+    Violations *add* a failure; they must never mask one. pytest's exit codes
+    ascend in severity past TESTS_FAILED — INTERRUPTED, INTERNAL_ERROR,
+    USAGE_ERROR — so overwriting unconditionally would hide the worse problem.
+    """
+    if not session.exitstatus:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def _resolve_report_path(config: pytest.Config) -> str | None:
     """Resolve the saved-report path: CLI flag > pyproject.toml > None."""
     try:
@@ -335,7 +346,7 @@ def _emit_attributed_verbose(
     print(f"{border}\n")
 
     if has_violations:
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        _fail_session(session)
 
 
 def _emit_attributed(
@@ -368,7 +379,7 @@ def _emit_attributed(
         print()
         Reporter.format_suggestions(merged, stream=sys.stdout, color=color)
     print(f"{border}\n")
-    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    _fail_session(session)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +532,7 @@ def pytest_sessionfinish(
             else:
                 Reporter.format(violations, stream=sys.stdout)
             if violations:
-                session.exitstatus = pytest.ExitCode.TESTS_FAILED
+                _fail_session(session)
     finally:
         strace_file.unlink(missing_ok=True)
         if markers_path_str:

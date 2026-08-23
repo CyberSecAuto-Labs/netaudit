@@ -32,6 +32,9 @@ _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
 _EXIT_STRACE_MISSING = 2
 _EXIT_BAD_REPORT = 2
+#: `run` reserves a code of its own for violations, because every other value
+#: belongs to the wrapped command — swallowing that would hide its failure.
+_EXIT_TRACED_VIOLATIONS = 3
 
 
 def _load_allowlist(allowlist: str | None) -> AllowList:
@@ -204,7 +207,8 @@ def run_cmd(
         strace_out = Path(tf.name)
 
     try:
-        runner.run(list(command), strace_out)
+        completed = runner.run(list(command), strace_out)
+        command_code = completed.returncode
         events = StraceParser().parse_stream(strace_out.read_text().splitlines())
         violations = Reporter.check(events, al)
         _emit(
@@ -215,10 +219,24 @@ def run_cmd(
             allowlist=al,
             color=_resolve_color(no_color),
             suggest_rules=suggest_rules,
-            run=build_run_metadata(command=list(command), allowlist=allowlist),
+            run=build_run_metadata(
+                command=list(command),
+                allowlist=allowlist,
+                command_exit_code=command_code,
+            ),
             output=output,
         )
-        sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
+        if command_code != 0:
+            # Surface it: codes 2 and 3 are netaudit's own, so a propagated
+            # value could otherwise be misread as netaudit's verdict.
+            click.echo(
+                f"netaudit: traced command exited with {command_code}",
+                err=True,
+            )
+            # The command's failure leads. It may have died part-way, which makes
+            # the trace — and therefore the violation set — incomplete.
+            sys.exit(command_code)
+        sys.exit(_EXIT_TRACED_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
         strace_out.unlink(missing_ok=True)
 
