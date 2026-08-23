@@ -27,7 +27,15 @@ import pytest
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
-from netaudit.reporter import _BOLD, _RED, Reporter, Violation, _paint, supports_color
+from netaudit.reporter import (
+    _BOLD,
+    _RED,
+    Reporter,
+    Violation,
+    _paint,
+    _ViolationKey,
+    supports_color,
+)
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
@@ -135,6 +143,36 @@ def _pyproject_netaudit() -> dict[str, Any]:
         return {}
     netaudit_cfg = tool_cfg.get("netaudit")
     return netaudit_cfg if isinstance(netaudit_cfg, dict) else {}
+
+
+def _merge_by_destination(
+    violations_by_test: dict[str, list[Violation]],
+) -> tuple[list[Violation], dict[_ViolationKey, set[str]]]:
+    """Collapse per-test violations into one row per destination.
+
+    The same destination hit by several tests yields separate ``Violation``
+    objects; the summary needs them merged, plus the inverse mapping of
+    destination to the tests that reached it.
+    """
+    merged: dict[_ViolationKey, Violation] = {}
+    tests_by_key: dict[_ViolationKey, set[str]] = {}
+    for nodeid, violations in violations_by_test.items():
+        for v in violations:
+            existing = merged.get(v.key)
+            if existing is None:
+                merged[v.key] = Violation(
+                    family=v.family,
+                    addr=v.addr,
+                    port=v.port,
+                    pids=set(v.pids),
+                    count=v.count,
+                    first_timestamp=v.first_timestamp,
+                )
+            else:
+                existing.pids |= v.pids
+                existing.count += v.count
+            tests_by_key.setdefault(v.key, set()).add(nodeid)
+    return list(merged.values()), tests_by_key
 
 
 def _resolve_color(session: pytest.Session) -> bool:
@@ -250,6 +288,10 @@ def _emit_attributed(
         print(f"\n  [{nodeid}]")
         for v in violations:
             print("    " + _paint(str(v), _RED, color))
+
+    merged, tests_by_key = _merge_by_destination(violations_by_test)
+    print()
+    Reporter.format_summary(merged, tests_by_key=tests_by_key, stream=sys.stdout, color=color)
     print(f"{border}\n")
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

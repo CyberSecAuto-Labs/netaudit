@@ -56,6 +56,11 @@ def _emit(
         )
     elif verbose and events is not None and allowlist is not None:
         Reporter.format_verbose(events, allowlist, stream=sys.stdout, color=color)
+        # The verbose table is per-event; the summary aggregates it per destination.
+        # In non-verbose mode the detail block is already one row per destination,
+        # so a summary there would repeat it verbatim.
+        print()
+        Reporter.format_summary(violations, stream=sys.stdout, color=color)
     else:
         Reporter.format(violations, stream=sys.stdout, color=color)
 

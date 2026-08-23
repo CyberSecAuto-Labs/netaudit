@@ -169,11 +169,52 @@ class Reporter:
         return result
 
     @staticmethod
+    def format_summary(
+        violations: list[Violation],
+        tests_by_key: dict[_ViolationKey, set[str]] | None = None,
+        stream: TextIO | None = None,
+        color: bool = False,
+    ) -> str:
+        """Render a compact per-destination overview of *violations*.
+
+        The third column adapts to the caller: test nodeids when *tests_by_key*
+        supplies attribution (pytest), otherwise the PIDs that made the calls
+        (CLI). Returns the empty string when there is nothing to summarise.
+        """
+        if not violations:
+            return ""
+
+        col_addr = 30
+        col_count = 6
+        label = "TESTS" if tests_by_key is not None else "PIDS"
+
+        header = f"{'ADDR:PORT':<{col_addr}} {'COUNT':>{col_count}}  {label}"
+        sep = f"{'-' * col_addr} {'-' * col_count}  {'-' * 24}"
+
+        buf = io.StringIO()
+        buf.write(_paint(header, _BOLD, color) + "\n")
+        buf.write(sep + "\n")
+        # Loudest destination first; ties broken by address for stable output.
+        for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
+            if tests_by_key is not None:
+                third = ", ".join(sorted(tests_by_key.get(v.key, set()))) or "-"
+            else:
+                third = ", ".join(str(pid) for pid in sorted(v.pids))
+            addr = _paint(f"{v._addr_str():<{col_addr}}", _RED, color)
+            buf.write(f"{addr} {v.count:>{col_count}}  {third}\n")
+
+        result = buf.getvalue()
+        if stream is not None:
+            stream.write(result)
+        return result
+
+    @staticmethod
     def format_json(
         violations: list[Violation],
         events: list[ConnectEvent] | None = None,
         allowlist: AllowList | None = None,
         include_allowed: bool = False,
+        tests_by_key: dict[_ViolationKey, set[str]] | None = None,
     ) -> str:
         """Render violations (and optionally all events) as a JSON string."""
         violations_data = [
@@ -186,9 +227,22 @@ class Reporter:
             }
             for v in violations
         ]
+        by_destination: list[dict[str, Any]] = []
+        for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
+            dest: dict[str, Any] = {
+                "family": v.family,
+                "addr": v.addr,
+                "port": v.port,
+                "count": v.count,
+                "pids": sorted(v.pids),
+            }
+            if tests_by_key is not None:
+                dest["tests"] = sorted(tests_by_key.get(v.key, set()))
+            by_destination.append(dest)
+
         data: dict[str, Any] = {
             "violations": violations_data,
-            "summary": {"total": len(violations)},
+            "summary": {"total": len(violations), "by_destination": by_destination},
         }
         if include_allowed and events is not None and allowlist is not None:
             annotated = []
