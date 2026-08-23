@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -61,7 +62,8 @@ class TestParseMarkers:
     def test_single_test(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text(
-            "START 10.000000 tests/test_foo.py::test_a\nEND 10.500000 tests/test_foo.py::test_a\n"
+            "START\t10.000000\t\ttests/test_foo.py::test_a\n"
+            "END\t10.500000\t\ttests/test_foo.py::test_a\n"
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
@@ -71,7 +73,10 @@ class TestParseMarkers:
 
     def test_multiple_tests(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("START 10.0 test_a\nEND 10.5 test_a\nSTART 10.6 test_b\nEND 11.0 test_b\n")
+        f.write_text(
+            "START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
+            "START\t10.6\t\ttest_b\nEND\t11.0\t\ttest_b\n"
+        )
         ranges = _parse_markers(f)
         assert len(ranges) == 2
         assert ranges[0].nodeid == "test_a"
@@ -79,13 +84,15 @@ class TestParseMarkers:
 
     def test_ignores_malformed_lines(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("garbage\nSTART bad_ts test_a\nSTART 10.0 test_a\nEND 10.5 test_a\n")
+        f.write_text(
+            "garbage\nSTART\tbad_ts\t\ttest_a\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
+        )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
 
     def test_unmatched_start_is_dropped(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("START 10.0 test_a\n")  # no END
+        f.write_text("START\t10.0\t\ttest_a\n")  # no END
         ranges = _parse_markers(f)
         assert ranges == []
 
@@ -456,7 +463,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -483,7 +490,7 @@ class TestPytestSessionfinish:
             'sin_port=htons(80), sin_addr=inet_addr("127.0.0.1")}, 16) = 0\n'
         )
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -505,7 +512,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -709,7 +716,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -753,7 +760,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_LOOPBACK)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -776,7 +783,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -1086,3 +1093,96 @@ class TestEmitAttributedSummary:
         out = capsys.readouterr().out
         row = next(ln for ln in out.splitlines() if ln.startswith("1.2.3.4:80"))
         assert "test_a, test_b" in row
+
+
+# ---------------------------------------------------------------------------
+# Test node linking (file:line)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerLocations:
+    def test_location_is_parsed(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text(
+            "START\t10.0\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
+            "END\t10.5\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
+        )
+        ranges = _parse_markers(f)
+        assert len(ranges) == 1
+        assert ranges[0].location == "tests/test_api.py:42"
+
+    def test_empty_location_becomes_none(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text("START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        assert _parse_markers(f)[0].location is None
+
+    def test_nodeid_with_spaces_survives(self, tmp_path: Path) -> None:
+        """Parametrized nodeids contain spaces — tabs keep the field intact."""
+        nodeid = "tests/test_api.py::test_p[a b c]"
+        f = tmp_path / "m"
+        f.write_text(f"START\t10.0\tf.py:1\t{nodeid}\nEND\t10.5\tf.py:1\t{nodeid}\n")
+        assert _parse_markers(f)[0].nodeid == nodeid
+
+    def test_wrong_field_count_ignored(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text("START\t10.0\ttest_a\n")
+        assert _parse_markers(f) == []
+
+
+class TestEmitAttributedLocations:
+    def _v(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_location_shown_next_to_nodeid(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed(
+            {"tests/test_api.py::test_a": [self._v()]},
+            session,
+            locations={"tests/test_api.py::test_a": "tests/test_api.py:42"},
+        )
+        out = capsys.readouterr().out
+        assert "tests/test_api.py::test_a" in out
+        assert "tests/test_api.py:42" in out
+
+    def test_nodeid_alone_when_location_unknown(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"tests/test_api.py::test_a": [self._v()]}, session, locations={})
+        out = capsys.readouterr().out
+        assert "tests/test_api.py::test_a" in out
+        assert ".py:" not in out.split("tests/test_api.py::test_a")[1].split("\n")[0]
+
+
+class TestRuntestProtocolLocation:
+    def test_writes_location_field(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        markers = tmp_path / "m"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        item = MagicMock()
+        item.nodeid = "tests/test_api.py::test_a"
+        item.location = ("tests/test_api.py", 41, "test_a")
+
+        gen = pytest_runtest_protocol(item, None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            next(gen)
+
+        lines = markers.read_text().splitlines()
+        assert lines[0].split("\t")[2] == "tests/test_api.py:42"  # 0-based -> 1-based
+
+    def test_missing_lineno_writes_empty_location(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        markers = tmp_path / "m"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        item = MagicMock()
+        item.nodeid = "test_a"
+        item.location = ("tests/test_api.py", None, "test_a")
+
+        gen = pytest_runtest_protocol(item, None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            next(gen)
+
+        assert markers.read_text().splitlines()[0].split("\t")[2] == ""
