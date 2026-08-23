@@ -85,6 +85,18 @@ Resolution order for `verbose`:
 | 2 | `verbose = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
 
+## Test node linking
+
+Each violation block is headed by the standard pytest nodeid, followed by the test's
+`file:line` so editors and terminals can jump straight to it:
+
+```
+  [tests/test_api.py::TestFetch::test_timeout]  (tests/test_api.py:42)
+    AF_INET 198.51.100.1:443 (count=1, pids=[4242])
+```
+
+The location is omitted when pytest reports no line number for the item.
+
 ## Summary table
 
 After the per-test violations, a summary maps each destination to the tests that
