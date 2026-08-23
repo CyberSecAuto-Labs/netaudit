@@ -388,3 +388,48 @@ class TestSummaryTable:
         result = CliRunner().invoke(main, ["analyze", "--verbose", str(self._log(tmp_path))])
         body = [ln for ln in result.output.splitlines() if ln.startswith("8.8.8.8")]
         assert body
+
+
+# ---------------------------------------------------------------------------
+# --suggest-rules
+# ---------------------------------------------------------------------------
+
+
+class TestSuggestRules:
+    def _log(self, tmp_path: Path) -> Path:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+        return log
+
+    def test_suggestions_printed_when_flag_set(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", "--suggest-rules", str(self._log(tmp_path))])
+        assert "Suggested rules" in result.output
+        assert "family: AF_INET" in result.output
+        assert "addr: 8.8.8.8" in result.output
+
+    def test_no_suggestions_without_flag(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", str(self._log(tmp_path))])
+        assert "Suggested rules" not in result.output
+
+    def test_no_suggestions_when_clean(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        result = CliRunner().invoke(main, ["analyze", "--suggest-rules", str(log)])
+        assert "Suggested rules" not in result.output
+        assert result.exit_code == 0
+
+    def test_exit_code_unchanged_by_suggestions(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", "--suggest-rules", str(self._log(tmp_path))])
+        assert result.exit_code == 1
+
+    def test_json_output_carries_suggestions(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(
+            main, ["analyze", "--suggest-rules", "--format", "json", str(self._log(tmp_path))]
+        )
+        data = json.loads(result.output)
+        assert data["suggested_rules"][0]["family"] == "AF_INET"
+        assert data["suggested_rules"][0]["addr"] == "8.8.8.8"
+
+    def test_run_command_accepts_suggest_rules(self) -> None:
+        result = CliRunner().invoke(main, ["run", "--help"])
+        assert "--suggest-rules" in result.output

@@ -24,6 +24,7 @@ from netaudit.integrations.pytest_plugin import (
     _resolve_allowlist,
     _resolve_color,
     _resolve_enabled,
+    _resolve_suggest_rules,
     _resolve_verbose,
     _TestRange,
     pytest_addoption,
@@ -306,12 +307,12 @@ class TestPytestAddoption:
         parser.getgroup.return_value = group
         pytest_addoption(parser)
         parser.getgroup.assert_called_once_with("netaudit", "Network egress auditing")
-        # --netaudit, --netaudit-allowlist, --netaudit-verbose
-        assert group.addoption.call_count == 3
+        assert group.addoption.call_count == 4
         option_names = [c.args[0] for c in group.addoption.call_args_list]
         assert "--netaudit" in option_names
         assert "--netaudit-allowlist" in option_names
         assert "--netaudit-verbose" in option_names
+        assert "--netaudit-suggest-rules" in option_names
 
 
 # ---------------------------------------------------------------------------
@@ -1186,3 +1187,70 @@ class TestRuntestProtocolLocation:
             next(gen)
 
         assert markers.read_text().splitlines()[0].split("\t")[2] == ""
+
+
+# ---------------------------------------------------------------------------
+# --netaudit-suggest-rules
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSuggestRules:
+    def _cfg(self, cli_flag: bool) -> MagicMock:
+        config = MagicMock(spec=["getoption"])
+
+        def _getoption(name: str, *default: object) -> object:
+            if name == "--netaudit-suggest-rules":
+                return cli_flag
+            return default[0] if default else None
+
+        config.getoption.side_effect = _getoption
+        return config
+
+    def test_cli_flag_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_suggest_rules(self._cfg(True)) is True  # type: ignore[arg-type]
+
+    def test_default_off(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_suggest_rules(self._cfg(False)) is False  # type: ignore[arg-type]
+
+    def test_pyproject_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nsuggest_rules = true\n")
+        assert _resolve_suggest_rules(self._cfg(False)) is True  # type: ignore[arg-type]
+
+    def test_option_not_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = MagicMock(spec=["getoption"])
+        config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_suggest_rules(config) is False  # type: ignore[arg-type]
+
+
+class TestEmitAttributedSuggestions:
+    def _v(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_suggestions_emitted_when_enabled(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v()]}, session, suggest_rules=True)
+        out = capsys.readouterr().out
+        assert "Suggested rules" in out
+        assert "addr: 1.2.3.4" in out
+        assert "port: 80" in out
+
+    def test_absent_by_default(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v()]}, session)
+        assert "Suggested rules" not in capsys.readouterr().out
+
+    def test_suggestions_deduplicated_across_tests(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed(
+            {"test_a": [self._v()], "test_b": [self._v()]}, session, suggest_rules=True
+        )
+        assert capsys.readouterr().out.count("addr: 1.2.3.4") == 1

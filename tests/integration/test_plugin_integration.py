@@ -295,3 +295,38 @@ class TestPluginNodeLinking:
         result = pytester.runpytest_subprocess("--netaudit")
         result.stdout.fnmatch_lines(["*ADDR:PORT*COUNT*TESTS*"])
         result.stdout.fnmatch_lines(["*198.51.100.1:443*test_egress.py::test_external*"])
+
+
+class TestPluginSuggestRules:
+    """Suggested rules must be valid enough to silence the violation they describe."""
+
+    _EGRESS = """
+        def test_external():
+            import socket
+            s = socket.socket()
+            s.setblocking(False)
+            try:
+                s.connect(("198.51.100.1", 443))
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                s.close()
+        """
+
+    def test_suggestions_printed(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-suggest-rules")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*Suggested rules*"])
+        result.stdout.fnmatch_lines(["*addr: 198.51.100.1*"])
+
+    def test_absent_without_flag(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        result = pytester.runpytest_subprocess("--netaudit")
+        assert "Suggested rules" not in result.stdout.str()
+
+    def test_enabled_via_pyproject(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        pytester.makepyprojecttoml("[tool.netaudit]\nenabled = true\nsuggest_rules = true\n")
+        result = pytester.runpytest_subprocess()
+        result.stdout.fnmatch_lines(["*Suggested rules*"])

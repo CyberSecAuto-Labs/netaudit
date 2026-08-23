@@ -3,6 +3,7 @@
 import io
 import json
 import re
+from pathlib import Path
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
@@ -388,3 +389,89 @@ class TestFormatJsonSummary:
     def test_empty_violations_gives_empty_by_destination(self) -> None:
         data = json.loads(Reporter.format_json([]))
         assert data["summary"]["by_destination"] == []
+
+
+# ---------------------------------------------------------------------------
+# Rule suggestions
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSuggestions:
+    def _violations(self, *events: ConnectEvent) -> list[Violation]:
+        return Reporter.check(list(events), AllowList.empty())
+
+    def test_ipv4_suggestion_includes_addr_and_port(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        assert "family: AF_INET" in out
+        assert "addr: 198.51.100.1" in out
+        assert "port: 443" in out
+
+    def test_ipv6_suggestion_quotes_the_address(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET6", "2001:db8::1", 8080)))
+        assert "family: AF_INET6" in out
+        assert 'addr: "2001:db8::1"' in out
+        assert "port: 8080" in out
+
+    def test_unix_socket_suggestion_uses_path_glob(self) -> None:
+        # Built-ins allow every AF_UNIX socket, so this path is only reachable
+        # for users who opted out of them.
+        strict = AllowList([], includes_builtins=False)
+        violations = Reporter.check([_event("AF_UNIX", "/run/x.sock")], strict)
+        out = Reporter.format_suggestions(violations)
+        assert "family: AF_UNIX" in out
+        assert "path_glob: /run/x.sock" in out
+        assert "port:" not in out
+
+    def test_port_omitted_when_event_has_none(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1")))
+        assert "addr: 198.51.100.1" in out
+        assert "port:" not in out
+
+    def test_each_destination_gets_one_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            self._violations(
+                _event("AF_INET", "198.51.100.1", 443),
+                _event("AF_INET", "203.0.113.7", 80),
+            )
+        )
+        assert out.count("- name:") == 2
+
+    def test_empty_violations_returns_empty_string(self) -> None:
+        assert Reporter.format_suggestions([]) == ""
+
+    def test_output_is_valid_yaml_and_round_trips(self) -> None:
+        """The whole point is copy-paste: the block must load as a real allowlist."""
+        import yaml
+
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        rules = yaml.safe_load(body)
+        assert isinstance(rules, list)
+        assert rules[0]["family"] == "AF_INET"
+        assert rules[0]["port"] == 443
+
+    def test_suggested_rule_actually_allows_the_connection(self, tmp_path: "Path") -> None:
+        """A suggestion that does not silence the violation is worthless."""
+
+        event = _event("AF_INET", "198.51.100.1", 443)
+        out = Reporter.format_suggestions(self._violations(event))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        y = tmp_path / "suggested.yaml"
+        y.write_text("version: 1\nallowlist:\n" + body + "\n")
+        assert AllowList.from_yaml(y).is_allowed(event) is True
+
+    def test_suggested_rule_does_not_allow_other_ports(self, tmp_path: "Path") -> None:
+
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        y = tmp_path / "suggested.yaml"
+        y.write_text("version: 1\nallowlist:\n" + body + "\n")
+        other = _event("AF_INET", "198.51.100.1", 22)
+        assert AllowList.from_yaml(y).is_allowed(other) is False
+
+    def test_writes_to_stream(self) -> None:
+        buf = io.StringIO()
+        out = Reporter.format_suggestions(
+            self._violations(_event("AF_INET", "198.51.100.1", 443)), stream=buf
+        )
+        assert buf.getvalue() == out
