@@ -60,6 +60,7 @@ The plugin resolves the allowlist in this priority order:
 | `--netaudit-allowlist YAML` | Path to allowlist YAML file |
 | `--netaudit-verbose` | Show all network events (allowed and violations) with rule names |
 | `--netaudit-suggest-rules` | Print allowlist YAML that would permit each violation |
+| `--netaudit-report PATH` | Write a JSON report to PATH for later analysis |
 
 ## Verbose mode
 
@@ -109,6 +110,24 @@ ADDR:PORT                       COUNT  TESTS
 ------------------------------ ------  ------------------------
 198.51.100.1:443                    3  test_api.py::test_fetch, test_api.py::test_sync
 ```
+
+## Saving a report
+
+`--netaudit-report PATH`, or `report = "..."` in `[tool.netaudit]`, writes a JSON report
+alongside the console output. Parent directories are created as needed.
+
+```toml
+[tool.netaudit]
+enabled = true
+report = "netaudit-report.json"
+```
+
+The plugin's report is the only one carrying **per-test attribution** — each entry in
+`summary.by_destination` lists the tests that reached that destination. The CLI has no
+notion of tests, so that information exists nowhere else.
+
+The strace log and marker sidecar are deleted when the session ends; the report is not.
+It is written whether or not the run had violations.
 
 ## Suggesting rules
 
