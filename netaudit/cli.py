@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -11,7 +13,16 @@ import click
 from netaudit import __version__
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
-from netaudit.reporter import Reporter, Violation, supports_color
+from netaudit.reporter import (
+    REPORT_VERSION,
+    MergedDestination,
+    Reporter,
+    Violation,
+    build_run_metadata,
+    load_report,
+    merge_reports,
+    supports_color,
+)
 from netaudit.runner import StraceNotFoundError, StraceRunner
 
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
@@ -20,6 +31,7 @@ _DEFAULT_ALLOWLIST = "netaudit.yaml"
 _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
 _EXIT_STRACE_MISSING = 2
+_EXIT_BAD_REPORT = 2
 
 
 def _load_allowlist(allowlist: str | None) -> AllowList:
@@ -29,6 +41,54 @@ def _load_allowlist(allowlist: str | None) -> AllowList:
     if default.exists():
         return AllowList.from_yaml(default)
     return AllowList.empty()
+
+
+def _write_report(
+    violations: list[Violation],
+    fmt: str,
+    verbose: bool,
+    events: list[ConnectEvent] | None,
+    allowlist: AllowList | None,
+    suggest_rules: bool,
+    run: dict[str, object] | None,
+    path: Path,
+) -> None:
+    """Render the report into *path* instead of stdout."""
+    if fmt == "json":
+        body = Reporter.format_json(
+            violations,
+            events=events if verbose else None,
+            allowlist=allowlist if verbose else None,
+            include_allowed=verbose,
+            suggest_rules=suggest_rules,
+            run=run,
+        )
+    else:
+        buf = io.StringIO()
+        if verbose and events is not None and allowlist is not None:
+            Reporter.format_verbose(events, allowlist, stream=buf)
+            buf.write("\n")
+            Reporter.format_summary(violations, stream=buf)
+        else:
+            Reporter.format(violations, stream=buf)
+        if suggest_rules and violations:
+            buf.write("\n")
+            Reporter.format_suggestions(violations, stream=buf)
+        body = buf.getvalue()
+    path.write_text(body)
+
+
+def _as_event(dest: MergedDestination) -> ConnectEvent:
+    """Adapt a merged destination back to an event so allowlist rules can match it."""
+    return ConnectEvent(
+        pid=0,
+        timestamp=0.0,
+        family=dest.family,
+        addr=dest.addr,
+        port=dest.port,
+        result=0,
+        raw_line="",
+    )
 
 
 def _resolve_color(no_color: bool) -> bool:
@@ -44,7 +104,14 @@ def _emit(
     allowlist: AllowList | None = None,
     color: bool = False,
     suggest_rules: bool = False,
+    run: dict[str, object] | None = None,
+    output: str | None = None,
 ) -> None:
+    if output is not None:
+        # A file is not a terminal: never colourise a saved report, whatever
+        # stdout happens to be.
+        _write_report(violations, fmt, verbose, events, allowlist, suggest_rules, run, Path(output))
+        return
     if fmt == "json":
         # JSON is machine-readable — never colourised.
         click.echo(
@@ -54,6 +121,7 @@ def _emit(
                 allowlist=allowlist if verbose else None,
                 include_allowed=verbose,
                 suggest_rules=suggest_rules,
+                run=run,
             )
         )
     elif verbose and events is not None and allowlist is not None:
@@ -105,6 +173,14 @@ def main() -> None:
     default=False,
     help="Print copy-paste-ready allowlist YAML for each violation.",
 )
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    metavar="PATH",
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write the report to PATH instead of stdout (never coloured).",
+)
 @click.argument("command", nargs=-1, required=True)
 def run_cmd(
     allowlist: str | None,
@@ -112,6 +188,7 @@ def run_cmd(
     verbose: bool,
     no_color: bool,
     suggest_rules: bool,
+    output: str | None,
     command: tuple[str, ...],
 ) -> None:
     """Trace COMMAND under strace and report network violations."""
@@ -138,6 +215,8 @@ def run_cmd(
             allowlist=al,
             color=_resolve_color(no_color),
             suggest_rules=suggest_rules,
+            run=build_run_metadata(command=list(command), allowlist=allowlist),
+            output=output,
         )
         sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
@@ -172,6 +251,14 @@ def run_cmd(
     default=False,
     help="Print copy-paste-ready allowlist YAML for each violation.",
 )
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    metavar="PATH",
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write the report to PATH instead of stdout (never coloured).",
+)
 @click.argument("strace_log", type=click.Path(exists=True, dir_okay=False))
 def analyze_cmd(
     allowlist: str | None,
@@ -179,6 +266,7 @@ def analyze_cmd(
     verbose: bool,
     no_color: bool,
     suggest_rules: bool,
+    output: str | None,
     strace_log: str,
 ) -> None:
     """Analyze an existing strace log file for network violations."""
@@ -193,5 +281,109 @@ def analyze_cmd(
         allowlist=al,
         color=_resolve_color(no_color),
         suggest_rules=suggest_rules,
+        run=build_run_metadata(source=strace_log, allowlist=allowlist),
+        output=output,
     )
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
+
+
+@main.command("undeclared")
+@click.option(
+    "--allowlist",
+    default=None,
+    metavar="YAML",
+    help="Existing allowlist — destinations it already permits are omitted.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["yaml", "json"]),
+    default="yaml",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--no-color",
+    is_flag=True,
+    default=False,
+    help="Disable coloured output (also honours the NO_COLOR environment variable).",
+)
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    metavar="PATH",
+    type=click.Path(dir_okay=False, writable=True),
+    help="Write the rules to PATH instead of stdout (never coloured).",
+)
+@click.argument("reports", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False))
+def undeclared_cmd(
+    allowlist: str | None,
+    fmt: str,
+    no_color: bool,
+    output: str | None,
+    reports: tuple[str, ...],
+) -> None:
+    """Report egress observed across saved JSON REPORTS that is not allowed.
+
+    Merges the destinations those runs reached but the allowlist does not permit,
+    and renders them as candidate rules annotated with the evidence behind each.
+
+    These are candidates to review, not recommendations: the reports contain
+    violations, and netaudit cannot distinguish egress nobody has declared yet
+    from egress that should never have happened. Which of them belong in the
+    allowlist is the reviewer's decision.
+
+    Exits 1 when undeclared egress is found and 0 when there is none, matching
+    `run` and `analyze`, so it works directly as a CI assertion.
+    """
+    try:
+        loaded = [load_report(Path(r)) for r in reports]
+    except ValueError as exc:
+        click.echo(f"netaudit: {exc}", err=True)
+        sys.exit(_EXIT_BAD_REPORT)
+
+    merged = merge_reports(loaded)
+
+    if allowlist is not None:
+        al = AllowList.from_yaml(Path(allowlist))
+        merged = [d for d in merged if not al.is_allowed(_as_event(d))]
+
+    if not merged:
+        # Status goes to stderr: stdout is data, and a redirected rules file
+        # must not pick up a human-readable line.
+        click.echo("netaudit: no undeclared egress found", err=True)
+        sys.exit(_EXIT_CLEAN)
+
+    color = False if output is not None else _resolve_color(no_color)
+    if fmt == "json":
+        body = json.dumps(
+            {
+                "version": REPORT_VERSION,
+                "run": build_run_metadata(source=", ".join(r.label for r in loaded)),
+                "suggested_rules": [
+                    {
+                        "name": f"allow {d.as_violation()._addr_str()}",
+                        "family": d.family,
+                        "addr": d.addr,
+                        **({"port": d.port} if d.port is not None else {}),
+                        "count": d.count,
+                        "reports": d.reports,
+                        "total_reports": d.total_reports,
+                        "external": d.is_external,
+                        **({"tests": sorted(d.tests)} if d.tests else {}),
+                    }
+                    for d in merged
+                ],
+            },
+            indent=2,
+        )
+    else:
+        body = Reporter.format_suggestions_with_evidence(merged, color=color)
+
+    if output is not None:
+        Path(output).write_text(body)
+    else:
+        click.echo(body, nl=False)
+    # Same sense as `run` and `analyze`: non-zero means something needs attention.
+    sys.exit(_EXIT_VIOLATIONS)
