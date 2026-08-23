@@ -7,6 +7,20 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
+def _netaudit_bin() -> str:
+    """Path to the installed console script.
+
+    `python -m netaudit.cli` is not usable: the module has no __main__ guard, so
+    it would import and exit 0 having run nothing.
+    """
+    import shutil
+
+    path = shutil.which("netaudit")
+    if path is None:  # pragma: no cover - integration env always installs it
+        pytest.skip("netaudit console script not on PATH")
+    return path
+
+
 class TestPluginSession:
     def test_loopback_allowed_by_default(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(
@@ -330,3 +344,119 @@ class TestPluginSuggestRules:
         pytester.makepyprojecttoml("[tool.netaudit]\nenabled = true\nsuggest_rules = true\n")
         result = pytester.runpytest_subprocess()
         result.stdout.fnmatch_lines(["*Suggested rules*"])
+
+
+class TestPluginSavedReport:
+    """The saved report is the durable input `netaudit undeclared` will consume."""
+
+    _EGRESS = """
+        def test_external():
+            import socket
+            s = socket.socket()
+            s.setblocking(False)
+            try:
+                s.connect(("198.51.100.1", 443))
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                s.close()
+        """
+
+    def test_report_written_with_test_attribution(self, pytester: pytest.Pytester) -> None:
+        import json
+
+        pytester.makepyfile(test_egress=self._EGRESS)
+        report = pytester.path / "report.json"
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
+        assert result.ret != 0
+        data = json.loads(report.read_text())
+        assert data["version"] == 1
+        assert data["run"]["netaudit_version"]
+        dest = data["summary"]["by_destination"][0]
+        assert dest["addr"] == "198.51.100.1"
+        assert dest["port"] == 443
+        assert dest["tests"] == ["test_egress.py::test_external"]
+
+    def test_report_survives_the_temp_file_cleanup(self, pytester: pytest.Pytester) -> None:
+        """strace/marker temp files are unlinked in a finally — the report must not be."""
+        pytester.makepyfile(test_egress=self._EGRESS)
+        report = pytester.path / "report.json"
+        pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
+        assert report.exists()
+
+    def test_report_via_pyproject(self, pytester: pytest.Pytester) -> None:
+        import json
+
+        pytester.makepyfile(test_egress=self._EGRESS)
+        pytester.makepyprojecttoml('[tool.netaudit]\nenabled = true\nreport = "out/report.json"\n')
+        pytester.runpytest_subprocess()
+        assert json.loads((pytester.path / "out" / "report.json").read_text())["version"] == 1
+
+
+class TestSuggestFromPluginReport:
+    """End-to-end: a plugin report feeds `netaudit undeclared` with test attribution."""
+
+    _EGRESS = """
+        def test_external():
+            import socket
+            s = socket.socket()
+            s.setblocking(False)
+            try:
+                s.connect(("198.51.100.1", 443))
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                s.close()
+        """
+
+    def test_suggest_names_the_test_that_caused_it(self, pytester: pytest.Pytester) -> None:
+        import subprocess
+
+        pytester.makepyfile(test_egress=self._EGRESS)
+        report = pytester.path / "report.json"
+        pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
+
+        out = subprocess.run(
+            [_netaudit_bin(), "undeclared", str(report)],
+            capture_output=True,
+            text=True,
+        )
+        # 1 = undeclared egress found, same sense as `run` and `analyze`.
+        assert out.returncode == 1, out.stderr
+        assert "addr: 198.51.100.1" in out.stdout
+        assert "port: 443" in out.stdout
+        assert "test_egress.py::test_external" in out.stdout
+
+    def test_suggested_rules_silence_the_original_violation(
+        self, pytester: pytest.Pytester
+    ) -> None:
+        import subprocess
+
+        pytester.makepyfile(test_egress=self._EGRESS)
+        report = pytester.path / "report.json"
+        pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
+
+        rules = pytester.path / "rules.yaml"
+        # Not check=True: finding undeclared egress is a non-zero exit by design.
+        suggested = subprocess.run(
+            [_netaudit_bin(), "undeclared", "--output", str(rules), str(report)],
+            capture_output=True,
+            text=True,
+        )
+        assert suggested.returncode == 1, suggested.stderr
+
+        allowlist = pytester.path / "netaudit.yaml"
+        allowlist.write_text("version: 1\nallowlist:\n" + rules.read_text())
+
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-allowlist", str(allowlist))
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+
+        # And the detector agrees: nothing undeclared remains against that allowlist.
+        recheck = subprocess.run(
+            [_netaudit_bin(), "undeclared", "--allowlist", str(allowlist), str(report)],
+            capture_output=True,
+            text=True,
+        )
+        assert recheck.returncode == 0, recheck.stdout
+        assert recheck.stdout.strip() == ""

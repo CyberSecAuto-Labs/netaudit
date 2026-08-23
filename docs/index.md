@@ -47,7 +47,14 @@ netaudit run --format json -- pytest
 
 # Suggest allowlist rules for anything that was blocked
 netaudit run --suggest-rules -- pytest
+
+# Save a report, then review undeclared egress across many saved runs
+netaudit run --format json --output report.json -- pytest
+netaudit undeclared reports/*.json
 ```
+
+`undeclared` reports what those runs touched that your allowlist does not permit — candidates
+to triage, not recommendations. See [Undeclared Egress](undeclared.md).
 
 Exit codes:
 

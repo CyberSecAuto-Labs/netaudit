@@ -10,7 +10,7 @@ netaudit/
 ├── parser.py          # Parses strace lines → ConnectEvent
 ├── allowlist.py       # YAML-driven rule engine
 ├── reporter.py        # Groups violations, formats output
-├── cli.py             # CLI entry point (run / analyze)
+├── cli.py             # CLI entry point (run / analyze / undeclared)
 └── integrations/
     └── pytest_plugin.py   # pytest integration (test attribution)
 ```
@@ -34,8 +34,26 @@ StraceParser          ← parser.py
 Reporter.check()      ← reporter.py + allowlist.py
   │ list[Violation]
   ▼
-Reporter.format()     → stdout (text or JSON)
+Reporter.format()     → stdout, or a saved report via --output
 ```
+
+A saved JSON report closes the loop back into the tool:
+
+```
+report.json (xN)
+  │
+  ▼
+load_report()         ← reporter.py
+  │ list[LoadedReport]
+  ▼
+merge_reports()       ← one MergedDestination per (family, addr, port)
+  │
+  ▼
+format_suggestions_with_evidence()  → allowlist YAML + provenance comments
+```
+
+This is what `netaudit undeclared` runs. Reports carry a schema `version`, and one whose
+version is unrecognised is refused rather than parsed optimistically.
 
 ---
 
@@ -97,6 +115,18 @@ JSON. Three further renderers build on the same `Violation` list:
 | `format_verbose()` | Every event — allowed and violating — annotated with the matching rule name |
 | `format_summary()` | One row per destination, loudest first; third column is test nodeids when attribution is available, PIDs otherwise |
 | `format_suggestions()` | Allowlist YAML that would permit each violation, scoped to exact address and port |
+| `format_suggestions_with_evidence()` | The same, for destinations merged across saved reports, annotated with counts and source reports |
+
+### Saved reports
+
+`build_run_metadata()` describes the run that produced a report — timestamp, hostname,
+netaudit version, and either the traced command or the analysed log. `Reporter` only
+embeds it; callers supply it, so the module stays free of environment introspection.
+
+`load_report()` reads a saved report into a `LoadedReport` (labelled by filename), and
+`merge_reports()` collapses destinations across several into `MergedDestination` objects
+carrying the evidence — total count, which reports saw it, and the tests responsible
+where the pytest plugin preserved them.
 
 `supports_color()` decides whether ANSI escapes are emitted: a TTY check plus the
 [NO_COLOR](https://no-color.org/) convention. Colour is passed explicitly into each

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,9 +25,11 @@ from netaudit.integrations.pytest_plugin import (
     _resolve_allowlist,
     _resolve_color,
     _resolve_enabled,
+    _resolve_report_path,
     _resolve_suggest_rules,
     _resolve_verbose,
     _TestRange,
+    _write_report,
     pytest_addoption,
     pytest_configure,
     pytest_runtest_protocol,
@@ -307,12 +310,13 @@ class TestPytestAddoption:
         parser.getgroup.return_value = group
         pytest_addoption(parser)
         parser.getgroup.assert_called_once_with("netaudit", "Network egress auditing")
-        assert group.addoption.call_count == 4
+        assert group.addoption.call_count == 5
         option_names = [c.args[0] for c in group.addoption.call_args_list]
         assert "--netaudit" in option_names
         assert "--netaudit-allowlist" in option_names
         assert "--netaudit-verbose" in option_names
         assert "--netaudit-suggest-rules" in option_names
+        assert "--netaudit-report" in option_names
 
 
 # ---------------------------------------------------------------------------
@@ -1254,3 +1258,140 @@ class TestEmitAttributedSuggestions:
             {"test_a": [self._v()], "test_b": [self._v()]}, session, suggest_rules=True
         )
         assert capsys.readouterr().out.count("addr: 1.2.3.4") == 1
+
+
+# ---------------------------------------------------------------------------
+# Saved report artifact
+# ---------------------------------------------------------------------------
+
+
+class TestResolveReportPath:
+    def _cfg(self, cli_value: str | None) -> MagicMock:
+        config = MagicMock(spec=["getoption"])
+
+        def _getoption(name: str, *default: object) -> object:
+            if name == "--netaudit-report":
+                return cli_value
+            return default[0] if default else None
+
+        config.getoption.side_effect = _getoption
+        return config
+
+    def test_cli_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_report_path(self._cfg("r.json")) == "r.json"  # type: ignore[arg-type]
+
+    def test_none_by_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_report_path(self._cfg(None)) is None  # type: ignore[arg-type]
+
+    def test_pyproject_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nreport = "out.json"\n')
+        assert _resolve_report_path(self._cfg(None)) == "out.json"  # type: ignore[arg-type]
+
+    def test_cli_overrides_pyproject(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nreport = "out.json"\n')
+        assert _resolve_report_path(self._cfg("cli.json")) == "cli.json"  # type: ignore[arg-type]
+
+    def test_option_not_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = MagicMock(spec=["getoption"])
+        config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_report_path(config) is None  # type: ignore[arg-type]
+
+
+class TestWriteReport:
+    def _v(self, addr: str = "1.2.3.4") -> Violation:
+        v = Violation(family="AF_INET", addr=addr, port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_report_has_version_and_run_block(self, tmp_path: Path) -> None:
+        out = tmp_path / "r.json"
+        _write_report({"test_a": [self._v()]}, out)
+        data = json.loads(out.read_text())
+        assert data["version"] == 1
+        assert data["run"]["netaudit_version"]
+        assert data["run"]["command"][:1] == ["pytest"]
+
+    def test_tests_attribution_survives_into_the_artifact(self, tmp_path: Path) -> None:
+        """The pytest path is the only source of per-test attribution."""
+        out = tmp_path / "r.json"
+        _write_report({"test_a": [self._v()], "test_b": [self._v()]}, out)
+        dest = json.loads(out.read_text())["summary"]["by_destination"][0]
+        assert dest["tests"] == ["test_a", "test_b"]
+        assert dest["count"] == 2
+
+    def test_distinct_destinations_kept_separate(self, tmp_path: Path) -> None:
+        out = tmp_path / "r.json"
+        _write_report({"test_a": [self._v("1.2.3.4"), self._v("5.6.7.8")]}, out)
+        assert len(json.loads(out.read_text())["summary"]["by_destination"]) == 2
+
+    def test_creates_parent_directories(self, tmp_path: Path) -> None:
+        out = tmp_path / "nested" / "dir" / "r.json"
+        _write_report({"test_a": [self._v()]}, out)
+        assert out.exists()
+
+    def test_clean_session_still_writes_a_report(self, tmp_path: Path) -> None:
+        out = tmp_path / "r.json"
+        _write_report({}, out)
+        assert json.loads(out.read_text())["summary"]["total"] == 0
+
+
+class TestSessionfinishWritesReport:
+    def _make_session(self, report: str | None) -> MagicMock:
+        config = MagicMock(spec=["getoption"])
+
+        def _getoption(name: str, *default: object) -> object:
+            if name == "--netaudit-report":
+                return report
+            if name == "color":
+                return "no"
+            if name in ("--netaudit-verbose", "--netaudit-suggest-rules"):
+                return False
+            return default[0] if default else None
+
+        config.getoption.side_effect = _getoption
+        session = MagicMock()
+        session.config = config
+        return session
+
+    def _setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        markers_file = tmp_path / "markers"
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.chdir(tmp_path)
+
+    def test_report_written_when_requested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        out = tmp_path / "report.json"
+        pytest_sessionfinish(session=self._make_session(str(out)), exitstatus=0)
+        capsys.readouterr()
+        data = json.loads(out.read_text())
+        assert data["version"] == 1
+        assert data["summary"]["by_destination"][0]["tests"] == ["test_a"]
+
+    def test_no_report_by_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        pytest_sessionfinish(session=self._make_session(None), exitstatus=0)
+        capsys.readouterr()
+        assert not list(tmp_path.glob("*.json"))
+
+    def test_report_does_not_change_exit_status(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        session = self._make_session(str(tmp_path / "report.json"))
+        pytest_sessionfinish(session=session, exitstatus=0)
+        capsys.readouterr()
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED

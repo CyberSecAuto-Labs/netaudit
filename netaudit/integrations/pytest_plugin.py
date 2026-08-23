@@ -34,6 +34,7 @@ from netaudit.reporter import (
     Violation,
     _paint,
     _ViolationKey,
+    build_run_metadata,
     supports_color,
 )
 
@@ -209,6 +210,36 @@ def _resolve_suggest_rules(config: pytest.Config) -> bool:
     return value if isinstance(value, bool) else False
 
 
+def _resolve_report_path(config: pytest.Config) -> str | None:
+    """Resolve the saved-report path: CLI flag > pyproject.toml > None."""
+    try:
+        cli_value = config.getoption("--netaudit-report")
+    except (ValueError, pytest.UsageError):
+        return None
+    if cli_value:
+        return str(cli_value)
+
+    value = _pyproject_netaudit().get("report")
+    return value if isinstance(value, str) else None
+
+
+def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) -> None:
+    """Save a JSON report carrying per-test attribution.
+
+    This is the only place test attribution survives into a durable artifact —
+    the CLI has no notion of tests — so ``summary.by_destination[].tests`` is
+    populated here for later consumers such as ``netaudit undeclared``.
+    """
+    merged, tests_by_key = _merge_by_destination(violations_by_test)
+    body = Reporter.format_json(
+        merged,
+        tests_by_key=tests_by_key,
+        run=build_run_metadata(command=["pytest", *sys.argv[1:]]),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
 def _resolve_color(session: pytest.Session) -> bool:
     """Colour follows pytest's own ``--color`` option (yes/no/auto)."""
     try:
@@ -360,6 +391,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Allowlist YAML file (overrides pyproject.toml and netaudit.yaml).",
     )
     group.addoption(
+        "--netaudit-report",
+        metavar="PATH",
+        default=None,
+        help="Write a JSON report to PATH for later analysis (e.g. netaudit undeclared).",
+    )
+    group.addoption(
         "--netaudit-suggest-rules",
         action="store_true",
         default=False,
@@ -458,10 +495,15 @@ def pytest_sessionfinish(
         markers_file = Path(markers_path_str) if markers_path_str else None
         if markers_file and markers_file.exists():
             test_ranges = _parse_markers(markers_file)
+            violations_by_test = _attribute_violations(events, allowlist, test_ranges)
+            report_path = _resolve_report_path(session.config)
+            if report_path:
+                # Written regardless of verbosity or whether anything violated —
+                # a clean report is still evidence of what the run observed.
+                _write_report(violations_by_test, Path(report_path))
             if verbose:
                 _emit_attributed_verbose(events, allowlist, test_ranges, session)
             else:
-                violations_by_test = _attribute_violations(events, allowlist, test_ranges)
                 if violations_by_test:
                     locations = {
                         tr.nodeid: tr.location for tr in test_ranges if tr.location is not None

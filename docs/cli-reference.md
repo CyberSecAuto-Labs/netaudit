@@ -30,6 +30,7 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--no-color` | off | Disable coloured output |
 | `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
+| `--output PATH` / `-o` | stdout | Write the report to PATH instead of stdout |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -75,6 +76,7 @@ netaudit analyze [OPTIONS] STRACE_LOG
 | `--verbose` / `-v` | off | Show all network events, not just violations |
 | `--no-color` | off | Disable coloured output |
 | `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
+| `--output PATH` / `-o` | stdout | Write the report to PATH instead of stdout |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -175,6 +177,80 @@ The non-verbose report is already one row per destination, so no summary is adde
 
 In `--format json` the same data is always available under `summary.by_destination`,
 regardless of `--verbose`.
+
+## `netaudit undeclared`
+
+```
+netaudit undeclared [OPTIONS] REPORT [REPORT ...]
+```
+
+Reports the egress that one or more **saved** JSON reports observed but the allowlist does
+not permit, merged across them with the evidence behind each entry. Entries are candidates
+to review, not recommendations — see [Undeclared Egress](undeclared.md) for the full workflow
+and how to read the annotations. Distinct from `--suggest-rules`, which describes only the run that just
+happened; `undeclared` answers what egress has been observed that the allowlist does not permit.
+
+```bash
+netaudit undeclared ci-reports/*.json
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--allowlist YAML` | none | Existing allowlist — destinations it already permits are omitted |
+| `--format {yaml,json}` | `yaml` | Output format |
+| `--no-color` | off | Disable coloured output |
+| `--output PATH` / `-o` | stdout | Write the rules to PATH instead of stdout |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | No undeclared egress found |
+| 1 | Undeclared egress found |
+| 2 | A report could not be read, or its schema version is unsupported |
+
+Same sense as `run` and `analyze`: non-zero means something needs attention. `undeclared` can
+therefore be used directly as a CI assertion, with no flag to flip its meaning:
+
+```bash
+netaudit undeclared --allowlist netaudit.yaml reports/*.json
+```
+
+Status messages go to stderr, so a redirected rules file only ever contains YAML. Reports
+whose `version` this netaudit does not recognise are refused rather than parsed
+optimistically — misreading evidence is worse than failing.
+
+## Saving a report
+
+`--output PATH` writes the report to a file instead of stdout. Combined with
+`--format json` this produces a durable, self-describing artifact:
+
+```bash
+netaudit run --format json --output report.json -- pytest
+```
+
+The saved report carries a schema `version` and a `run` block recording the timestamp,
+hostname, netaudit version, and either the traced command or the analysed log:
+
+```json
+{
+  "version": 1,
+  "run": {
+    "timestamp": "2026-08-23T14:03:38.499417+00:00",
+    "hostname": "ci-runner-4",
+    "netaudit_version": "0.5.0",
+    "command": ["pytest"],
+    "allowlist": "netaudit.yaml"
+  },
+  "violations": [...],
+  "summary": {...}
+}
+```
+
+Reports written to a file are never coloured, whatever stdout happens to be. A clean run
+still writes a report — an empty result is evidence too.
 
 ## Suggesting rules
 
