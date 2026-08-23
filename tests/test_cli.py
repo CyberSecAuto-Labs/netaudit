@@ -169,7 +169,7 @@ class TestRunCommand:
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "curl", "8.8.8.8"])
 
-        assert result.exit_code == 1
+        assert result.exit_code == 3
 
     def test_json_format(self, tmp_path: Path) -> None:
         strace_log = tmp_path / "out.strace"
@@ -188,7 +188,7 @@ class TestRunCommand:
                     main, ["run", "--format", "json", "--", "curl", "8.8.8.8"]
                 )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 3
         data = json.loads(result.output)
         assert data["summary"]["total"] == 1
 
@@ -292,7 +292,7 @@ class TestVerboseFlag:
                     main, ["run", "--verbose", "--format", "json", "--", "curl", "8.8.8.8"]
                 )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 3
         data = json.loads(result.output)
         assert "events" in data
         assert data["events"][0]["status"] == "violation"
@@ -734,3 +734,65 @@ class TestSuggestEvidence:
         assert rule["reports"] == ["a.json", "b.json"]
         assert rule["total_reports"] == 2
         assert rule["external"] is False
+
+
+# ---------------------------------------------------------------------------
+# run — exit code propagation
+# ---------------------------------------------------------------------------
+
+
+class TestRunExitCodes:
+    """`run` must not swallow the wrapped command's exit status."""
+
+    def _invoke(self, tmp_path: Path, strace_body: str, returncode: int, *args: str) -> "object":
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(strace_body)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=returncode)
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+        ):
+            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
+            with patch("pathlib.Path.unlink"):
+                return CliRunner().invoke(main, ["run", *args, "--", "pytest"])
+
+    def test_clean_command_no_violations_exits_0(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 0)
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+
+    def test_violations_use_the_reserved_code(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_VIOLATION, 0)
+        assert result.exit_code == 3  # type: ignore[attr-defined]
+
+    def test_failing_command_propagates_its_code(self, tmp_path: Path) -> None:
+        """The bug: a failing suite with clean egress used to exit 0."""
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 1)
+        assert result.exit_code == 1  # type: ignore[attr-defined]
+
+    def test_unusual_command_code_propagates(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 137)
+        assert result.exit_code == 137  # type: ignore[attr-defined]
+
+    def test_failing_command_takes_precedence_over_violations(self, tmp_path: Path) -> None:
+        """A crashed command may have produced a partial trace, so its failure leads."""
+        result = self._invoke(tmp_path, _STRACE_LOG_VIOLATION, 1)
+        assert result.exit_code == 1  # type: ignore[attr-defined]
+
+    def test_violations_still_reported_when_command_fails(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_VIOLATION, 1)
+        assert "8.8.8.8" in result.output  # type: ignore[attr-defined]
+
+    def test_command_exit_code_is_surfaced(self, tmp_path: Path) -> None:
+        """Never lose it silently — 2 and 3 are ambiguous with netaudit's own codes."""
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 137)
+        assert "137" in result.output  # type: ignore[attr-defined]
+
+    def test_success_is_not_announced(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 0)
+        assert "exited with" not in result.output  # type: ignore[attr-defined]
+
+    def test_json_output_records_the_command_exit_code(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 5, "--format", "json")
+        data = json.loads(result.stdout)  # type: ignore[attr-defined]
+        assert data["run"]["command_exit_code"] == 5

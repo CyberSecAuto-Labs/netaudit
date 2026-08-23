@@ -5,6 +5,8 @@ Run with: pytest -m integration
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,3 +104,68 @@ def test_custom_allowlist_passes_external_ip(strace_output: Path) -> None:
     assert not any(v.addr == "198.51.100.1" for v in violations), (
         "198.51.100.1 should be allowed when 198.51.100.0/24 is in the allowlist"
     )
+
+
+# ---------------------------------------------------------------------------
+# run — exit code propagation (the wrapped command's status must survive)
+# ---------------------------------------------------------------------------
+
+
+def _run_netaudit(*args: str) -> subprocess.CompletedProcess[str]:
+    binary = shutil.which("netaudit")
+    if binary is None:  # pragma: no cover - integration env always installs it
+        pytest.skip("netaudit console script not on PATH")
+    return subprocess.run([binary, *args], capture_output=True, text=True)
+
+
+@pytest.mark.integration
+class TestRunExitCodePropagation:
+    def test_failing_command_with_clean_egress_is_not_reported_as_success(self) -> None:
+        """The bug this phase fixes: `netaudit run -- false` used to exit 0."""
+        result = _run_netaudit("run", "--", "false")
+        assert result.returncode == 1
+
+    def test_successful_command_with_clean_egress_exits_0(self) -> None:
+        result = _run_netaudit("run", "--", "true")
+        assert result.returncode == 0
+
+    def test_specific_exit_code_survives(self) -> None:
+        result = _run_netaudit("run", "--", "sh", "-c", "exit 42")
+        assert result.returncode == 42
+        assert "42" in result.stderr
+
+    def test_violations_use_the_reserved_code(self, tmp_path: Path) -> None:
+        script = tmp_path / "egress.py"
+        script.write_text(
+            "import socket\n"
+            "s = socket.socket()\n"
+            "s.setblocking(False)\n"
+            "try:\n"
+            "    s.connect(('198.51.100.1', 443))\n"
+            "except (BlockingIOError, OSError):\n"
+            "    pass\n"
+            "finally:\n"
+            "    s.close()\n"
+        )
+        result = _run_netaudit("run", "--", sys.executable, str(script))
+        assert result.returncode == 3
+        assert "198.51.100.1" in result.stdout
+
+    def test_command_failure_takes_precedence_over_violations(self, tmp_path: Path) -> None:
+        script = tmp_path / "egress_fail.py"
+        script.write_text(
+            "import socket, sys\n"
+            "s = socket.socket()\n"
+            "s.setblocking(False)\n"
+            "try:\n"
+            "    s.connect(('198.51.100.1', 443))\n"
+            "except (BlockingIOError, OSError):\n"
+            "    pass\n"
+            "finally:\n"
+            "    s.close()\n"
+            "sys.exit(7)\n"
+        )
+        result = _run_netaudit("run", "--", sys.executable, str(script))
+        assert result.returncode == 7
+        # The violation is still reported even though the exit code is the command's.
+        assert "198.51.100.1" in result.stdout
