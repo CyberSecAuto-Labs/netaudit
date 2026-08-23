@@ -12,7 +12,7 @@ netaudit/
 ├── reporter.py        # Groups violations, formats output
 ├── cli.py             # CLI entry point (run / analyze)
 └── integrations/
-    └── pytest_plugin.py   # (future) pytest integration
+    └── pytest_plugin.py   # pytest integration (test attribution)
 ```
 
 The core must not import anything from integrations.
@@ -89,7 +89,19 @@ Built-in defaults (loopback + unix + netlink) are prepended to every allowlist u
 
 `Reporter.check()` filters events against the allowlist and groups identical destinations into `Violation` objects (deduplication by `(family, addr, port)`).
 
-`Reporter.format()` renders a human-readable box. `Reporter.format_json()` returns structured JSON.
+`Reporter.format()` renders a human-readable box and `Reporter.format_json()` returns structured
+JSON. Three further renderers build on the same `Violation` list:
+
+| Function | Output |
+|---|---|
+| `format_verbose()` | Every event — allowed and violating — annotated with the matching rule name |
+| `format_summary()` | One row per destination, loudest first; third column is test nodeids when attribution is available, PIDs otherwise |
+| `format_suggestions()` | Allowlist YAML that would permit each violation, scoped to exact address and port |
+
+`supports_color()` decides whether ANSI escapes are emitted: a TTY check plus the
+[NO_COLOR](https://no-color.org/) convention. Colour is passed explicitly into each
+renderer as `color=`, keeping `Reporter` free of global state — callers decide policy
+(`--no-color` for the CLI, pytest's `--color` for the plugin).
 
 ### `cli.py`
 

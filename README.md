@@ -52,7 +52,13 @@ netaudit analyze /tmp/trace.log
 
 # Machine-readable output for CI artifacts
 netaudit run --format json -- make test
+
+# Print ready-to-paste allowlist rules for whatever was blocked
+netaudit run --suggest-rules -- pytest tests/
 ```
+
+Violations are printed in red on a terminal; pass `--no-color` or set `NO_COLOR=1` to
+turn that off.
 
 **Exit codes:** `0` clean · `1` violations · `2` strace not found
 

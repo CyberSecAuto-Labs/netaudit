@@ -246,3 +246,87 @@ class TestPluginAutoEnable:
         result = pytester.runpytest_subprocess()
         result.assert_outcomes(passed=1)
         assert result.ret == 0
+
+
+class TestPluginNodeLinking:
+    """Violations carry the test's file:line for editor click-through."""
+
+    def test_violation_reports_file_and_line(self, pytester: pytest.Pytester) -> None:
+        path = pytester.makepyfile(
+            test_egress="""
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        # Derive the expected line from the file rather than hard-coding it, so the
+        # assertion proves the reported location really points at the test's `def`.
+        lineno = next(
+            i
+            for i, line in enumerate(path.read_text().splitlines(), start=1)
+            if line.startswith("def test_external")
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines([f"*test_egress.py::test_external*test_egress.py:{lineno}*"])
+
+    def test_summary_lists_the_offending_test(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            test_egress="""
+            def test_external():
+                import socket
+                s = socket.socket()
+                s.setblocking(False)
+                try:
+                    s.connect(("198.51.100.1", 443))
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    s.close()
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        result.stdout.fnmatch_lines(["*ADDR:PORT*COUNT*TESTS*"])
+        result.stdout.fnmatch_lines(["*198.51.100.1:443*test_egress.py::test_external*"])
+
+
+class TestPluginSuggestRules:
+    """Suggested rules must be valid enough to silence the violation they describe."""
+
+    _EGRESS = """
+        def test_external():
+            import socket
+            s = socket.socket()
+            s.setblocking(False)
+            try:
+                s.connect(("198.51.100.1", 443))
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                s.close()
+        """
+
+    def test_suggestions_printed(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        result = pytester.runpytest_subprocess("--netaudit", "--netaudit-suggest-rules")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*Suggested rules*"])
+        result.stdout.fnmatch_lines(["*addr: 198.51.100.1*"])
+
+    def test_absent_without_flag(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        result = pytester.runpytest_subprocess("--netaudit")
+        assert "Suggested rules" not in result.stdout.str()
+
+    def test_enabled_via_pyproject(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(test_egress=self._EGRESS)
+        pytester.makepyprojecttoml("[tool.netaudit]\nenabled = true\nsuggest_rules = true\n")
+        result = pytester.runpytest_subprocess()
+        result.stdout.fnmatch_lines(["*Suggested rules*"])

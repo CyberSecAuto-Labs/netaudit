@@ -59,6 +59,7 @@ The plugin resolves the allowlist in this priority order:
 | `--netaudit` | Enable network auditing for this session |
 | `--netaudit-allowlist YAML` | Path to allowlist YAML file |
 | `--netaudit-verbose` | Show all network events (allowed and violations) with rule names |
+| `--netaudit-suggest-rules` | Print allowlist YAML that would permit each violation |
 
 ## Verbose mode
 
@@ -84,6 +85,48 @@ Resolution order for `verbose`:
 | 1 | `--netaudit-verbose` CLI flag |
 | 2 | `verbose = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
+
+## Test node linking
+
+Each violation block is headed by the standard pytest nodeid, followed by the test's
+`file:line` so editors and terminals can jump straight to it:
+
+```
+  [tests/test_api.py::TestFetch::test_timeout]  (tests/test_api.py:42)
+    AF_INET 198.51.100.1:443 (count=1, pids=[4242])
+```
+
+The location is omitted when pytest reports no line number for the item.
+
+## Summary table
+
+After the per-test violations, a summary maps each destination to the tests that
+reached it — the inverse of the detail block, which answers "what did this test do?"
+rather than "which tests hit this host?":
+
+```
+ADDR:PORT                       COUNT  TESTS
+------------------------------ ------  ------------------------
+198.51.100.1:443                    3  test_api.py::test_fetch, test_api.py::test_sync
+```
+
+## Suggesting rules
+
+Pass `--netaudit-suggest-rules`, or set `suggest_rules = true` in `[tool.netaudit]`,
+to append copy-paste-ready allowlist YAML to the report. A destination reached by
+several tests yields a single rule, not one per test.
+
+```toml
+[tool.netaudit]
+enabled = true
+suggest_rules = true
+```
+
+## Coloured output
+
+Violations are printed in red when the terminal supports it. The plugin follows
+pytest's own `--color` option — `--color=no` disables it, `--color=yes` forces it on
+even when output is captured — and the `NO_COLOR` environment variable.
 
 ## Output
 

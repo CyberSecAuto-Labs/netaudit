@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,10 +18,13 @@ from netaudit.integrations.pytest_plugin import (
     _emit_attributed,
     _emit_attributed_verbose,
     _group_events,
+    _merge_by_destination,
     _now_ts,
     _parse_markers,
     _resolve_allowlist,
+    _resolve_color,
     _resolve_enabled,
+    _resolve_suggest_rules,
     _resolve_verbose,
     _TestRange,
     pytest_addoption,
@@ -59,7 +63,8 @@ class TestParseMarkers:
     def test_single_test(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text(
-            "START 10.000000 tests/test_foo.py::test_a\nEND 10.500000 tests/test_foo.py::test_a\n"
+            "START\t10.000000\t\ttests/test_foo.py::test_a\n"
+            "END\t10.500000\t\ttests/test_foo.py::test_a\n"
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
@@ -69,7 +74,10 @@ class TestParseMarkers:
 
     def test_multiple_tests(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("START 10.0 test_a\nEND 10.5 test_a\nSTART 10.6 test_b\nEND 11.0 test_b\n")
+        f.write_text(
+            "START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
+            "START\t10.6\t\ttest_b\nEND\t11.0\t\ttest_b\n"
+        )
         ranges = _parse_markers(f)
         assert len(ranges) == 2
         assert ranges[0].nodeid == "test_a"
@@ -77,13 +85,15 @@ class TestParseMarkers:
 
     def test_ignores_malformed_lines(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("garbage\nSTART bad_ts test_a\nSTART 10.0 test_a\nEND 10.5 test_a\n")
+        f.write_text(
+            "garbage\nSTART\tbad_ts\t\ttest_a\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
+        )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
 
     def test_unmatched_start_is_dropped(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("START 10.0 test_a\n")  # no END
+        f.write_text("START\t10.0\t\ttest_a\n")  # no END
         ranges = _parse_markers(f)
         assert ranges == []
 
@@ -193,7 +203,7 @@ class TestNowTs:
 
 def _mock_config(allowlist_opt: str | None = None) -> MagicMock:
     config = MagicMock(spec=["getoption"])
-    config.getoption.return_value = allowlist_opt
+    config.getoption.side_effect = lambda name, *default: allowlist_opt
     return config
 
 
@@ -297,12 +307,12 @@ class TestPytestAddoption:
         parser.getgroup.return_value = group
         pytest_addoption(parser)
         parser.getgroup.assert_called_once_with("netaudit", "Network egress auditing")
-        # --netaudit, --netaudit-allowlist, --netaudit-verbose
-        assert group.addoption.call_count == 3
+        assert group.addoption.call_count == 4
         option_names = [c.args[0] for c in group.addoption.call_args_list]
         assert "--netaudit" in option_names
         assert "--netaudit-allowlist" in option_names
         assert "--netaudit-verbose" in option_names
+        assert "--netaudit-suggest-rules" in option_names
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +464,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -481,7 +491,7 @@ class TestPytestSessionfinish:
             'sin_port=htons(80), sin_addr=inet_addr("127.0.0.1")}, 16) = 0\n'
         )
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -503,7 +513,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -546,9 +556,11 @@ class TestPytestSessionfinish:
 def _mock_config_verbose(verbose: bool = False, allowlist_opt: str | None = None) -> MagicMock:
     config = MagicMock(spec=["getoption"])
 
-    def _getoption(name: str) -> object:
+    def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit-verbose":
             return verbose
+        if name == "color":
+            return default[0] if default else "auto"
         return allowlist_opt
 
     config.getoption.side_effect = _getoption
@@ -705,7 +717,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -749,7 +761,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_LOOPBACK)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -772,7 +784,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START 43199.0 test_a\nEND 43201.0 test_a\n")
+        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
@@ -795,10 +807,10 @@ class TestPytestSessionfinishVerbose:
 def _mock_config_enabled(cli_flag: bool = False) -> MagicMock:
     config = MagicMock(spec=["getoption"])
 
-    def _getoption(name: str) -> object:
+    def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit":
             return cli_flag
-        return None
+        return default[0] if default else None
 
     config.getoption.side_effect = _getoption
     return config
@@ -958,3 +970,287 @@ class TestPytestConfigureAutoEnable:
 
         with pytest.raises(pytest.UsageError, match="strace"):
             pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_color
+# ---------------------------------------------------------------------------
+
+
+def _mock_session_color(mode: str) -> MagicMock:
+    session = MagicMock()
+    session.config.getoption.return_value = mode
+    return session
+
+
+class TestResolveColor:
+    """Colour follows pytest's own --color option rather than a netaudit flag."""
+
+    def test_color_yes_forces_on(self) -> None:
+        assert _resolve_color(_mock_session_color("yes")) is True
+
+    def test_color_no_forces_off(self) -> None:
+        assert _resolve_color(_mock_session_color("no")) is False
+
+    def test_color_auto_defers_to_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        session = _mock_session_color("auto")
+        with patch("netaudit.integrations.pytest_plugin.supports_color", return_value=True):
+            assert _resolve_color(session) is True
+
+    def test_color_auto_off_for_non_tty(self) -> None:
+        session = _mock_session_color("auto")
+        with patch("netaudit.integrations.pytest_plugin.supports_color", return_value=False):
+            assert _resolve_color(session) is False
+
+    def test_option_not_registered_returns_false(self) -> None:
+        session = MagicMock()
+        session.config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_color(session) is False
+
+
+class TestEmitAttributedColor:
+    def _make_violation(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_violations_colored_when_color_yes(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("yes")
+        _emit_attributed({"test_a": [self._make_violation()]}, session)
+        assert "\033[31m" in capsys.readouterr().out
+
+    def test_no_ansi_when_color_no(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._make_violation()]}, session)
+        assert "\033[" not in capsys.readouterr().out
+
+    def test_verbose_colored_when_color_yes(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = _event("AF_INET", "1.2.3.4", 80, ts=10.5)
+        session = _mock_session_color("yes")
+        _emit_attributed_verbose([event], AllowList([], includes_builtins=False), ranges, session)
+        assert "\033[31m" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _merge_by_destination
+# ---------------------------------------------------------------------------
+
+
+class TestMergeByDestination:
+    def _v(self, addr: str, port: int, pid: int, count: int) -> Violation:
+        v = Violation(family="AF_INET", addr=addr, port=port)
+        v.pids.add(pid)
+        v.count = count
+        return v
+
+    def test_same_destination_across_tests_is_merged(self) -> None:
+        by_test = {
+            "test_a": [self._v("1.2.3.4", 80, pid=1, count=2)],
+            "test_b": [self._v("1.2.3.4", 80, pid=2, count=3)],
+        }
+        merged, tests = _merge_by_destination(by_test)
+        assert len(merged) == 1
+        assert merged[0].count == 5
+        assert merged[0].pids == {1, 2}
+        assert tests[merged[0].key] == {"test_a", "test_b"}
+
+    def test_distinct_destinations_stay_separate(self) -> None:
+        by_test = {
+            "test_a": [self._v("1.2.3.4", 80, pid=1, count=1)],
+            "test_b": [self._v("5.6.7.8", 443, pid=1, count=1)],
+        }
+        merged, tests = _merge_by_destination(by_test)
+        assert len(merged) == 2
+
+    def test_empty_input(self) -> None:
+        merged, tests = _merge_by_destination({})
+        assert merged == []
+        assert tests == {}
+
+
+class TestEmitAttributedSummary:
+    def _v(self, addr: str) -> Violation:
+        v = Violation(family="AF_INET", addr=addr, port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_summary_table_emitted(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v("1.2.3.4")]}, session)
+        out = capsys.readouterr().out
+        assert "ADDR:PORT" in out
+        assert "TESTS" in out
+        assert "test_a" in out
+
+    def test_summary_lists_every_test_hitting_a_destination(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v("1.2.3.4")], "test_b": [self._v("1.2.3.4")]}, session)
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("1.2.3.4:80"))
+        assert "test_a, test_b" in row
+
+
+# ---------------------------------------------------------------------------
+# Test node linking (file:line)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerLocations:
+    def test_location_is_parsed(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text(
+            "START\t10.0\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
+            "END\t10.5\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
+        )
+        ranges = _parse_markers(f)
+        assert len(ranges) == 1
+        assert ranges[0].location == "tests/test_api.py:42"
+
+    def test_empty_location_becomes_none(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text("START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        assert _parse_markers(f)[0].location is None
+
+    def test_nodeid_with_spaces_survives(self, tmp_path: Path) -> None:
+        """Parametrized nodeids contain spaces — tabs keep the field intact."""
+        nodeid = "tests/test_api.py::test_p[a b c]"
+        f = tmp_path / "m"
+        f.write_text(f"START\t10.0\tf.py:1\t{nodeid}\nEND\t10.5\tf.py:1\t{nodeid}\n")
+        assert _parse_markers(f)[0].nodeid == nodeid
+
+    def test_wrong_field_count_ignored(self, tmp_path: Path) -> None:
+        f = tmp_path / "m"
+        f.write_text("START\t10.0\ttest_a\n")
+        assert _parse_markers(f) == []
+
+
+class TestEmitAttributedLocations:
+    def _v(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_location_shown_next_to_nodeid(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed(
+            {"tests/test_api.py::test_a": [self._v()]},
+            session,
+            locations={"tests/test_api.py::test_a": "tests/test_api.py:42"},
+        )
+        out = capsys.readouterr().out
+        assert "tests/test_api.py::test_a" in out
+        assert "tests/test_api.py:42" in out
+
+    def test_nodeid_alone_when_location_unknown(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"tests/test_api.py::test_a": [self._v()]}, session, locations={})
+        out = capsys.readouterr().out
+        assert "tests/test_api.py::test_a" in out
+        assert ".py:" not in out.split("tests/test_api.py::test_a")[1].split("\n")[0]
+
+
+class TestRuntestProtocolLocation:
+    def test_writes_location_field(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        markers = tmp_path / "m"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        item = MagicMock()
+        item.nodeid = "tests/test_api.py::test_a"
+        item.location = ("tests/test_api.py", 41, "test_a")
+
+        gen = pytest_runtest_protocol(item, None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            next(gen)
+
+        lines = markers.read_text().splitlines()
+        assert lines[0].split("\t")[2] == "tests/test_api.py:42"  # 0-based -> 1-based
+
+    def test_missing_lineno_writes_empty_location(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        markers = tmp_path / "m"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        item = MagicMock()
+        item.nodeid = "test_a"
+        item.location = ("tests/test_api.py", None, "test_a")
+
+        gen = pytest_runtest_protocol(item, None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            next(gen)
+
+        assert markers.read_text().splitlines()[0].split("\t")[2] == ""
+
+
+# ---------------------------------------------------------------------------
+# --netaudit-suggest-rules
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSuggestRules:
+    def _cfg(self, cli_flag: bool) -> MagicMock:
+        config = MagicMock(spec=["getoption"])
+
+        def _getoption(name: str, *default: object) -> object:
+            if name == "--netaudit-suggest-rules":
+                return cli_flag
+            return default[0] if default else None
+
+        config.getoption.side_effect = _getoption
+        return config
+
+    def test_cli_flag_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_suggest_rules(self._cfg(True)) is True  # type: ignore[arg-type]
+
+    def test_default_off(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert _resolve_suggest_rules(self._cfg(False)) is False  # type: ignore[arg-type]
+
+    def test_pyproject_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nsuggest_rules = true\n")
+        assert _resolve_suggest_rules(self._cfg(False)) is True  # type: ignore[arg-type]
+
+    def test_option_not_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = MagicMock(spec=["getoption"])
+        config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_suggest_rules(config) is False  # type: ignore[arg-type]
+
+
+class TestEmitAttributedSuggestions:
+    def _v(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_suggestions_emitted_when_enabled(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v()]}, session, suggest_rules=True)
+        out = capsys.readouterr().out
+        assert "Suggested rules" in out
+        assert "addr: 1.2.3.4" in out
+        assert "port: 80" in out
+
+    def test_absent_by_default(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v()]}, session)
+        assert "Suggested rules" not in capsys.readouterr().out
+
+    def test_suggestions_deduplicated_across_tests(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed(
+            {"test_a": [self._v()], "test_b": [self._v()]}, session, suggest_rules=True
+        )
+        assert capsys.readouterr().out.count("addr: 1.2.3.4") == 1

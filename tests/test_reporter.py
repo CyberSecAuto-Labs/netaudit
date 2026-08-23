@@ -2,10 +2,12 @@
 
 import io
 import json
+import re
+from pathlib import Path
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
-from netaudit.reporter import Reporter, Violation
+from netaudit.reporter import Reporter, Violation, supports_color
 
 
 def _event(
@@ -209,3 +211,267 @@ class TestReporterFormatJsonVerbose:
         violations = Reporter.check(events, al)
         data = json.loads(Reporter.format_json(violations))
         assert "events" not in data
+
+
+# ---------------------------------------------------------------------------
+# Colour support
+# ---------------------------------------------------------------------------
+
+
+class _FakeTTY(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class TestSupportsColor:
+    def test_tty_stream_supports_color(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert supports_color(_FakeTTY()) is True
+
+    def test_non_tty_stream_does_not(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert supports_color(io.StringIO()) is False
+
+    def test_no_color_env_disables_on_tty(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert supports_color(_FakeTTY()) is False
+
+    def test_empty_no_color_env_does_not_disable(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """no-color.org: the variable must be present *and non-empty* to apply."""
+        monkeypatch.setenv("NO_COLOR", "")
+        assert supports_color(_FakeTTY()) is True
+
+    def test_none_stream_falls_back_to_stdout(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr("sys.stdout", _FakeTTY())
+        assert supports_color() is True
+
+
+class TestFormatColor:
+    def test_violation_is_red_when_color_enabled(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        out = Reporter.format(violations, color=True)
+        assert "\033[31m" in out
+        assert "\033[0m" in out
+
+    def test_no_ansi_when_color_disabled(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        out = Reporter.format(violations, color=False)
+        assert "\033[" not in out
+
+    def test_color_defaults_to_off(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        assert "\033[" not in Reporter.format(violations)
+
+    def test_clean_message_is_green_when_color_enabled(self) -> None:
+        out = Reporter.format([], color=True)
+        assert "\033[32m" in out
+        assert "no violations" in out
+
+    def test_colored_output_preserves_plain_content(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        colored = Reporter.format(violations, color=True)
+        assert "198.51.100.1:443" in colored
+        assert "1 violation detected" in colored
+
+
+class TestFormatVerboseColor:
+    def _mixed_events(self) -> list[ConnectEvent]:
+        return [_event("AF_INET", "127.0.0.1", 80), _event("AF_INET", "198.51.100.1", 443)]
+
+    def test_ok_green_and_violation_red(self) -> None:
+        out = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=True)
+        assert "\033[32m" in out
+        assert "\033[31m" in out
+
+    def test_no_ansi_when_color_disabled(self) -> None:
+        out = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=False)
+        assert "\033[" not in out
+
+    def test_columns_stay_aligned_when_colored(self) -> None:
+        """ANSI codes must not be counted in the column width."""
+        plain = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=False)
+        colored = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=True)
+        strip = re.sub(r"\033\[[0-9;]*m", "", colored)
+        assert strip == plain
+
+
+# ---------------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSummary:
+    def _violations(self) -> list[Violation]:
+        events = [
+            _event("AF_INET", "198.51.100.1", 443, pid=10),
+            _event("AF_INET", "198.51.100.1", 443, pid=11),
+            _event("AF_INET", "203.0.113.7", 80, pid=10),
+        ]
+        return Reporter.check(events, AllowList.empty())
+
+    def test_header_and_rows_present(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        assert "ADDR:PORT" in out
+        assert "COUNT" in out
+        assert "198.51.100.1:443" in out
+        assert "203.0.113.7:80" in out
+
+    def test_counts_are_aggregated_per_destination(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        row = next(ln for ln in out.splitlines() if "198.51.100.1:443" in ln)
+        assert "2" in row.split()
+
+    def test_pids_column_when_no_attribution(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        assert "PIDS" in out
+        assert "10, 11" in out
+
+    def test_tests_column_when_attribution_given(self) -> None:
+        violations = self._violations()
+        tests = {v.key: {"test_a", "test_b"} for v in violations if v.port == 443}
+        out = Reporter.format_summary(violations, tests_by_key=tests)
+        assert "TESTS" in out
+        assert "PIDS" not in out
+        assert "test_a, test_b" in out
+
+    def test_destinations_sorted_by_count_descending(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        body = [ln for ln in out.splitlines() if ":" in ln and "ADDR" not in ln]
+        assert "198.51.100.1:443" in body[0]
+
+    def test_empty_violations_returns_empty_string(self) -> None:
+        assert Reporter.format_summary([]) == ""
+
+    def test_no_ansi_by_default(self) -> None:
+        assert "\033[" not in Reporter.format_summary(self._violations())
+
+    def test_colored_when_requested(self) -> None:
+        assert "\033[" in Reporter.format_summary(self._violations(), color=True)
+
+    def test_writes_to_stream(self) -> None:
+        buf = io.StringIO()
+        out = Reporter.format_summary(self._violations(), stream=buf)
+        assert buf.getvalue() == out
+
+
+class TestFormatJsonSummary:
+    def _violations(self) -> list[Violation]:
+        events = [
+            _event("AF_INET", "198.51.100.1", 443, pid=10),
+            _event("AF_INET", "198.51.100.1", 443, pid=11),
+        ]
+        return Reporter.check(events, AllowList.empty())
+
+    def test_by_destination_present(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        dests = data["summary"]["by_destination"]
+        assert len(dests) == 1
+        assert dests[0]["addr"] == "198.51.100.1"
+        assert dests[0]["port"] == 443
+        assert dests[0]["count"] == 2
+        assert dests[0]["pids"] == [10, 11]
+
+    def test_total_still_present(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        assert data["summary"]["total"] == 1
+
+    def test_tests_included_when_attribution_given(self) -> None:
+        violations = self._violations()
+        tests = {v.key: {"test_b", "test_a"} for v in violations}
+        data = json.loads(Reporter.format_json(violations, tests_by_key=tests))
+        assert data["summary"]["by_destination"][0]["tests"] == ["test_a", "test_b"]
+
+    def test_tests_key_absent_without_attribution(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        assert "tests" not in data["summary"]["by_destination"][0]
+
+    def test_empty_violations_gives_empty_by_destination(self) -> None:
+        data = json.loads(Reporter.format_json([]))
+        assert data["summary"]["by_destination"] == []
+
+
+# ---------------------------------------------------------------------------
+# Rule suggestions
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSuggestions:
+    def _violations(self, *events: ConnectEvent) -> list[Violation]:
+        return Reporter.check(list(events), AllowList.empty())
+
+    def test_ipv4_suggestion_includes_addr_and_port(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        assert "family: AF_INET" in out
+        assert "addr: 198.51.100.1" in out
+        assert "port: 443" in out
+
+    def test_ipv6_suggestion_quotes_the_address(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET6", "2001:db8::1", 8080)))
+        assert "family: AF_INET6" in out
+        assert 'addr: "2001:db8::1"' in out
+        assert "port: 8080" in out
+
+    def test_unix_socket_suggestion_uses_path_glob(self) -> None:
+        # Built-ins allow every AF_UNIX socket, so this path is only reachable
+        # for users who opted out of them.
+        strict = AllowList([], includes_builtins=False)
+        violations = Reporter.check([_event("AF_UNIX", "/run/x.sock")], strict)
+        out = Reporter.format_suggestions(violations)
+        assert "family: AF_UNIX" in out
+        assert "path_glob: /run/x.sock" in out
+        assert "port:" not in out
+
+    def test_port_omitted_when_event_has_none(self) -> None:
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1")))
+        assert "addr: 198.51.100.1" in out
+        assert "port:" not in out
+
+    def test_each_destination_gets_one_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            self._violations(
+                _event("AF_INET", "198.51.100.1", 443),
+                _event("AF_INET", "203.0.113.7", 80),
+            )
+        )
+        assert out.count("- name:") == 2
+
+    def test_empty_violations_returns_empty_string(self) -> None:
+        assert Reporter.format_suggestions([]) == ""
+
+    def test_output_is_valid_yaml_and_round_trips(self) -> None:
+        """The whole point is copy-paste: the block must load as a real allowlist."""
+        import yaml
+
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        rules = yaml.safe_load(body)
+        assert isinstance(rules, list)
+        assert rules[0]["family"] == "AF_INET"
+        assert rules[0]["port"] == 443
+
+    def test_suggested_rule_actually_allows_the_connection(self, tmp_path: "Path") -> None:
+        """A suggestion that does not silence the violation is worthless."""
+
+        event = _event("AF_INET", "198.51.100.1", 443)
+        out = Reporter.format_suggestions(self._violations(event))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        y = tmp_path / "suggested.yaml"
+        y.write_text("version: 1\nallowlist:\n" + body + "\n")
+        assert AllowList.from_yaml(y).is_allowed(event) is True
+
+    def test_suggested_rule_does_not_allow_other_ports(self, tmp_path: "Path") -> None:
+
+        out = Reporter.format_suggestions(self._violations(_event("AF_INET", "198.51.100.1", 443)))
+        body = "\n".join(ln for ln in out.splitlines() if not ln.lstrip().startswith("#"))
+        y = tmp_path / "suggested.yaml"
+        y.write_text("version: 1\nallowlist:\n" + body + "\n")
+        other = _event("AF_INET", "198.51.100.1", 22)
+        assert AllowList.from_yaml(y).is_allowed(other) is False
+
+    def test_writes_to_stream(self) -> None:
+        buf = io.StringIO()
+        out = Reporter.format_suggestions(
+            self._violations(_event("AF_INET", "198.51.100.1", 443)), stream=buf
+        )
+        assert buf.getvalue() == out

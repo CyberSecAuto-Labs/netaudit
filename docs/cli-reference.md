@@ -28,6 +28,8 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | `--allowlist YAML` | `netaudit.yaml` in cwd | Path to allowlist file |
 | `--format {text,json}` | `text` | Output format |
 | `--verbose` / `-v` | off | Show all network events, not just violations |
+| `--no-color` | off | Disable coloured output |
+| `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -71,6 +73,8 @@ netaudit analyze [OPTIONS] STRACE_LOG
 | `--allowlist YAML` | `netaudit.yaml` in cwd | Path to allowlist file |
 | `--format {text,json}` | `text` | Output format |
 | `--verbose` / `-v` | off | Show all network events, not just violations |
+| `--no-color` | off | Disable coloured output |
+| `--suggest-rules` | off | Print allowlist YAML that would permit each violation |
 | `--help` | | Show help |
 
 ### Exit codes
@@ -154,3 +158,57 @@ Adds an `"events"` array containing every network event with `"status"` and `"ru
   "summary": {"total": 1}
 }
 ```
+
+## Summary table
+
+With `--verbose`, a compact per-destination overview follows the event table:
+
+```
+ADDR:PORT                       COUNT  PIDS
+------------------------------ ------  ------------------------
+198.51.100.1:443                    3  100, 101
+203.0.113.7:80                      1  102
+```
+
+Destinations are sorted loudest-first, so the noisiest offender is the top row.
+The non-verbose report is already one row per destination, so no summary is added there.
+
+In `--format json` the same data is always available under `summary.by_destination`,
+regardless of `--verbose`.
+
+## Suggesting rules
+
+`--suggest-rules` prints a ready-to-paste allowlist block for every violation:
+
+```console
+$ netaudit analyze --suggest-rules trace.log
+...
+# Suggested rules to allow these connections:
+  - name: "allow 198.51.100.1:443"
+    family: AF_INET
+    addr: 198.51.100.1
+    port: 443
+```
+
+Rules are scoped as narrowly as the observed connection allows — exact address, and
+exact port when the connection had one. Paste them under the `allowlist:` key of your
+config to turn a violation into an explicit, reviewable exception.
+
+Suggestions never change the exit code: a run with violations still exits 1.
+With `--format json` they appear under the `suggested_rules` key instead.
+
+## Coloured output
+
+Violations are printed in red and clean results in green when stdout is a terminal.
+Colour is suppressed automatically when output is piped or redirected, so captured
+logs stay free of escape codes.
+
+To turn it off explicitly:
+
+| Method | Scope |
+|--------|-------|
+| `--no-color` | The single invocation |
+| `NO_COLOR=1` environment variable | Every invocation — see [no-color.org](https://no-color.org/) |
+
+Following the convention, `NO_COLOR` applies when it is set to any non-empty value;
+setting it to the empty string has no effect. `--format json` is never colourised.

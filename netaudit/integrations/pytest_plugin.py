@@ -27,7 +27,15 @@ import pytest
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
-from netaudit.reporter import Reporter, Violation
+from netaudit.reporter import (
+    _BOLD,
+    _RED,
+    Reporter,
+    Violation,
+    _paint,
+    _ViolationKey,
+    supports_color,
+)
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
@@ -50,25 +58,47 @@ class _TestRange:
     nodeid: str
     start: float
     end: float
+    location: str | None = None
+    """``file:line`` of the test, when pytest reported a line number."""
+
+
+def _item_location(item: pytest.Item) -> str:
+    """``file:line`` for *item*, or the empty string when pytest has no line.
+
+    ``item.location`` reports a 0-based line number; editors are 1-based.
+    """
+    try:
+        path, lineno, _domain = item.location
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if not path or lineno is None:
+        return ""
+    return f"{path}:{lineno + 1}"
 
 
 def _parse_markers(path: Path) -> list[_TestRange]:
-    """Parse a markers sidecar file into test time-ranges."""
+    """Parse a markers sidecar file into test time-ranges.
+
+    Records are tab-separated ``kind, timestamp, location, nodeid``. Tabs rather
+    than spaces because parametrized nodeids contain spaces — ``test_p[a b c]``
+    — which a space-delimited fourth field could not survive.
+    """
     ranges: list[_TestRange] = []
-    pending: dict[str, float] = {}
+    pending: dict[str, tuple[float, str | None]] = {}
     for line in path.read_text().splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) != 3:
+        parts = line.split("\t")
+        if len(parts) != 4:
             continue
-        kind, ts_str, nodeid = parts
+        kind, ts_str, location, nodeid = parts
         try:
             ts = float(ts_str)
         except ValueError:
             continue
         if kind == "START":
-            pending[nodeid] = ts
+            pending[nodeid] = (ts, location or None)
         elif kind == "END" and nodeid in pending:
-            ranges.append(_TestRange(nodeid=nodeid, start=pending.pop(nodeid), end=ts))
+            start, loc = pending.pop(nodeid)
+            ranges.append(_TestRange(nodeid=nodeid, start=start, end=ts, location=loc))
     return ranges
 
 
@@ -135,6 +165,61 @@ def _pyproject_netaudit() -> dict[str, Any]:
         return {}
     netaudit_cfg = tool_cfg.get("netaudit")
     return netaudit_cfg if isinstance(netaudit_cfg, dict) else {}
+
+
+def _merge_by_destination(
+    violations_by_test: dict[str, list[Violation]],
+) -> tuple[list[Violation], dict[_ViolationKey, set[str]]]:
+    """Collapse per-test violations into one row per destination.
+
+    The same destination hit by several tests yields separate ``Violation``
+    objects; the summary needs them merged, plus the inverse mapping of
+    destination to the tests that reached it.
+    """
+    merged: dict[_ViolationKey, Violation] = {}
+    tests_by_key: dict[_ViolationKey, set[str]] = {}
+    for nodeid, violations in violations_by_test.items():
+        for v in violations:
+            existing = merged.get(v.key)
+            if existing is None:
+                merged[v.key] = Violation(
+                    family=v.family,
+                    addr=v.addr,
+                    port=v.port,
+                    pids=set(v.pids),
+                    count=v.count,
+                    first_timestamp=v.first_timestamp,
+                )
+            else:
+                existing.pids |= v.pids
+                existing.count += v.count
+            tests_by_key.setdefault(v.key, set()).add(nodeid)
+    return list(merged.values()), tests_by_key
+
+
+def _resolve_suggest_rules(config: pytest.Config) -> bool:
+    """Resolve suggest-rules: CLI flag > pyproject.toml > default (off)."""
+    try:
+        if bool(config.getoption("--netaudit-suggest-rules")):
+            return True
+    except (ValueError, pytest.UsageError):
+        return False
+
+    value = _pyproject_netaudit().get("suggest_rules")
+    return value if isinstance(value, bool) else False
+
+
+def _resolve_color(session: pytest.Session) -> bool:
+    """Colour follows pytest's own ``--color`` option (yes/no/auto)."""
+    try:
+        mode = session.config.getoption("color", "auto")
+    except (ValueError, pytest.UsageError):
+        return False
+    if mode == "yes":
+        return True
+    if mode == "no":
+        return False
+    return supports_color(sys.stdout)
 
 
 def _resolve_enabled(config: pytest.Config) -> bool:
@@ -207,6 +292,7 @@ def _emit_attributed_verbose(
             by_test.setdefault("<session>", []).append(event)
 
     has_violations = any(not allowlist.is_allowed(e) for e in events)
+    color = _resolve_color(session)
 
     border = "=" * 60
     print(f"\n{border}")
@@ -214,7 +300,7 @@ def _emit_attributed_verbose(
     print(border)
     for nodeid, test_events in sorted(by_test.items()):
         print(f"\n  [{nodeid}]")
-        Reporter.format_verbose(test_events, allowlist, stream=sys.stdout)
+        Reporter.format_verbose(test_events, allowlist, stream=sys.stdout, color=color)
     print(f"{border}\n")
 
     if has_violations:
@@ -224,17 +310,32 @@ def _emit_attributed_verbose(
 def _emit_attributed(
     violations_by_test: dict[str, list[Violation]],
     session: pytest.Session,
+    locations: dict[str, str] | None = None,
+    suggest_rules: bool = False,
 ) -> None:
     total = sum(len(vs) for vs in violations_by_test.values())
+    color = _resolve_color(session)
     border = "=" * 60
     print(f"\n{border}")
     noun = "violation" if total == 1 else "violations"
-    print(f"  netaudit: {total} {noun} detected")
+    print(_paint(f"  netaudit: {total} {noun} detected", _BOLD + _RED, color))
     print(border)
     for nodeid, violations in sorted(violations_by_test.items()):
-        print(f"\n  [{nodeid}]")
+        loc = (locations or {}).get(nodeid)
+        # The nodeid is the pytest address; file:line is what editors can jump to.
+        suffix = f"  ({loc})" if loc else ""
+        print(f"\n  [{nodeid}]{suffix}")
         for v in violations:
-            print(f"    {v}")
+            print("    " + _paint(str(v), _RED, color))
+
+    merged, tests_by_key = _merge_by_destination(violations_by_test)
+    print()
+    Reporter.format_summary(merged, tests_by_key=tests_by_key, stream=sys.stdout, color=color)
+    if suggest_rules:
+        # `merged` is already one entry per destination, so the same host hit by
+        # several tests yields a single rule rather than one per test.
+        print()
+        Reporter.format_suggestions(merged, stream=sys.stdout, color=color)
     print(f"{border}\n")
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
@@ -257,6 +358,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         metavar="YAML",
         default=None,
         help="Allowlist YAML file (overrides pyproject.toml and netaudit.yaml).",
+    )
+    group.addoption(
+        "--netaudit-suggest-rules",
+        action="store_true",
+        default=False,
+        help="Print copy-paste-ready allowlist YAML for each violation.",
     )
     group.addoption(
         "--netaudit-verbose",
@@ -314,17 +421,18 @@ def pytest_runtest_protocol(
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
     markers_path = os.environ.get(_ENV_MARKERS_OUT)
+    location = _item_location(item)
     if markers_path:
         ts = _now_ts()
         with open(markers_path, "a") as f:
-            f.write(f"START {ts:.6f} {item.nodeid}\n")
+            f.write(f"START\t{ts:.6f}\t{location}\t{item.nodeid}\n")
 
     yield
 
     if markers_path:
         ts = _now_ts()
         with open(markers_path, "a") as f:
-            f.write(f"END {ts:.6f} {item.nodeid}\n")
+            f.write(f"END\t{ts:.6f}\t{location}\t{item.nodeid}\n")
 
 
 def pytest_sessionfinish(
@@ -355,7 +463,15 @@ def pytest_sessionfinish(
             else:
                 violations_by_test = _attribute_violations(events, allowlist, test_ranges)
                 if violations_by_test:
-                    _emit_attributed(violations_by_test, session)
+                    locations = {
+                        tr.nodeid: tr.location for tr in test_ranges if tr.location is not None
+                    }
+                    _emit_attributed(
+                        violations_by_test,
+                        session,
+                        locations=locations,
+                        suggest_rules=_resolve_suggest_rules(session.config),
+                    )
         else:
             violations = Reporter.check(events, allowlist)
             if verbose:
