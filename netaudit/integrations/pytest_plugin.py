@@ -58,25 +58,47 @@ class _TestRange:
     nodeid: str
     start: float
     end: float
+    location: str | None = None
+    """``file:line`` of the test, when pytest reported a line number."""
+
+
+def _item_location(item: pytest.Item) -> str:
+    """``file:line`` for *item*, or the empty string when pytest has no line.
+
+    ``item.location`` reports a 0-based line number; editors are 1-based.
+    """
+    try:
+        path, lineno, _domain = item.location
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if not path or lineno is None:
+        return ""
+    return f"{path}:{lineno + 1}"
 
 
 def _parse_markers(path: Path) -> list[_TestRange]:
-    """Parse a markers sidecar file into test time-ranges."""
+    """Parse a markers sidecar file into test time-ranges.
+
+    Records are tab-separated ``kind, timestamp, location, nodeid``. Tabs rather
+    than spaces because parametrized nodeids contain spaces — ``test_p[a b c]``
+    — which a space-delimited fourth field could not survive.
+    """
     ranges: list[_TestRange] = []
-    pending: dict[str, float] = {}
+    pending: dict[str, tuple[float, str | None]] = {}
     for line in path.read_text().splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) != 3:
+        parts = line.split("\t")
+        if len(parts) != 4:
             continue
-        kind, ts_str, nodeid = parts
+        kind, ts_str, location, nodeid = parts
         try:
             ts = float(ts_str)
         except ValueError:
             continue
         if kind == "START":
-            pending[nodeid] = ts
+            pending[nodeid] = (ts, location or None)
         elif kind == "END" and nodeid in pending:
-            ranges.append(_TestRange(nodeid=nodeid, start=pending.pop(nodeid), end=ts))
+            start, loc = pending.pop(nodeid)
+            ranges.append(_TestRange(nodeid=nodeid, start=start, end=ts, location=loc))
     return ranges
 
 
@@ -276,6 +298,7 @@ def _emit_attributed_verbose(
 def _emit_attributed(
     violations_by_test: dict[str, list[Violation]],
     session: pytest.Session,
+    locations: dict[str, str] | None = None,
 ) -> None:
     total = sum(len(vs) for vs in violations_by_test.values())
     color = _resolve_color(session)
@@ -285,7 +308,10 @@ def _emit_attributed(
     print(_paint(f"  netaudit: {total} {noun} detected", _BOLD + _RED, color))
     print(border)
     for nodeid, violations in sorted(violations_by_test.items()):
-        print(f"\n  [{nodeid}]")
+        loc = (locations or {}).get(nodeid)
+        # The nodeid is the pytest address; file:line is what editors can jump to.
+        suffix = f"  ({loc})" if loc else ""
+        print(f"\n  [{nodeid}]{suffix}")
         for v in violations:
             print("    " + _paint(str(v), _RED, color))
 
@@ -371,17 +397,18 @@ def pytest_runtest_protocol(
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
     markers_path = os.environ.get(_ENV_MARKERS_OUT)
+    location = _item_location(item)
     if markers_path:
         ts = _now_ts()
         with open(markers_path, "a") as f:
-            f.write(f"START {ts:.6f} {item.nodeid}\n")
+            f.write(f"START\t{ts:.6f}\t{location}\t{item.nodeid}\n")
 
     yield
 
     if markers_path:
         ts = _now_ts()
         with open(markers_path, "a") as f:
-            f.write(f"END {ts:.6f} {item.nodeid}\n")
+            f.write(f"END\t{ts:.6f}\t{location}\t{item.nodeid}\n")
 
 
 def pytest_sessionfinish(
@@ -412,7 +439,10 @@ def pytest_sessionfinish(
             else:
                 violations_by_test = _attribute_violations(events, allowlist, test_ranges)
                 if violations_by_test:
-                    _emit_attributed(violations_by_test, session)
+                    locations = {
+                        tr.nodeid: tr.location for tr in test_ranges if tr.location is not None
+                    }
+                    _emit_attributed(violations_by_test, session, locations=locations)
         else:
             violations = Reporter.check(events, allowlist)
             if verbose:
