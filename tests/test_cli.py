@@ -346,3 +346,45 @@ class TestNoColor:
     def test_run_command_accepts_no_color(self) -> None:
         result = CliRunner().invoke(main, ["run", "--help"])
         assert "--no-color" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryTable:
+    def _log(self, tmp_path: Path) -> Path:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+        return log
+
+    def test_summary_printed_after_verbose_table(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", "--verbose", str(self._log(tmp_path))])
+        assert "ADDR:PORT" in result.output
+        assert "COUNT" in result.output
+        # COUNT appears only in the summary; the verbose table must come first.
+        assert result.output.index("STATUS") < result.output.index("COUNT")
+
+    def test_no_summary_in_non_verbose_mode(self, tmp_path: Path) -> None:
+        """The non-verbose detail block is already one row per destination."""
+        result = CliRunner().invoke(main, ["analyze", str(self._log(tmp_path))])
+        assert "ADDR:PORT" not in result.output
+        assert "8.8.8.8" in result.output
+
+    def test_no_summary_when_clean(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+        assert "ADDR:PORT" not in result.output
+        assert result.exit_code == 0
+
+    def test_summary_in_json_output(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", "--format", "json", str(self._log(tmp_path))])
+        data = json.loads(result.output)
+        assert data["summary"]["by_destination"][0]["addr"] == "8.8.8.8"
+
+    def test_summary_sorted_loudest_first(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(main, ["analyze", "--verbose", str(self._log(tmp_path))])
+        body = [ln for ln in result.output.splitlines() if ln.startswith("8.8.8.8")]
+        assert body

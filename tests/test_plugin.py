@@ -17,6 +17,7 @@ from netaudit.integrations.pytest_plugin import (
     _emit_attributed,
     _emit_attributed_verbose,
     _group_events,
+    _merge_by_destination,
     _now_ts,
     _parse_markers,
     _resolve_allowlist,
@@ -1023,3 +1024,65 @@ class TestEmitAttributedColor:
         session = _mock_session_color("yes")
         _emit_attributed_verbose([event], AllowList([], includes_builtins=False), ranges, session)
         assert "\033[31m" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _merge_by_destination
+# ---------------------------------------------------------------------------
+
+
+class TestMergeByDestination:
+    def _v(self, addr: str, port: int, pid: int, count: int) -> Violation:
+        v = Violation(family="AF_INET", addr=addr, port=port)
+        v.pids.add(pid)
+        v.count = count
+        return v
+
+    def test_same_destination_across_tests_is_merged(self) -> None:
+        by_test = {
+            "test_a": [self._v("1.2.3.4", 80, pid=1, count=2)],
+            "test_b": [self._v("1.2.3.4", 80, pid=2, count=3)],
+        }
+        merged, tests = _merge_by_destination(by_test)
+        assert len(merged) == 1
+        assert merged[0].count == 5
+        assert merged[0].pids == {1, 2}
+        assert tests[merged[0].key] == {"test_a", "test_b"}
+
+    def test_distinct_destinations_stay_separate(self) -> None:
+        by_test = {
+            "test_a": [self._v("1.2.3.4", 80, pid=1, count=1)],
+            "test_b": [self._v("5.6.7.8", 443, pid=1, count=1)],
+        }
+        merged, tests = _merge_by_destination(by_test)
+        assert len(merged) == 2
+
+    def test_empty_input(self) -> None:
+        merged, tests = _merge_by_destination({})
+        assert merged == []
+        assert tests == {}
+
+
+class TestEmitAttributedSummary:
+    def _v(self, addr: str) -> Violation:
+        v = Violation(family="AF_INET", addr=addr, port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_summary_table_emitted(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v("1.2.3.4")]}, session)
+        out = capsys.readouterr().out
+        assert "ADDR:PORT" in out
+        assert "TESTS" in out
+        assert "test_a" in out
+
+    def test_summary_lists_every_test_hitting_a_destination(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._v("1.2.3.4")], "test_b": [self._v("1.2.3.4")]}, session)
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("1.2.3.4:80"))
+        assert "test_a, test_b" in row

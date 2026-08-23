@@ -293,3 +293,98 @@ class TestFormatVerboseColor:
         colored = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=True)
         strip = re.sub(r"\033\[[0-9;]*m", "", colored)
         assert strip == plain
+
+
+# ---------------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSummary:
+    def _violations(self) -> list[Violation]:
+        events = [
+            _event("AF_INET", "198.51.100.1", 443, pid=10),
+            _event("AF_INET", "198.51.100.1", 443, pid=11),
+            _event("AF_INET", "203.0.113.7", 80, pid=10),
+        ]
+        return Reporter.check(events, AllowList.empty())
+
+    def test_header_and_rows_present(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        assert "ADDR:PORT" in out
+        assert "COUNT" in out
+        assert "198.51.100.1:443" in out
+        assert "203.0.113.7:80" in out
+
+    def test_counts_are_aggregated_per_destination(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        row = next(ln for ln in out.splitlines() if "198.51.100.1:443" in ln)
+        assert "2" in row.split()
+
+    def test_pids_column_when_no_attribution(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        assert "PIDS" in out
+        assert "10, 11" in out
+
+    def test_tests_column_when_attribution_given(self) -> None:
+        violations = self._violations()
+        tests = {v.key: {"test_a", "test_b"} for v in violations if v.port == 443}
+        out = Reporter.format_summary(violations, tests_by_key=tests)
+        assert "TESTS" in out
+        assert "PIDS" not in out
+        assert "test_a, test_b" in out
+
+    def test_destinations_sorted_by_count_descending(self) -> None:
+        out = Reporter.format_summary(self._violations())
+        body = [ln for ln in out.splitlines() if ":" in ln and "ADDR" not in ln]
+        assert "198.51.100.1:443" in body[0]
+
+    def test_empty_violations_returns_empty_string(self) -> None:
+        assert Reporter.format_summary([]) == ""
+
+    def test_no_ansi_by_default(self) -> None:
+        assert "\033[" not in Reporter.format_summary(self._violations())
+
+    def test_colored_when_requested(self) -> None:
+        assert "\033[" in Reporter.format_summary(self._violations(), color=True)
+
+    def test_writes_to_stream(self) -> None:
+        buf = io.StringIO()
+        out = Reporter.format_summary(self._violations(), stream=buf)
+        assert buf.getvalue() == out
+
+
+class TestFormatJsonSummary:
+    def _violations(self) -> list[Violation]:
+        events = [
+            _event("AF_INET", "198.51.100.1", 443, pid=10),
+            _event("AF_INET", "198.51.100.1", 443, pid=11),
+        ]
+        return Reporter.check(events, AllowList.empty())
+
+    def test_by_destination_present(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        dests = data["summary"]["by_destination"]
+        assert len(dests) == 1
+        assert dests[0]["addr"] == "198.51.100.1"
+        assert dests[0]["port"] == 443
+        assert dests[0]["count"] == 2
+        assert dests[0]["pids"] == [10, 11]
+
+    def test_total_still_present(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        assert data["summary"]["total"] == 1
+
+    def test_tests_included_when_attribution_given(self) -> None:
+        violations = self._violations()
+        tests = {v.key: {"test_b", "test_a"} for v in violations}
+        data = json.loads(Reporter.format_json(violations, tests_by_key=tests))
+        assert data["summary"]["by_destination"][0]["tests"] == ["test_a", "test_b"]
+
+    def test_tests_key_absent_without_attribution(self) -> None:
+        data = json.loads(Reporter.format_json(self._violations()))
+        assert "tests" not in data["summary"]["by_destination"][0]
+
+    def test_empty_violations_gives_empty_by_destination(self) -> None:
+        data = json.loads(Reporter.format_json([]))
+        assert data["summary"]["by_destination"] == []
