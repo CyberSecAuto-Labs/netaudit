@@ -252,7 +252,7 @@ class TestPluginNodeLinking:
     """Violations carry the test's file:line for editor click-through."""
 
     def test_violation_reports_file_and_line(self, pytester: pytest.Pytester) -> None:
-        pytester.makepyfile(
+        path = pytester.makepyfile(
             test_egress="""
             def test_external():
                 import socket
@@ -266,9 +266,16 @@ class TestPluginNodeLinking:
                     s.close()
             """
         )
+        # Derive the expected line from the file rather than hard-coding it, so the
+        # assertion proves the reported location really points at the test's `def`.
+        lineno = next(
+            i
+            for i, line in enumerate(path.read_text().splitlines(), start=1)
+            if line.startswith("def test_external")
+        )
         result = pytester.runpytest_subprocess("--netaudit")
         assert result.ret != 0
-        result.stdout.fnmatch_lines(["*test_egress.py::test_external*test_egress.py:2*"])
+        result.stdout.fnmatch_lines([f"*test_egress.py::test_external*test_egress.py:{lineno}*"])
 
     def test_summary_lists_the_offending_test(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(
