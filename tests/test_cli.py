@@ -296,3 +296,53 @@ class TestVerboseFlag:
         data = json.loads(result.output)
         assert "events" in data
         assert data["events"][0]["status"] == "violation"
+
+
+# ---------------------------------------------------------------------------
+# --no-color
+# ---------------------------------------------------------------------------
+
+
+class TestNoColor:
+    """Colour is emitted only on a TTY, and `--no-color` always wins."""
+
+    def _log(self, tmp_path: Path) -> Path:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+        return log
+
+    def test_color_emitted_when_supported(self, tmp_path: Path) -> None:
+        log = self._log(tmp_path)
+        with patch("netaudit.cli.supports_color", return_value=True):
+            result = CliRunner().invoke(main, ["analyze", str(log)])
+        assert "\033[31m" in result.output
+
+    def test_no_color_flag_suppresses_ansi(self, tmp_path: Path) -> None:
+        log = self._log(tmp_path)
+        with patch("netaudit.cli.supports_color", return_value=True):
+            result = CliRunner().invoke(main, ["analyze", "--no-color", str(log)])
+        assert "\033[" not in result.output
+        assert result.exit_code == 1
+
+    def test_no_ansi_when_not_a_tty(self, tmp_path: Path) -> None:
+        log = self._log(tmp_path)
+        with patch("netaudit.cli.supports_color", return_value=False):
+            result = CliRunner().invoke(main, ["analyze", str(log)])
+        assert "\033[" not in result.output
+
+    def test_verbose_output_is_colored(self, tmp_path: Path) -> None:
+        log = self._log(tmp_path)
+        with patch("netaudit.cli.supports_color", return_value=True):
+            result = CliRunner().invoke(main, ["analyze", "--verbose", str(log)])
+        assert "\033[31m" in result.output
+
+    def test_json_format_never_colored(self, tmp_path: Path) -> None:
+        log = self._log(tmp_path)
+        with patch("netaudit.cli.supports_color", return_value=True):
+            result = CliRunner().invoke(main, ["analyze", "--format", "json", str(log)])
+        assert "\033[" not in result.output
+        json.loads(result.output)
+
+    def test_run_command_accepts_no_color(self) -> None:
+        result = CliRunner().invoke(main, ["run", "--help"])
+        assert "--no-color" in result.output

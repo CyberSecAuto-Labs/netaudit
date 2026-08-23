@@ -2,10 +2,11 @@
 
 import io
 import json
+import re
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
-from netaudit.reporter import Reporter, Violation
+from netaudit.reporter import Reporter, Violation, supports_color
 
 
 def _event(
@@ -209,3 +210,86 @@ class TestReporterFormatJsonVerbose:
         violations = Reporter.check(events, al)
         data = json.loads(Reporter.format_json(violations))
         assert "events" not in data
+
+
+# ---------------------------------------------------------------------------
+# Colour support
+# ---------------------------------------------------------------------------
+
+
+class _FakeTTY(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class TestSupportsColor:
+    def test_tty_stream_supports_color(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert supports_color(_FakeTTY()) is True
+
+    def test_non_tty_stream_does_not(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert supports_color(io.StringIO()) is False
+
+    def test_no_color_env_disables_on_tty(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert supports_color(_FakeTTY()) is False
+
+    def test_empty_no_color_env_does_not_disable(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        """no-color.org: the variable must be present *and non-empty* to apply."""
+        monkeypatch.setenv("NO_COLOR", "")
+        assert supports_color(_FakeTTY()) is True
+
+    def test_none_stream_falls_back_to_stdout(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr("sys.stdout", _FakeTTY())
+        assert supports_color() is True
+
+
+class TestFormatColor:
+    def test_violation_is_red_when_color_enabled(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        out = Reporter.format(violations, color=True)
+        assert "\033[31m" in out
+        assert "\033[0m" in out
+
+    def test_no_ansi_when_color_disabled(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        out = Reporter.format(violations, color=False)
+        assert "\033[" not in out
+
+    def test_color_defaults_to_off(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        assert "\033[" not in Reporter.format(violations)
+
+    def test_clean_message_is_green_when_color_enabled(self) -> None:
+        out = Reporter.format([], color=True)
+        assert "\033[32m" in out
+        assert "no violations" in out
+
+    def test_colored_output_preserves_plain_content(self) -> None:
+        violations = Reporter.check([_event("AF_INET", "198.51.100.1", 443)], AllowList.empty())
+        colored = Reporter.format(violations, color=True)
+        assert "198.51.100.1:443" in colored
+        assert "1 violation detected" in colored
+
+
+class TestFormatVerboseColor:
+    def _mixed_events(self) -> list[ConnectEvent]:
+        return [_event("AF_INET", "127.0.0.1", 80), _event("AF_INET", "198.51.100.1", 443)]
+
+    def test_ok_green_and_violation_red(self) -> None:
+        out = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=True)
+        assert "\033[32m" in out
+        assert "\033[31m" in out
+
+    def test_no_ansi_when_color_disabled(self) -> None:
+        out = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=False)
+        assert "\033[" not in out
+
+    def test_columns_stay_aligned_when_colored(self) -> None:
+        """ANSI codes must not be counted in the column width."""
+        plain = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=False)
+        colored = Reporter.format_verbose(self._mixed_events(), AllowList.empty(), color=True)
+        strip = re.sub(r"\033\[[0-9;]*m", "", colored)
+        assert strip == plain

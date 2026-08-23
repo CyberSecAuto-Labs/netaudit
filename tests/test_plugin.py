@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,6 +20,7 @@ from netaudit.integrations.pytest_plugin import (
     _now_ts,
     _parse_markers,
     _resolve_allowlist,
+    _resolve_color,
     _resolve_enabled,
     _resolve_verbose,
     _TestRange,
@@ -193,7 +194,7 @@ class TestNowTs:
 
 def _mock_config(allowlist_opt: str | None = None) -> MagicMock:
     config = MagicMock(spec=["getoption"])
-    config.getoption.return_value = allowlist_opt
+    config.getoption.side_effect = lambda name, *default: allowlist_opt
     return config
 
 
@@ -546,9 +547,11 @@ class TestPytestSessionfinish:
 def _mock_config_verbose(verbose: bool = False, allowlist_opt: str | None = None) -> MagicMock:
     config = MagicMock(spec=["getoption"])
 
-    def _getoption(name: str) -> object:
+    def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit-verbose":
             return verbose
+        if name == "color":
+            return default[0] if default else "auto"
         return allowlist_opt
 
     config.getoption.side_effect = _getoption
@@ -795,10 +798,10 @@ class TestPytestSessionfinishVerbose:
 def _mock_config_enabled(cli_flag: bool = False) -> MagicMock:
     config = MagicMock(spec=["getoption"])
 
-    def _getoption(name: str) -> object:
+    def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit":
             return cli_flag
-        return None
+        return default[0] if default else None
 
     config.getoption.side_effect = _getoption
     return config
@@ -958,3 +961,65 @@ class TestPytestConfigureAutoEnable:
 
         with pytest.raises(pytest.UsageError, match="strace"):
             pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_color
+# ---------------------------------------------------------------------------
+
+
+def _mock_session_color(mode: str) -> MagicMock:
+    session = MagicMock()
+    session.config.getoption.return_value = mode
+    return session
+
+
+class TestResolveColor:
+    """Colour follows pytest's own --color option rather than a netaudit flag."""
+
+    def test_color_yes_forces_on(self) -> None:
+        assert _resolve_color(_mock_session_color("yes")) is True
+
+    def test_color_no_forces_off(self) -> None:
+        assert _resolve_color(_mock_session_color("no")) is False
+
+    def test_color_auto_defers_to_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        session = _mock_session_color("auto")
+        with patch("netaudit.integrations.pytest_plugin.supports_color", return_value=True):
+            assert _resolve_color(session) is True
+
+    def test_color_auto_off_for_non_tty(self) -> None:
+        session = _mock_session_color("auto")
+        with patch("netaudit.integrations.pytest_plugin.supports_color", return_value=False):
+            assert _resolve_color(session) is False
+
+    def test_option_not_registered_returns_false(self) -> None:
+        session = MagicMock()
+        session.config.getoption.side_effect = ValueError("unknown option")
+        assert _resolve_color(session) is False
+
+
+class TestEmitAttributedColor:
+    def _make_violation(self) -> Violation:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80)
+        v.pids.add(1)
+        v.count = 1
+        return v
+
+    def test_violations_colored_when_color_yes(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("yes")
+        _emit_attributed({"test_a": [self._make_violation()]}, session)
+        assert "\033[31m" in capsys.readouterr().out
+
+    def test_no_ansi_when_color_no(self, capsys: pytest.CaptureFixture[str]) -> None:
+        session = _mock_session_color("no")
+        _emit_attributed({"test_a": [self._make_violation()]}, session)
+        assert "\033[" not in capsys.readouterr().out
+
+    def test_verbose_colored_when_color_yes(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
+        event = _event("AF_INET", "1.2.3.4", 80, ts=10.5)
+        session = _mock_session_color("yes")
+        _emit_attributed_verbose([event], AllowList([], includes_builtins=False), ranges, session)
+        assert "\033[31m" in capsys.readouterr().out
