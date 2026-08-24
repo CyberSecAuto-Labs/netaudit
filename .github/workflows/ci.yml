@@ -77,8 +77,8 @@ jobs:
           code=$?
           set -e
           echo "$out"
-          if [ "$code" -ne 1 ]; then
-            echo "::error::expected exit 1 (violations), got $code"
+          if [ "$code" -ne 83 ]; then
+            echo "::error::expected exit 83 (violations), got $code"
             exit 1
           fi
           if ! grep -q "192.0.2.1" <<<"$out"; then
@@ -90,3 +90,15 @@ jobs:
         run: |
           docker run --rm --cap-add SYS_PTRACE netaudit:ci \
             run -- python -c 'print("no egress")'
+
+      - name: Smoke test — a failing command's exit code is not swallowed
+        run: |
+          set +e
+          docker run --rm --cap-add SYS_PTRACE netaudit:ci \
+            run -- python -c 'import sys; sys.exit(42)'
+          code=$?
+          set -e
+          if [ "$code" -ne 42 ]; then
+            echo "::error::expected the traced command's exit code 42, got $code"
+            exit 1
+          fi

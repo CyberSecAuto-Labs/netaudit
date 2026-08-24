@@ -18,6 +18,7 @@ from netaudit.integrations.pytest_plugin import (
     _attribute_violations,
     _emit_attributed,
     _emit_attributed_verbose,
+    _fail_session,
     _group_events,
     _merge_by_destination,
     _now_ts,
@@ -272,6 +273,7 @@ class TestEmitAttributed:
 
     def test_prints_nodeid_and_violation(self, capsys: pytest.CaptureFixture[str]) -> None:
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed({"tests/test_foo.py::test_bar": [self._make_violation()]}, session)
         out = capsys.readouterr().out
         assert "test_bar" in out
@@ -280,17 +282,20 @@ class TestEmitAttributed:
 
     def test_sets_exit_code(self) -> None:
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed({"test_a": [self._make_violation()]}, session)
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
 
     def test_singular_noun_for_one_violation(self, capsys: pytest.CaptureFixture[str]) -> None:
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed({"test_a": [self._make_violation()]}, session)
         out = capsys.readouterr().out
         assert "1 violation detected" in out
 
     def test_plural_noun_for_multiple_violations(self, capsys: pytest.CaptureFixture[str]) -> None:
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         v1, v2 = self._make_violation(), self._make_violation()
         v2.addr = "5.6.7.8"
         _emit_attributed({"test_a": [v1, v2]}, session)
@@ -444,6 +449,7 @@ class TestPytestSessionfinish:
     def test_does_nothing_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         pytest_sessionfinish(session=session, exitstatus=0)
         # exitstatus not changed
         session.exitstatus  # just access it — no assertion needed
@@ -456,6 +462,7 @@ class TestPytestSessionfinish:
         monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         pytest_sessionfinish(session=session, exitstatus=0)
         # No exception, no exit code change
 
@@ -476,6 +483,7 @@ class TestPytestSessionfinish:
 
         config = _mock_config()
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = config
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -503,6 +511,7 @@ class TestPytestSessionfinish:
 
         config = _mock_config()
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = config
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -524,6 +533,7 @@ class TestPytestSessionfinish:
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = _mock_config()
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -544,6 +554,7 @@ class TestPytestSessionfinish:
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = _mock_config()
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -641,6 +652,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("1.2.3.4", ts=10.5)
         al = AllowList([], includes_builtins=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         out = capsys.readouterr().out
         assert "FAMILY" in out
@@ -652,6 +664,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("127.0.0.1", ts=10.5)
         al = AllowList.empty()  # builtins allow loopback
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         out = capsys.readouterr().out
         assert "OK" in out
@@ -662,6 +675,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("1.2.3.4", ts=10.5)
         al = AllowList([], includes_builtins=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
 
@@ -670,6 +684,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("127.0.0.1", ts=10.5)
         al = AllowList.empty()
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         assert session.exitstatus != pytest.ExitCode.TESTS_FAILED
 
@@ -678,6 +693,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("1.2.3.4", ts=10.5)
         al = AllowList([], includes_builtins=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         out = capsys.readouterr().out
         assert "tests/test_foo.py::test_bar" in out
@@ -689,6 +705,7 @@ class TestEmitAttributedVerbose:
         event = self._make_event("1.2.3.4", ts=10.5)
         al = AllowList([], includes_builtins=False)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         out = capsys.readouterr().out
         assert "<session>" in out
@@ -709,6 +726,7 @@ class TestPytestSessionfinishVerbose:
     def _make_session(self, verbose: bool = True) -> MagicMock:
         config = _mock_config_verbose(verbose=verbose)
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = config
         return session
 
@@ -983,6 +1001,7 @@ class TestPytestConfigureAutoEnable:
 
 def _mock_session_color(mode: str) -> MagicMock:
     session = MagicMock()
+    session.exitstatus = pytest.ExitCode.OK
     session.config.getoption.return_value = mode
     return session
 
@@ -1009,6 +1028,7 @@ class TestResolveColor:
 
     def test_option_not_registered_returns_false(self) -> None:
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config.getoption.side_effect = ValueError("unknown option")
         assert _resolve_color(session) is False
 
@@ -1356,6 +1376,7 @@ class TestSessionfinishWritesReport:
 
         config.getoption.side_effect = _getoption
         session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
         session.config = config
         return session
 
@@ -1394,4 +1415,49 @@ class TestSessionfinishWritesReport:
         session = self._make_session(str(tmp_path / "report.json"))
         pytest_sessionfinish(session=session, exitstatus=0)
         capsys.readouterr()
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Session exit status must never be downgraded
+# ---------------------------------------------------------------------------
+
+
+class TestFailSession:
+    """Violations add a failure; they must not mask a more severe one."""
+
+    def test_ok_session_becomes_tests_failed(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        _fail_session(session)
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_already_failed_stays_failed(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        _fail_session(session)
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_internal_error_is_not_downgraded(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.INTERNAL_ERROR
+        _fail_session(session)
+        assert session.exitstatus == pytest.ExitCode.INTERNAL_ERROR
+
+    def test_usage_error_is_not_downgraded(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.USAGE_ERROR
+        _fail_session(session)
+        assert session.exitstatus == pytest.ExitCode.USAGE_ERROR
+
+    def test_interrupted_is_not_downgraded(self) -> None:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.INTERRUPTED
+        _fail_session(session)
+        assert session.exitstatus == pytest.ExitCode.INTERRUPTED
+
+    def test_integer_zero_is_treated_as_ok(self) -> None:
+        session = MagicMock()
+        session.exitstatus = 0
+        _fail_session(session)
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED

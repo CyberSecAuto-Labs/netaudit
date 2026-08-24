@@ -67,6 +67,7 @@ def build_run_metadata(
     command: list[str] | None = None,
     allowlist: str | None = None,
     source: str | None = None,
+    command_exit_code: int | None = None,
 ) -> dict[str, Any]:
     """Describe the run that produced a report.
 
@@ -88,6 +89,8 @@ def build_run_metadata(
         meta["allowlist"] = allowlist
     if source is not None:
         meta["source"] = source
+    if command_exit_code is not None:
+        meta["command_exit_code"] = command_exit_code
     return meta
 
 

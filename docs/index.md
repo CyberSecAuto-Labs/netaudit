@@ -56,13 +56,35 @@ netaudit undeclared reports/*.json
 `undeclared` reports what those runs touched that your allowlist does not permit — candidates
 to triage, not recommendations. See [Undeclared Egress](undeclared.md).
 
-Exit codes:
+Exit codes for `netaudit run`:
 
 | Code | Meaning |
 |------|---------|
-| 0 | No violations |
-| 1 | One or more violations detected |
-| 2 | `strace` not found on PATH |
+| 0 | Command succeeded, no violations |
+| 83 | Command succeeded, violations detected |
+| 84 | `strace` not found on PATH |
+| *other* | The traced command's own exit code, passed through |
+
+`run` wraps another process, so violations get a reserved code and the wrapped command's
+status is never swallowed — a failing test suite still fails.
+
+Exit codes for `netaudit analyze`:
+
+| Code | Meaning |
+|------|---------|
+| 0 | No violations found in log |
+| 1 | One or more violations found |
+
+Exit codes for `netaudit undeclared`:
+
+| Code | Meaning |
+|------|---------|
+| 0 | No undeclared egress found |
+| 1 | Undeclared egress found |
+| 2 | A report could not be read, or its schema version is unsupported |
+
+`analyze` and `undeclared` wrap nothing, so they keep the whole exit-code space and use `1`
+for findings. See the [CLI reference](cli-reference.md#exit-codes) for details.
 
 ## How it works
 
