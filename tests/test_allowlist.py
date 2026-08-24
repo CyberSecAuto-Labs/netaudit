@@ -355,3 +355,28 @@ class TestPortFromYaml:
                 tmp_path,
                 "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: 99999\n",
             )
+
+
+# ---------------------------------------------------------------------------
+# Malformed addresses
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedAddress:
+    """A rule must reject an unparseable address rather than raise.
+
+    strace can emit addresses the parser passes through verbatim; a rule that
+    raised on one would abort the whole run instead of flagging a violation.
+    """
+
+    def test_ipv4_rule_rejects_a_non_address(self) -> None:
+        assert not IPv4Rule("10.0.0.0/8").matches(_event("AF_INET", "not-an-ip"))
+
+    def test_ipv4_rule_rejects_an_ipv6_literal(self) -> None:
+        assert not IPv4Rule("0.0.0.0/0").matches(_event("AF_INET", "::1"))
+
+    def test_ipv6_rule_rejects_a_non_address(self) -> None:
+        assert not IPv6Rule("fe80::/10").matches(_event("AF_INET6", "not-an-ip"))
+
+    def test_ipv6_rule_rejects_an_ipv4_literal(self) -> None:
+        assert not IPv6Rule("::/0").matches(_event("AF_INET6", "10.1.2.3"))
