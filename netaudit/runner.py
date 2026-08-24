@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+__all__ = ["StraceNotFoundError", "StraceProcess", "StraceRunner"]
+
 _TERMINATE_TIMEOUT = 5  # seconds to wait for graceful shutdown before SIGKILL
 
 

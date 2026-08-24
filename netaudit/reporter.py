@@ -16,6 +16,20 @@ from typing import Any, TextIO
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
 
+__all__ = [
+    "Destination",
+    "LoadedReport",
+    "MergedDestination",
+    "REPORT_VERSION",
+    "Reporter",
+    "Violation",
+    "build_run_metadata",
+    "is_external",
+    "load_report",
+    "merge_reports",
+    "supports_color",
+]
+
 #: Schema version of the JSON report envelope. Bump on any breaking change to
 #: the shape, so tools reading saved reports can reject what they cannot parse.
 REPORT_VERSION = 1

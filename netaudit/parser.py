@@ -7,6 +7,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
+__all__ = ["ConnectEvent", "StraceParser"]
+
 # Lines longer than this are skipped — they can't be valid strace output and
 # would trigger catastrophic regex backtracking on malformed input.
 _MAX_LINE_LEN = 4096

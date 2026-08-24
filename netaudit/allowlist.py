@@ -11,6 +11,15 @@ import yaml
 
 from netaudit.parser import ConnectEvent
 
+__all__ = [
+    "AllowList",
+    "IPv4Rule",
+    "IPv6Rule",
+    "NetlinkRule",
+    "Rule",
+    "UnixSocketRule",
+]
+
 # ---------------------------------------------------------------------------
 # Rule protocol
 # ---------------------------------------------------------------------------
