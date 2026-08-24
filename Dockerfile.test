@@ -1,0 +1,30 @@
+# Test image — Linux + strace, for running the integration suite.
+#
+# This is the image CI runs the integration job in, so a local run reproduces
+# CI exactly:
+#
+#   make integration-docker
+#
+# The distribution image (./Dockerfile) is deliberately not reused: it ships the
+# CLI without dev dependencies. This one exists to run tests, not to be shipped.
+#
+# Override the interpreter to check another supported version:
+#   docker build -f Dockerfile.test --build-arg PYTHON_VERSION=3.14 -t netaudit:test .
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends strace \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir -e ".[dev]"
+
+# Keep pytest and coverage scratch out of the source tree, which may be mounted
+# read-only.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    COVERAGE_FILE=/tmp/.coverage
+
+ENTRYPOINT ["pytest", "-p", "no:cacheprovider"]
+CMD ["-m", "integration", "-v"]

@@ -1,4 +1,4 @@
-.PHONY: venv lint test integration docs docs-serve clean
+.PHONY: venv lint test integration integration-docker docs docs-serve clean
 
 venv:
 	python3.11 -m venv .venv
@@ -15,6 +15,13 @@ test:
 
 integration:
 	.venv/bin/pytest -m integration -v
+
+# Runs the integration suite the way CI does: Linux, real strace, same image.
+# Use this on macOS/Windows, where strace does not exist.
+integration-docker:
+	docker build -f Dockerfile.test -t netaudit:test .
+	docker run --rm --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+		netaudit:test -m integration -v
 
 docs:
 	.venv/bin/mkdocs build --strict

@@ -49,15 +49,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Install strace
-        run: sudo apt-get install -y strace
-      - name: Install dev dependencies
-        run: pip install -e ".[dev]"
+      # Built from Dockerfile.test so `make integration-docker` reproduces this
+      # job exactly, including the interpreter and the strace build.
+      - name: Build test image
+        run: docker build -f Dockerfile.test -t netaudit:test .
+      # strace needs ptrace, which Docker's default seccomp profile denies.
       - name: Run integration tests
-        run: pytest -m integration -v
+        run: >
+          docker run --rm --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+          netaudit:test -m integration -v
 
   docker:
     name: Docker smoke test
