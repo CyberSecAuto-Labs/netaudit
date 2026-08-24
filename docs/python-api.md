@@ -77,11 +77,13 @@ Rules can be constructed directly instead of loaded from YAML:
 ```python
 from netaudit.allowlist import AllowList, IPv4Rule, UnixSocketRule
 
-allowlist = AllowList([
-    IPv4Rule("10.0.0.0/8", name="internal network"),
-    IPv4Rule("127.0.0.1/32", name="local proxy", port=9393),
-    UnixSocketRule("/run/gvmd/*", name="GVM socket"),
-])
+allowlist = AllowList(
+    [
+        IPv4Rule("10.0.0.0/8", name="internal network"),
+        IPv4Rule("127.0.0.1/32", name="local proxy", port=9393),
+        UnixSocketRule("/run/gvmd/*", name="GVM socket"),
+    ]
+)
 ```
 
 Any object satisfying the `Rule` protocol — a `name` attribute and a
