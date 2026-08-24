@@ -30,7 +30,8 @@ _DEFAULT_ALLOWLIST = "netaudit.yaml"
 # Exit codes
 _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
-_EXIT_STRACE_MISSING = 2
+#: `undeclared` and `analyze` wrap nothing, so their codes cannot be confused
+#: with a child process's and stay in the low range.
 _EXIT_BAD_REPORT = 2
 #: `run` reserves a code of its own for violations, because every other value
 #: belongs to the wrapped command — swallowing that would hide its failure.
@@ -53,6 +54,10 @@ _EXIT_BAD_REPORT = 2
 #: application-defined codes. A code shared with something a suite emits routinely
 #: teaches people to disregard it, and a real violation then goes unnoticed.
 _EXIT_TRACED_VIOLATIONS = 83
+#: Also `run`'s own, for the same reason. 2 would collide with the traced
+#: command — `pytest.ExitCode.INTERRUPTED` is 2, so a cancelled or timed-out run
+#: would be indistinguishable from a missing strace.
+_EXIT_STRACE_MISSING = 84
 
 
 def _load_allowlist(allowlist: str | None) -> AllowList:
