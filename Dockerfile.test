@@ -22,9 +22,11 @@ COPY . /app
 RUN pip install --no-cache-dir -e ".[dev]"
 
 # Keep pytest and coverage scratch out of the source tree, which may be mounted
-# read-only.
+# read-only. COVERAGE_PROCESS_START lets coverage follow the pytest plugin's
+# os.execvpe into strace — without it the plugin's coverage is silently lost.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    COVERAGE_FILE=/tmp/.coverage
+    COVERAGE_FILE=/tmp/.coverage \
+    COVERAGE_PROCESS_START=/app/pyproject.toml
 
 ENTRYPOINT ["pytest", "-p", "no:cacheprovider"]
 CMD ["-m", "integration", "-v"]

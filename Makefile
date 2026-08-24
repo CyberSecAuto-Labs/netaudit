@@ -14,7 +14,7 @@ test:
 	.venv/bin/pytest --cov=netaudit --cov-fail-under=98
 
 integration:
-	.venv/bin/pytest -m integration -v
+	COVERAGE_PROCESS_START=$(PWD)/pyproject.toml .venv/bin/pytest -m integration -v
 
 # Runs the integration suite the way CI does: Linux, real strace, same image.
 # Use this on macOS/Windows, where strace does not exist.
