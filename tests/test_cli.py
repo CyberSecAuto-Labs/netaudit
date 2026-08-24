@@ -125,14 +125,14 @@ class TestAnalyzeCommand:
 
 
 class TestRunCommand:
-    def test_strace_missing_exits_2(self) -> None:
+    def test_strace_missing_uses_a_reserved_code(self) -> None:
         with patch("netaudit.cli.StraceRunner") as mock_cls:
             from netaudit.runner import StraceNotFoundError
 
             mock_cls.side_effect = StraceNotFoundError("strace not found")
             result = CliRunner().invoke(main, ["run", "--", "echo", "hi"])
 
-        assert result.exit_code == 2
+        assert result.exit_code == 84
         assert "strace" in result.output.lower()
 
     def test_clean_run_exits_0(self, tmp_path: Path) -> None:
@@ -796,3 +796,37 @@ class TestRunExitCodes:
         result = self._invoke(tmp_path, _STRACE_LOG_CLEAN, 5, "--format", "json")
         data = json.loads(result.stdout)  # type: ignore[attr-defined]
         assert data["run"]["command_exit_code"] == 5
+
+
+class TestRunReservedCodesAreDistinct:
+    """netaudit's own codes must not be reachable by the traced command."""
+
+    def test_command_exiting_2_is_not_read_as_missing_strace(self, tmp_path: Path) -> None:
+        """pytest.ExitCode.INTERRUPTED is 2 — a cancelled run must stay a 2."""
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(_STRACE_LOG_CLEAN)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=2)
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+        ):
+            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
+            with patch("pathlib.Path.unlink"):
+                result = CliRunner().invoke(main, ["run", "--", "pytest"])
+        assert result.exit_code == 2
+        assert "traced command exited with 2" in result.output
+
+    def test_reserved_codes_do_not_overlap(self) -> None:
+        from netaudit.cli import (
+            _EXIT_CLEAN,
+            _EXIT_STRACE_MISSING,
+            _EXIT_TRACED_VIOLATIONS,
+        )
+
+        codes = {_EXIT_CLEAN, _EXIT_TRACED_VIOLATIONS, _EXIT_STRACE_MISSING}
+        assert len(codes) == 3
+        # Both netaudit-originated codes sit in the band left clear of sysexits,
+        # the Linux socket errno block, shell codes and signal-derived values.
+        assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
+        assert 79 <= _EXIT_STRACE_MISSING <= 87
