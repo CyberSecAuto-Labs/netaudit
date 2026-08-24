@@ -169,7 +169,7 @@ class TestRunCommand:
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "curl", "8.8.8.8"])
 
-        assert result.exit_code == 3
+        assert result.exit_code == 83
 
     def test_json_format(self, tmp_path: Path) -> None:
         strace_log = tmp_path / "out.strace"
@@ -188,7 +188,7 @@ class TestRunCommand:
                     main, ["run", "--format", "json", "--", "curl", "8.8.8.8"]
                 )
 
-        assert result.exit_code == 3
+        assert result.exit_code == 83
         data = json.loads(result.output)
         assert data["summary"]["total"] == 1
 
@@ -292,7 +292,7 @@ class TestVerboseFlag:
                     main, ["run", "--verbose", "--format", "json", "--", "curl", "8.8.8.8"]
                 )
 
-        assert result.exit_code == 3
+        assert result.exit_code == 83
         data = json.loads(result.output)
         assert "events" in data
         assert data["events"][0]["status"] == "violation"
@@ -763,7 +763,7 @@ class TestRunExitCodes:
 
     def test_violations_use_the_reserved_code(self, tmp_path: Path) -> None:
         result = self._invoke(tmp_path, _STRACE_LOG_VIOLATION, 0)
-        assert result.exit_code == 3  # type: ignore[attr-defined]
+        assert result.exit_code == 83  # type: ignore[attr-defined]
 
     def test_failing_command_propagates_its_code(self, tmp_path: Path) -> None:
         """The bug: a failing suite with clean egress used to exit 0."""

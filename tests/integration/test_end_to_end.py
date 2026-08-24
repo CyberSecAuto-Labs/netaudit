@@ -148,7 +148,7 @@ class TestRunExitCodePropagation:
             "    s.close()\n"
         )
         result = _run_netaudit("run", "--", sys.executable, str(script))
-        assert result.returncode == 3
+        assert result.returncode == 83
         assert "198.51.100.1" in result.stdout
 
     def test_command_failure_takes_precedence_over_violations(self, tmp_path: Path) -> None:
