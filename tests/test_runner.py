@@ -43,8 +43,9 @@ class TestStraceCmd:
         assert "-tt" in cmd, "timestamps are needed to correlate with markers"
 
     def test_writes_to_the_given_output_path(self) -> None:
-        cmd = _strace_cmd(Path("/var/log/somewhere.log"))
-        assert cmd[cmd.index("-o") + 1] == "/var/log/somewhere.log"
+        out = Path("/var/log/somewhere.log")
+        cmd = _strace_cmd(out)
+        assert cmd[cmd.index("-o") + 1] == str(out)
 
 
 # ---------------------------------------------------------------------------
