@@ -77,8 +77,6 @@ jobs:
           code=$?
           set -e
           echo "$out"
-          # 83 is `run`'s reserved code for violations; every other value
-          # belongs to the traced command.
           if [ "$code" -ne 83 ]; then
             echo "::error::expected exit 83 (violations), got $code"
             exit 1

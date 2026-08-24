@@ -211,12 +211,7 @@ def _resolve_suggest_rules(config: pytest.Config) -> bool:
 
 
 def _fail_session(session: pytest.Session) -> None:
-    """Mark the session failed without downgrading a more severe status.
-
-    Violations *add* a failure; they must never mask one. pytest's exit codes
-    ascend in severity past TESTS_FAILED — INTERRUPTED, INTERNAL_ERROR,
-    USAGE_ERROR — so overwriting unconditionally would hide the worse problem.
-    """
+    """Mark the session failed without downgrading a more severe status."""
     if not session.exitstatus:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
