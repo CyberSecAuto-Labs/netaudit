@@ -26,9 +26,17 @@ __all__ = [
 
 
 class Rule(Protocol):
+    """What an allowlist rule must provide.
+
+    Any object with a ``name`` and a ``matches`` method can be passed to
+    :class:`AllowList`; the built-in rule types are not privileged.
+    """
+
     name: str
 
-    def matches(self, event: ConnectEvent) -> bool: ...
+    def matches(self, event: ConnectEvent) -> bool:
+        """Whether this rule permits *event*."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +57,7 @@ class IPv4Rule:
         self.port = port
 
     def matches(self, event: ConnectEvent) -> bool:
+        """Whether *event* is an AF_INET connection inside this rule's CIDR."""
         if event.family != "AF_INET" or event.addr is None:
             return False
         if self.port is not None and event.port != self.port:
@@ -72,6 +81,7 @@ class IPv6Rule:
         self.port = port
 
     def matches(self, event: ConnectEvent) -> bool:
+        """Whether *event* is an AF_INET6 connection inside this rule's CIDR."""
         if event.family != "AF_INET6" or event.addr is None:
             return False
         if self.port is not None and event.port != self.port:
@@ -90,6 +100,7 @@ class UnixSocketRule:
         self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
+        """Whether *event* is an AF_UNIX connection whose path matches the glob."""
         if event.family != "AF_UNIX" or event.addr is None:
             return False
         return fnmatch.fnmatch(event.addr, self._glob)
@@ -102,6 +113,7 @@ class NetlinkRule:
         self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
+        """Whether *event* is an AF_NETLINK connection."""
         return event.family == "AF_NETLINK"
 
 
@@ -157,6 +169,13 @@ def _rule_from_dict(entry: dict[str, Any]) -> Rule:
 
 
 class AllowList:
+    """The rule set a :class:`~netaudit.parser.ConnectEvent` is judged against.
+
+    Rules are tried in order and the first match wins. Built-in rules for
+    loopback, Unix sockets and netlink are prepended unless
+    ``includes_builtins=False`` — users opt out rather than opt in.
+    """
+
     def __init__(self, rules: list[Rule], includes_builtins: bool = True) -> None:
         self._rules: list[Rule] = list(rules)
         if includes_builtins:
@@ -164,6 +183,7 @@ class AllowList:
 
     @classmethod
     def from_yaml(cls, path: Path) -> "AllowList":
+        """Load an allowlist from a YAML file at *path*."""
         raw = yaml.safe_load(path.read_text())
         includes_builtins = raw.get("includes_builtins", True)
         rules: list[Rule] = []
@@ -184,4 +204,5 @@ class AllowList:
         return None
 
     def is_allowed(self, event: ConnectEvent) -> bool:
+        """Whether any rule permits *event*."""
         return self.match(event) is not None

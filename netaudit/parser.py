@@ -101,6 +101,16 @@ def _parse_ts(ts: str) -> float:
 
 @dataclass
 class ConnectEvent:
+    """One observed ``connect()`` syscall.
+
+    This is the unit every other part of netaudit works in: the parser
+    produces them, allowlist rules match against them, and the reporter
+    groups them into violations.
+
+    ``result`` is 0 on success or a negative errno. A non-blocking connect
+    still in flight (``EINPROGRESS``) is normalised to 0 — it egressed.
+    """
+
     pid: int
     timestamp: float
     family: str
