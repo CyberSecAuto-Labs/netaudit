@@ -510,6 +510,32 @@ class TestOutputFile:
         result = CliRunner().invoke(main, ["analyze", "--format", "json", str(self._log(tmp_path))])
         assert "run" in json.loads(result.output)
 
+    def test_verbose_text_file_lists_every_event(self, tmp_path: Path) -> None:
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(
+            main, ["analyze", "--verbose", "--output", str(out), str(self._log(tmp_path))]
+        )
+        body = out.read_text()
+        assert "8.8.8.8:53" in body
+        assert "STATUS" in body, "verbose mode writes the per-event table"
+        assert "COUNT" in body, "the per-destination summary follows the event table"
+
+    def test_suggested_rules_reach_the_text_file(self, tmp_path: Path) -> None:
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(
+            main, ["analyze", "--suggest-rules", "--output", str(out), str(self._log(tmp_path))]
+        )
+        body = out.read_text()
+        assert "8.8.8.8" in body
+        assert "family: AF_INET" in body, "suggestions are emitted as allowlist YAML"
+
+    def test_no_suggestions_appended_for_a_clean_run(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(main, ["analyze", "--suggest-rules", "--output", str(out), str(log)])
+        assert "family:" not in out.read_text()
+
 
 # ---------------------------------------------------------------------------
 # netaudit undeclared
