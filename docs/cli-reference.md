@@ -39,12 +39,12 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 |------|---------|
 | 0 | Command succeeded and made no unallowed connections |
 | 2 | `strace` binary not found on PATH |
-| 3 | Command succeeded, but unallowed connections were detected |
+| 83 | Command succeeded, but unallowed connections were detected |
 | *other* | The traced command's own exit code, passed through unchanged |
 
 `run` wraps another process, so most of the exit-code space belongs to that process.
-Violations therefore get a reserved code of their own (**3**) rather than `1`, which is
-free to mean "the wrapped command failed".
+Violations therefore get a reserved code of their own — **83** — leaving `1` free to mean
+"the wrapped command failed".
 
 **A failing command takes precedence over violations.** A command that died part-way may
 have produced an incomplete trace, so its failure is the more reliable signal — but any
@@ -52,10 +52,43 @@ violations found are still printed. When the traced command exits non-zero, neta
 writes `netaudit: traced command exited with N` to stderr and records
 `run.command_exit_code` in the JSON report, so the value is never lost.
 
-!!! note "Ambiguity when the command uses 2 or 3"
-    Codes `2` and `3` are netaudit's own. If the traced command itself exits with one of
-    them, the meaning is ambiguous from the code alone — the stderr line and the report
-    tell you which happened.
+### Why 83
+
+Exit codes are 8 bits — `0`–`255` — and values above that wrap silently, so `exit(256)`
+becomes `0`. A violation code must live inside that range, and clear of everything already
+spoken for:
+
+| Range | Already used for |
+|-------|------------------|
+| 0–2 | Success and general errors, near-universally |
+| 3–10 | Common application codes — Mocha reports its *failure count* here |
+| 64–78 | BSD `sysexits.h` |
+| 88–115 | The Linux socket errno block — `111` is `ECONNREFUSED`, `110` `ETIMEDOUT`, `113` `EHOSTUNREACH` |
+| 100, 111 | `chpst` (runit/daemontools) — "the wrapper failed to set up" |
+| 126–128 | Shell: not executable, not found, bad exit argument |
+| 129–192 | Killed by signal (128 + signal number) |
+| 255 | Catch-all, and what `exit(-1)` becomes |
+
+That leaves **79–87**, within the 64–113 range conventionally recommended for
+application-defined codes.
+
+The socket errno block matters especially here: netaudit reports connection results as
+negated errno values, so a report can contain `-111 ECONNREFUSED` — and a network tool
+exiting `111` alongside that would be read as a connection failure rather than a policy
+violation. The `chpst` clash is the same hazard from the other direction: it is a process
+wrapper too, so `111` already means "the wrapper broke" to anyone from that ecosystem.
+
+Sharing a code with something a suite emits routinely teaches people to disregard it, and
+a real violation then goes unnoticed. That is why the number is chosen deliberately rather
+than taken from the low range.
+
+!!! note "If the traced command itself exits 2 or 83"
+    Those two values are netaudit's own, so the meaning is ambiguous from the code alone.
+    netaudit writes `netaudit: traced command exited with N` to stderr and records
+    `run.command_exit_code` in the JSON report, so the two cases stay distinguishable.
+    **For anything scripted, read the JSON report rather than the exit code** — it states
+    the command's status and the violation count separately, and no choice of number can
+    make a single integer carry two independent signals unambiguously.
 
 ### Examples
 

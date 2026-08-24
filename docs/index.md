@@ -62,7 +62,7 @@ Exit codes for `netaudit run`:
 |------|---------|
 | 0 | Command succeeded, no violations |
 | 2 | `strace` not found on PATH |
-| 3 | Command succeeded, violations detected |
+| 83 | Command succeeded, violations detected |
 | *other* | The traced command's own exit code, passed through |
 
 `run` wraps another process, so violations get a reserved code and the wrapped command's
