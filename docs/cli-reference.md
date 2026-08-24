@@ -287,8 +287,8 @@ Rules are scoped as narrowly as the observed connection allows — exact address
 exact port when the connection had one. Paste them under the `allowlist:` key of your
 config to turn a violation into an explicit, reviewable exception.
 
-Suggestions never change the exit code: a run with violations still exits 3.
-With `--format json` they appear under the `suggested_rules` key instead.
+Suggestions never change the exit code: violations still exit `83` under `run` and `1`
+under `analyze`. With `--format json` they appear under the `suggested_rules` key instead.
 
 ## Coloured output
 

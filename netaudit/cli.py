@@ -228,8 +228,8 @@ def run_cmd(
             output=output,
         )
         if command_code != 0:
-            # Surface it: codes 2 and 3 are netaudit's own, so a propagated
-            # value could otherwise be misread as netaudit's verdict.
+            # Surface it: 83 and 84 are netaudit's own, so a propagated value
+            # could otherwise be misread as netaudit's verdict.
             click.echo(
                 f"netaudit: traced command exited with {command_code}",
                 err=True,
