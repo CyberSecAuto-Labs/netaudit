@@ -77,10 +77,10 @@ jobs:
           code=$?
           set -e
           echo "$out"
-          # 3 is `run`'s reserved code for violations; every other value belongs
-          # to the traced command.
-          if [ "$code" -ne 3 ]; then
-            echo "::error::expected exit 3 (violations), got $code"
+          # 83 is `run`'s reserved code for violations; every other value
+          # belongs to the traced command.
+          if [ "$code" -ne 83 ]; then
+            echo "::error::expected exit 83 (violations), got $code"
             exit 1
           fi
           if ! grep -q "192.0.2.1" <<<"$out"; then
