@@ -34,7 +34,25 @@ _EXIT_STRACE_MISSING = 2
 _EXIT_BAD_REPORT = 2
 #: `run` reserves a code of its own for violations, because every other value
 #: belongs to the wrapped command — swallowing that would hide its failure.
-_EXIT_TRACED_VIOLATIONS = 3
+#:
+#: Exit codes are 8 bits and wrap silently (``exit(256)`` becomes 0), so the value
+#: must sit inside 0-255 and clear of everything already spoken for:
+#:
+#: * 0-2       universal success / general error
+#: * 3-10      common application codes — Mocha reports its failure *count* here
+#: * 64-78     BSD ``sysexits.h``
+#: * 88-115    the Linux socket errno block, which is this tool's own subject
+#:             matter: 111 is ECONNREFUSED and appears negated in ``ConnectEvent.result``
+#: * 100, 111  daemontools/runit ``chpst`` — "wrapper failed to set up", i.e. a
+#:             conflicting meaning in the same category of tool
+#: * 126-128   shell: not executable, not found, bad exit argument
+#: * 129-192   killed by signal (128 + signal number)
+#: * 255       catch-all
+#:
+#: 79-87 is what survives, inside the 64-113 range conventionally recommended for
+#: application-defined codes. A code shared with something a suite emits routinely
+#: teaches people to disregard it, and a real violation then goes unnoticed.
+_EXIT_TRACED_VIOLATIONS = 83
 
 
 def _load_allowlist(allowlist: str | None) -> AllowList:
