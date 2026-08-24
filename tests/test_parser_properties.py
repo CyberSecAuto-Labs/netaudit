@@ -175,9 +175,47 @@ class TestParserInvariants:
 
     @given(st.lists(st.text(max_size=200), max_size=30))
     def test_stream_keeps_exactly_the_recognised_lines(self, lines: list[str]) -> None:
+        """Absent split syscalls, the stream is just the recognised lines.
+
+        With them, parse_stream rejoins the two halves into one event, so it is
+        deliberately not a plain filter over parse_line.
+        """
+        assume(not any("<unfinished ...>" in ln or "connect resumed" in ln for ln in lines))
         parser = StraceParser()
         expected = [e for e in (parser.parse_line(ln) for ln in lines) if e is not None]
         assert parser.parse_stream(lines) == expected
+
+    @given(
+        entries=st.lists(
+            st.tuples(pids, timestamps, ipv4_addrs, ports, results), min_size=1, max_size=12
+        )
+    )
+    def test_split_calls_yield_one_event_each(
+        self, entries: list[tuple[int, str, str, int, int]]
+    ) -> None:
+        """However strace interleaves them, one connect must mean one event."""
+        # Distinct pids: a thread can only have one connect in flight at a time.
+        unique = {pid: entry for pid, *rest in entries for entry in [(pid, *rest)]}
+        halves: list[str] = []
+        for pid, ts, addr, port, _result in unique.values():
+            halves.append(_inet_line(pid, ts, addr, port, 0).replace(") = 0", " <unfinished ...>"))
+        for pid, ts, _addr, _port, result in unique.values():
+            halves.append(f"{pid} {ts} <... connect resumed>) = {result}")
+
+        events = StraceParser().parse_stream(halves)
+        assert len(events) == len(unique)
+        assert {e.addr for e in events} == {addr for _, _, addr, _, _ in unique.values()}
+        assert all(e.family == "AF_INET" for e in events)
+
+    @given(pid=pids, ts=timestamps, addr=ipv4_addrs, port=ports)
+    def test_a_split_call_never_loses_its_destination(
+        self, pid: int, ts: str, addr: str, port: int
+    ) -> None:
+        """The bug this guards: the destination lives only on the first half."""
+        unfinished = _inet_line(pid, ts, addr, port, 0).replace(") = 0", " <unfinished ...>")
+        resumed = f"{pid} {ts} <... connect resumed>) = 0"
+        events = StraceParser().parse_stream([unfinished, resumed])
+        assert [e.addr for e in events] == [addr]
 
     @given(
         st.lists(
