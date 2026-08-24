@@ -6,13 +6,17 @@ coverage lives in ``tests/integration/test_end_to_end.py``.
 
 from __future__ import annotations
 
+import signal
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from netaudit.runner import (
+    _SIGKILL,
     _TERMINATE_TIMEOUT,
     StraceNotFoundError,
     StraceProcess,
@@ -21,6 +25,35 @@ from netaudit.runner import (
 )
 
 _OUT = Path("/tmp/netaudit-test.log")
+_GROUP_ID = 4242
+
+
+@contextmanager
+def _fake_process_groups(available: bool = True) -> Iterator[MagicMock]:
+    """Intercept the real process-group calls.
+
+    Without this the signalling path reaches the OS for real: ``MagicMock.pid``
+    implements ``__index__`` and evaluates to 1, so ``os.getpgid`` returns
+    init's group and ``os.killpg`` signals it. ``create=True`` keeps this usable
+    on Windows, which has neither call.
+    """
+    with (
+        patch("netaudit.runner._HAS_PROCESS_GROUPS", available),
+        patch("netaudit.runner.os.getpgid", create=True, return_value=_GROUP_ID),
+        patch("netaudit.runner.os.killpg", create=True) as killpg,
+    ):
+        yield killpg
+
+
+def _interrupted_proc(*, ignores_sigterm: bool = False) -> MagicMock:
+    """A strace process that raises KeyboardInterrupt out of communicate()."""
+    proc = MagicMock()
+    effects: list[object] = [KeyboardInterrupt()]
+    if ignores_sigterm:
+        effects.append(subprocess.TimeoutExpired(cmd="strace", timeout=_TERMINATE_TIMEOUT))
+    effects.append((b"", b""))
+    proc.communicate.side_effect = effects
+    return proc
 
 
 def _runner() -> StraceRunner:
@@ -99,6 +132,13 @@ class TestStraceRunnerRun:
 
 
 class TestStraceRunnerStart:
+    def test_spawns_the_traced_command_in_its_own_session(self) -> None:
+        """Own session, so stop() can signal strace and the command together."""
+        runner = _runner()
+        with patch("netaudit.runner.subprocess.Popen") as popen:
+            runner.start(["sleep", "1"], _OUT)
+        assert popen.call_args.kwargs["start_new_session"] is True
+
     def test_spawns_the_traced_command_with_pipes(self) -> None:
         runner = _runner()
         with patch("netaudit.runner.subprocess.Popen") as popen:
@@ -135,36 +175,64 @@ class TestStraceProcessStop:
         assert result.stdout == b"out"
         assert result.stderr == b"err"
 
-    def test_interrupt_terminates_the_child_and_re_raises(self) -> None:
-        proc = MagicMock()
-        proc.communicate.side_effect = [KeyboardInterrupt(), (b"", b"")]
+    def test_interrupt_signals_the_whole_traced_group(self) -> None:
+        """strace alone is not enough — the traced command shares its group."""
+        proc = _interrupted_proc()
+        with _fake_process_groups() as killpg:
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
+        killpg.assert_called_once_with(_GROUP_ID, signal.SIGTERM)
+        proc.terminate.assert_not_called()
 
-        with pytest.raises(KeyboardInterrupt):
-            StraceProcess(proc).stop()
+    def test_interrupt_gives_the_group_a_grace_period(self) -> None:
+        proc = _interrupted_proc()
+        with _fake_process_groups():
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
+        assert proc.communicate.call_args.kwargs["timeout"] == _TERMINATE_TIMEOUT
 
+    def test_group_is_killed_when_it_ignores_sigterm(self) -> None:
+        proc = _interrupted_proc(ignores_sigterm=True)
+        with _fake_process_groups() as killpg:
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
+        assert [c.args[1] for c in killpg.call_args_list] == [signal.SIGTERM, _SIGKILL]
+        assert proc.communicate.call_count == 3, "must reap the group after SIGKILL"
+
+    def test_falls_back_to_the_process_when_the_platform_has_no_groups(self) -> None:
+        """Windows has no killpg — and no strace either, but the code must not crash."""
+        proc = _interrupted_proc()
+        with _fake_process_groups(available=False) as killpg:
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
+        killpg.assert_not_called()
         proc.terminate.assert_called_once_with()
         proc.kill.assert_not_called()
 
-    def test_interrupt_gives_the_child_a_grace_period(self) -> None:
-        proc = MagicMock()
-        proc.communicate.side_effect = [KeyboardInterrupt(), (b"", b"")]
+    def test_falls_back_to_the_process_when_the_group_is_gone(self) -> None:
+        proc = _interrupted_proc()
+        with _fake_process_groups() as killpg:
+            killpg.side_effect = ProcessLookupError()
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
+        proc.terminate.assert_called_once_with()
 
-        with pytest.raises(KeyboardInterrupt):
-            StraceProcess(proc).stop()
-
-        assert proc.communicate.call_args.kwargs["timeout"] == _TERMINATE_TIMEOUT
-
-    def test_kills_the_child_when_it_ignores_sigterm(self) -> None:
-        proc = MagicMock()
-        proc.communicate.side_effect = [
-            KeyboardInterrupt(),
-            subprocess.TimeoutExpired(cmd="strace", timeout=_TERMINATE_TIMEOUT),
-            (b"", b""),
-        ]
-
-        with pytest.raises(KeyboardInterrupt):
-            StraceProcess(proc).stop()
-
+    def test_falls_back_to_kill_when_the_group_is_gone(self) -> None:
+        proc = _interrupted_proc(ignores_sigterm=True)
+        with _fake_process_groups() as killpg:
+            killpg.side_effect = ProcessLookupError()
+            with pytest.raises(KeyboardInterrupt):
+                StraceProcess(proc).stop()
         proc.terminate.assert_called_once_with()
         proc.kill.assert_called_once_with()
-        assert proc.communicate.call_count == 3, "must reap the child after SIGKILL"
+
+    def test_the_group_is_derived_from_the_strace_pid(self) -> None:
+        proc = _interrupted_proc()
+        proc.pid = 31337
+        with _fake_process_groups() as killpg:
+            with patch("netaudit.runner.os.getpgid", create=True) as getpgid:
+                getpgid.return_value = _GROUP_ID
+                with pytest.raises(KeyboardInterrupt):
+                    StraceProcess(proc).stop()
+        getpgid.assert_called_once_with(31337)
+        killpg.assert_called_once_with(_GROUP_ID, signal.SIGTERM)
