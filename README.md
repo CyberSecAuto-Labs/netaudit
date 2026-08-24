@@ -76,7 +76,7 @@ See [Undeclared Egress](https://netaudit.readthedocs.io/en/latest/undeclared/).
 Violations are printed in red on a terminal; pass `--no-color` or set `NO_COLOR=1` to
 turn that off.
 
-**Exit codes for `run`:** `0` clean · `2` strace not found · `83` violations · any other value
+**Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · any other value
 is the traced command's own exit code, passed through. A failing command takes precedence over
 violations, so wrapping a test suite never hides its failure.
 

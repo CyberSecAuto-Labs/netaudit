@@ -38,13 +38,20 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | Code | Meaning |
 |------|---------|
 | 0 | Command succeeded and made no unallowed connections |
-| 2 | `strace` binary not found on PATH |
 | 83 | Command succeeded, but unallowed connections were detected |
+| 84 | `strace` binary not found on PATH |
 | *other* | The traced command's own exit code, passed through unchanged |
 
+Both of netaudit's own codes — `83` and `84` — sit together in the reserved band. Every
+other value belongs to the wrapped command.
+
 `run` wraps another process, so most of the exit-code space belongs to that process.
-Violations therefore get a reserved code of their own — **83** — leaving `1` free to mean
-"the wrapped command failed".
+Violations therefore get a reserved code of their own — **83** — and a missing `strace`
+gets **84**, leaving the low range free for the wrapped command.
+
+`2` in particular had to move: `pytest.ExitCode.INTERRUPTED` is **2**, so a cancelled or
+timed-out test run would otherwise be indistinguishable from "strace isn't installed".
+(pytest also uses 3, 4 and 5, which is a second reason the violation code is not 3.)
 
 **A failing command takes precedence over violations.** A command that died part-way may
 have produced an incomplete trace, so its failure is the more reliable signal — but any
@@ -82,8 +89,9 @@ Sharing a code with something a suite emits routinely teaches people to disregar
 a real violation then goes unnoticed. That is why the number is chosen deliberately rather
 than taken from the low range.
 
-!!! note "If the traced command itself exits 2 or 83"
+!!! note "If the traced command itself exits 83 or 84"
     Those two values are netaudit's own, so the meaning is ambiguous from the code alone.
+    They were chosen to make that vanishingly unlikely, but nothing rules it out entirely.
     netaudit writes `netaudit: traced command exited with N` to stderr and records
     `run.command_exit_code` in the JSON report, so the two cases stay distinguishable.
     **For anything scripted, read the JSON report rather than the exit code** — it states
