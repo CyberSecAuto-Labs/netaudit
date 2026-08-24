@@ -121,9 +121,7 @@ class TestStartAndStop:
         result = process.stop()
         assert result.returncode == 7
 
-    def test_stop_captures_the_commands_stdout(
-        self, runner: StraceRunner, tmp_path: Path
-    ) -> None:
+    def test_stop_captures_the_commands_stdout(self, runner: StraceRunner, tmp_path: Path) -> None:
         process = runner.start(
             [sys.executable, "-c", "print('hello from the traced process')"],
             tmp_path / "out.log",
@@ -163,9 +161,7 @@ class TestStartAndStop:
 
 
 class TestInterruptKillsTheChild:
-    def test_interrupt_propagates_to_the_caller(
-        self, runner: StraceRunner, tmp_path: Path
-    ) -> None:
+    def test_interrupt_propagates_to_the_caller(self, runner: StraceRunner, tmp_path: Path) -> None:
         process = runner.start(_SLEEPER, tmp_path / "out.log")
         _interrupt_self_after(0.3)
         with pytest.raises(KeyboardInterrupt):
