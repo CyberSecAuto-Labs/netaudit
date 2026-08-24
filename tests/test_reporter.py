@@ -965,3 +965,77 @@ class TestFormatSuggestionsWithEvidenceStream:
 
     def test_returns_the_body_when_no_stream_is_given(self) -> None:
         assert "1.2.3.4" in Reporter.format_suggestions_with_evidence([_merged()])
+
+
+# ---------------------------------------------------------------------------
+# Multi-destination iteration
+# ---------------------------------------------------------------------------
+
+
+class TestMergeReportsMultipleDestinations:
+    def test_every_destination_in_a_report_is_merged(self) -> None:
+        """The per-report loop must keep going after the first destination."""
+        report = LoadedReport(
+            label="ci-1.json",
+            run={},
+            destinations=[
+                Destination(family="AF_INET", addr="1.2.3.4", port=80, count=2),
+                Destination(family="AF_INET", addr="5.6.7.8", port=443, count=1),
+            ],
+        )
+        merged = merge_reports([report])
+        assert {d.addr for d in merged} == {"1.2.3.4", "5.6.7.8"}
+        assert all(d.reports == ["ci-1.json"] for d in merged)
+
+    def test_a_report_is_credited_once_per_destination(self) -> None:
+        report = LoadedReport(
+            label="ci-1.json",
+            run={},
+            destinations=[
+                Destination(family="AF_INET", addr="1.2.3.4", port=80, count=2),
+                Destination(family="AF_INET", addr="1.2.3.4", port=80, count=3),
+            ],
+        )
+        merged = merge_reports([report])
+        assert len(merged) == 1
+        assert merged[0].count == 5
+        assert merged[0].reports == ["ci-1.json"], "the same report is not counted twice"
+
+
+class TestFormatSuggestionsWithEvidenceMultiple:
+    def test_all_destinations_are_rendered(self) -> None:
+        """A ported destination must not end the loop early."""
+        out = Reporter.format_suggestions_with_evidence(
+            [_merged(addr="1.2.3.4", port=80, count=9), _merged(addr="5.6.7.8", port=443, count=1)]
+        )
+        assert "1.2.3.4" in out
+        assert "5.6.7.8" in out
+        assert out.count("- name:") == 2
+
+    def test_portless_destination_does_not_end_the_loop(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [
+                _merged(addr="1.2.3.4", port=None, count=9),
+                _merged(addr="5.6.7.8", port=443, count=1),
+            ]
+        )
+        assert "addr: 1.2.3.4" in out
+        assert "addr: 5.6.7.8" in out
+        assert out.count("port:") == 1, "only the ported destination gets a port key"
+
+    def test_unix_destination_after_a_ported_one_is_rendered(self) -> None:
+        out = Reporter.format_suggestions_with_evidence(
+            [
+                _merged(addr="1.2.3.4", port=80, count=9),
+                MergedDestination(
+                    family="AF_UNIX",
+                    addr="/run/foo.sock",
+                    port=None,
+                    count=1,
+                    reports=["a.json"],
+                    total_reports=3,
+                ),
+            ]
+        )
+        assert "path_glob: /run/foo.sock" in out
+        assert "addr: 1.2.3.4" in out

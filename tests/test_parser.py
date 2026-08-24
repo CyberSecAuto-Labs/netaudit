@@ -142,6 +142,30 @@ class TestStraceParser:
         line = '1234 12:00:00.000001 read(3, "", 1024) = 0'
         assert parser.parse_line(line) is None
 
+    def test_af_inet_with_elided_struct_returns_none(self, parser: StraceParser) -> None:
+        """strace abbreviates structs under -e abbrev; half an address is no address."""
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, ...}, 16) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet_without_an_address_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, sin_port=htons(53)}, 16) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet_without_a_port_returns_none(self, parser: StraceParser) -> None:
+        line = (
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("8.8.8.8")}, 16) = 0'
+        )
+        assert parser.parse_line(line) is None
+
+    def test_af_inet6_with_elided_struct_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET6, ...}, 28) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet6_without_an_address_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET6, sin6_port=htons(53)}, 28) = 0"
+        assert parser.parse_line(line) is None
+
     # ------------------------------------------------------------------
     # parse_stream
     # ------------------------------------------------------------------
