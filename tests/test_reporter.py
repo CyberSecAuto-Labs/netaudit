@@ -16,6 +16,7 @@ from netaudit.reporter import (
     Reporter,
     Violation,
     build_run_metadata,
+    is_external,
     load_report,
     merge_reports,
     supports_color,
@@ -151,6 +152,17 @@ class TestReporterFormatVerbose:
         assert "ADDR:PORT" in result
         assert "STATUS" in result
         assert "RULE" in result
+
+    def test_addressless_event_renders_a_dash(self) -> None:
+        """AF_NETLINK events have no address; the column still needs a value."""
+        result = Reporter.format_verbose([_event("AF_NETLINK")], AllowList.empty())
+        assert "AF_NETLINK" in result
+        assert " - " in result
+
+    def test_portless_event_shows_the_bare_address(self) -> None:
+        result = Reporter.format_verbose([_event("AF_UNIX", "/run/foo.sock")], AllowList.empty())
+        assert "/run/foo.sock" in result
+        assert "/run/foo.sock:" not in result
 
     def test_allowed_event_shows_ok_and_rule(self) -> None:
         al = AllowList.empty()
@@ -586,6 +598,18 @@ class TestLoadReport:
     def test_label_is_the_file_name(self, tmp_path: Path) -> None:
         assert load_report(self._write(tmp_path / "ci-42.json")).label == "ci-42.json"
 
+    def test_rejects_json_that_is_not_an_object(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text("[]")
+        with pytest.raises(ValueError, match="not a JSON object"):
+            load_report(path)
+
+    def test_rejects_a_bare_json_scalar(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text('"nope"')
+        with pytest.raises(ValueError, match="not a JSON object"):
+            load_report(path)
+
     def test_tests_attribution_preserved(self, tmp_path: Path) -> None:
         rpt = load_report(
             self._write(
@@ -887,3 +911,57 @@ class TestFormatSuggestionsWithEvidence:
         )
         rules = _yaml.safe_load(Reporter.format_suggestions_with_evidence([dest]))
         assert rules[0]["addr"] == "2001:db8::1"
+
+
+# ---------------------------------------------------------------------------
+# Address classification
+# ---------------------------------------------------------------------------
+
+
+class TestIsExternal:
+    def test_public_address_is_external(self) -> None:
+        assert is_external("8.8.8.8")
+
+    def test_public_ipv6_address_is_external(self) -> None:
+        assert is_external("2606:4700::1111")
+
+    def test_private_address_is_not_external(self) -> None:
+        assert not is_external("10.0.0.5")
+
+    def test_loopback_is_not_external(self) -> None:
+        assert not is_external("::1")
+
+    def test_reserved_documentation_range_is_not_external(self) -> None:
+        """198.51.100.0/24 is TEST-NET-3 — not routable, despite looking public."""
+        assert not is_external("198.51.100.1")
+
+    def test_missing_address_is_not_external(self) -> None:
+        """AF_NETLINK events carry no address at all."""
+        assert not is_external(None)
+
+    def test_empty_address_is_not_external(self) -> None:
+        assert not is_external("")
+
+    def test_unix_socket_path_is_not_external(self) -> None:
+        assert not is_external("/run/gvmd/gvmd.sock")
+
+
+class TestMergedDestinationKey:
+    def test_key_identifies_the_destination(self) -> None:
+        assert _merged(addr="1.2.3.4", port=80).key == ("AF_INET", "1.2.3.4", 80)
+
+    def test_key_matches_the_unmerged_destination_it_came_from(self) -> None:
+        """merge_reports groups on this key; the two must agree."""
+        dest = Destination(family="AF_INET", addr="1.2.3.4", port=80, count=1)
+        assert _merged(addr="1.2.3.4", port=80).key == dest.key
+
+
+class TestFormatSuggestionsWithEvidenceStream:
+    def test_writes_to_the_given_stream(self) -> None:
+        buf = io.StringIO()
+        result = Reporter.format_suggestions_with_evidence([_merged()], stream=buf)
+        assert buf.getvalue() == result
+        assert "1.2.3.4" in buf.getvalue()
+
+    def test_returns_the_body_when_no_stream_is_given(self) -> None:
+        assert "1.2.3.4" in Reporter.format_suggestions_with_evidence([_merged()])
