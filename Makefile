@@ -11,7 +11,7 @@ lint:
 	.venv/bin/mkdocs build --strict
 
 test:
-	.venv/bin/pytest --cov=netaudit --cov-fail-under=80
+	.venv/bin/pytest --cov=netaudit --cov-fail-under=98
 
 integration:
 	.venv/bin/pytest -m integration -v

@@ -59,6 +59,11 @@ select = ["E", "F", "W", "I"]
 [tool.mypy]
 strict = true
 
+[tool.coverage.run]
+# Branch coverage, not just statements: a fully-executed line can still leave
+# one side of its condition untested.
+branch = true
+
 [tool.pytest.ini_options]
 markers = ["integration: mark test as requiring strace (Linux only)"]
 addopts = "-p no:netaudit"
