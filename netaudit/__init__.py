@@ -21,7 +21,7 @@ from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import Reporter, Violation
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "AllowList",

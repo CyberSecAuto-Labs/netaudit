@@ -259,7 +259,7 @@ hostname, netaudit version, and either the traced command or the analysed log:
   "run": {
     "timestamp": "2026-08-23T14:03:38.499417+00:00",
     "hostname": "ci-runner-4",
-    "netaudit_version": "0.5.0",
+    "netaudit_version": "0.6.0",
     "command": ["pytest"],
     "allowlist": "netaudit.yaml"
   },
