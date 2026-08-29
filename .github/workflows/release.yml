@@ -16,6 +16,19 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Check the tag matches the declared version
+        # The build reads the tree, never the tag, so a release cut without a
+        # version bump silently rebuilds the previous release and only fails at
+        # upload — after the release is already public. Catch it here instead.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project=$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          dunder=$(python -c 'import pathlib, re; print(re.search(r"^__version__ = \"(.+)\"$", pathlib.Path("netaudit/__init__.py").read_text(), re.M).group(1))')
+          echo "tag=$tag pyproject.toml=$project __init__.py=$dunder"
+          if [ "$tag" != "$project" ] || [ "$tag" != "$dunder" ]; then
+            echo "::error::version mismatch — tag v$tag, pyproject.toml $project, __init__.py $dunder"
+            exit 1
+          fi
       - name: Install build
         run: pip install build
       - name: Build distribution
