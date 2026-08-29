@@ -40,10 +40,11 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | 0 | Command succeeded and made no unallowed connections |
 | 83 | Command succeeded, but unallowed connections were detected |
 | 84 | `strace` binary not found on PATH |
+| 85 | The allowlist was rejected; the command was never started |
 | *other* | The traced command's own exit code, passed through unchanged |
 
 `run` wraps another process, so most of the exit-code space belongs to that process.
-`83` and `84` are netaudit's own; every other value is the command's, passed through.
+`83`, `84` and `85` are netaudit's own; every other value is the command's, passed through.
 
 **A failing command takes precedence over violations.** A command that died part-way may
 have produced an incomplete trace, so its failure is the more reliable signal — but any
@@ -51,8 +52,8 @@ violations found are still printed.
 
 Whenever the traced command exits non-zero, netaudit writes
 `netaudit: traced command exited with N` to stderr and records `run.command_exit_code` in
-the JSON report. That also resolves the one ambiguous case: a command that itself exits
-`83` or `84`.
+the JSON report. That also resolves the ambiguous cases: a command that itself exits
+`83`, `84` or `85`.
 
 !!! tip "Scripting against the result"
     Read the JSON report rather than the exit code. It states the command's status and the
@@ -102,6 +103,7 @@ netaudit analyze [OPTIONS] STRACE_LOG
 |------|---------|
 | 0 | No violations found in log |
 | 1 | One or more violations found |
+| 2 | Bad input: log file could not be read / allowlist was rejected |
 
 ### Examples
 

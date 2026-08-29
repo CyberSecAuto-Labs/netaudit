@@ -46,5 +46,6 @@ nav:
   - Undeclared Egress: undeclared.md
   - pytest Plugin: pytest-plugin.md
   - Docker: docker.md
+  - Python API: python-api.md
   - Architecture: architecture.md
   - Contributing: contributing.md

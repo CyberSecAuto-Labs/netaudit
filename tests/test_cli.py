@@ -510,6 +510,32 @@ class TestOutputFile:
         result = CliRunner().invoke(main, ["analyze", "--format", "json", str(self._log(tmp_path))])
         assert "run" in json.loads(result.output)
 
+    def test_verbose_text_file_lists_every_event(self, tmp_path: Path) -> None:
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(
+            main, ["analyze", "--verbose", "--output", str(out), str(self._log(tmp_path))]
+        )
+        body = out.read_text()
+        assert "8.8.8.8:53" in body
+        assert "STATUS" in body, "verbose mode writes the per-event table"
+        assert "COUNT" in body, "the per-destination summary follows the event table"
+
+    def test_suggested_rules_reach_the_text_file(self, tmp_path: Path) -> None:
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(
+            main, ["analyze", "--suggest-rules", "--output", str(out), str(self._log(tmp_path))]
+        )
+        body = out.read_text()
+        assert "8.8.8.8" in body
+        assert "family: AF_INET" in body, "suggestions are emitted as allowlist YAML"
+
+    def test_no_suggestions_appended_for_a_clean_run(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        out = tmp_path / "report.txt"
+        CliRunner().invoke(main, ["analyze", "--suggest-rules", "--output", str(out), str(log)])
+        assert "family:" not in out.read_text()
+
 
 # ---------------------------------------------------------------------------
 # netaudit undeclared
@@ -817,16 +843,61 @@ class TestRunReservedCodesAreDistinct:
         assert result.exit_code == 2
         assert "traced command exited with 2" in result.output
 
+    def test_malformed_allowlist_exits_2_without_a_traceback(self, tmp_path: Path) -> None:
+        # Version enforcement makes this the common upgrade failure, so it has
+        # to read as a usage error rather than a crash.
+        log = tmp_path / "trace.log"
+        log.write_text("")
+        bad = tmp_path / "netaudit.yaml"
+        bad.write_text("allowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n")
+        result = CliRunner().invoke(main, ["analyze", "--allowlist", str(bad), str(log)])
+        assert result.exit_code == 2
+        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "Traceback" not in result.output
+
+    def test_undeclared_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
+        report = tmp_path / "r.json"
+        report.write_text('{"version": 1, "violations": [], "summary": {"by_destination": []}}')
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("version: 2\nallowlist: []\n")
+        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(bad), str(report)])
+        assert result.exit_code == 2
+        assert "netaudit: Unsupported allowlist version" in result.output
+
     def test_reserved_codes_do_not_overlap(self) -> None:
         from netaudit.cli import (
+            _EXIT_BAD_ALLOWLIST,
             _EXIT_CLEAN,
             _EXIT_STRACE_MISSING,
             _EXIT_TRACED_VIOLATIONS,
         )
 
-        codes = {_EXIT_CLEAN, _EXIT_TRACED_VIOLATIONS, _EXIT_STRACE_MISSING}
-        assert len(codes) == 3
-        # Both netaudit-originated codes sit in the band left clear of sysexits,
+        codes = {
+            _EXIT_CLEAN,
+            _EXIT_TRACED_VIOLATIONS,
+            _EXIT_STRACE_MISSING,
+            _EXIT_BAD_ALLOWLIST,
+        }
+        assert len(codes) == 4
+        # Every netaudit-originated code sits in the band left clear of sysexits,
         # the Linux socket errno block, shell codes and signal-derived values.
         assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
         assert 79 <= _EXIT_STRACE_MISSING <= 87
+        assert 79 <= _EXIT_BAD_ALLOWLIST <= 87
+
+    def test_run_never_borrows_an_exit_code_the_command_could_return(self) -> None:
+        # The whole point of the reserved band: `run` passes the traced
+        # command's code through, so a netaudit-side failure must not use a
+        # value a normal process might exit with.
+        from netaudit.cli import _EXIT_BAD_ALLOWLIST, _EXIT_BAD_INPUT
+
+        assert _EXIT_BAD_ALLOWLIST != _EXIT_BAD_INPUT
+
+    def test_run_exits_reserved_code_on_a_rejected_allowlist(self, tmp_path: Path) -> None:
+        bad = tmp_path / "netaudit.yaml"
+        bad.write_text("allowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n")
+        with patch("netaudit.cli.StraceRunner"):
+            result = CliRunner().invoke(main, ["run", "--allowlist", str(bad), "--", "true"])
+        assert result.exit_code == 85
+        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "Traceback" not in result.output

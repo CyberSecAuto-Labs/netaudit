@@ -10,6 +10,15 @@ def parser() -> StraceParser:
     return StraceParser()
 
 
+_UNFINISHED = (
+    "8888 14:00:00.000001 connect(11, {sa_family=AF_INET, "
+    'sin_addr=inet_addr("1.2.3.4"), sin_port=htons(80)}, 16 <unfinished ...>'
+)
+_RESUMED = (
+    "8888 14:00:00.000002 <... connect resumed>) = -1 EINPROGRESS (Operation now in progress)"
+)
+
+
 class TestStraceParser:
     # ------------------------------------------------------------------
     # AF_INET
@@ -116,11 +125,33 @@ class TestStraceParser:
     # Resumed / unfinished lines
     # ------------------------------------------------------------------
 
-    def test_unfinished_line_returns_none(self, parser: StraceParser) -> None:
-        line = (
-            "8888 14:00:00.000001 connect(11, {sa_family=AF_INET, "
-            'sin_addr=inet_addr("1.2.3.4"), sin_port=htons(80)}, 16 <unfinished ...>'
-        )
+    def test_unfinished_line_keeps_the_destination(self, parser: StraceParser) -> None:
+        """The unfinished half carries the address; only the result is missing."""
+        event = parser.parse_line(_UNFINISHED)
+        assert event is not None
+        assert event.pid == 8888
+        assert event.family == "AF_INET"
+        assert event.addr == "1.2.3.4"
+        assert event.port == 80
+
+    def test_unfinished_connect_counts_as_in_flight(self, parser: StraceParser) -> None:
+        """Same treatment as EINPROGRESS: the syscall was issued, so it egressed."""
+        event = parser.parse_line(_UNFINISHED)
+        assert event is not None
+        assert event.result == 0
+
+    def test_unfinished_line_keeps_its_own_raw_text(self, parser: StraceParser) -> None:
+        event = parser.parse_line(_UNFINISHED)
+        assert event is not None
+        assert event.raw_line == _UNFINISHED
+
+    def test_unrecognisable_unfinished_line_returns_none(self, parser: StraceParser) -> None:
+        """Completing the line does not make an unparseable one parseable."""
+        assert parser.parse_line("this is not strace output <unfinished ...>") is None
+
+    def test_unfinished_line_with_an_elided_struct_returns_none(self, parser: StraceParser) -> None:
+        """Half an address on a half a line is still not a destination."""
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, ...}, 16 <unfinished ...>"
         assert parser.parse_line(line) is None
 
     def test_resumed_line(self, parser: StraceParser) -> None:
@@ -131,6 +162,80 @@ class TestStraceParser:
         assert event.family == "AF_UNKNOWN"
         assert event.result == 0
 
+    def test_resumed_einprogress_is_normalised_like_any_other(self, parser: StraceParser) -> None:
+        line = (
+            "8888 14:00:00.000002 <... connect resumed>) = -1 "
+            "EINPROGRESS (Operation now in progress)"
+        )
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.result == 0
+
+    # ------------------------------------------------------------------
+    # Split syscalls — correlation across lines
+    # ------------------------------------------------------------------
+
+    def test_split_connect_becomes_one_complete_event(self, parser: StraceParser) -> None:
+        """The two halves describe one syscall and must not become two events."""
+        events = parser.parse_stream([_UNFINISHED, _RESUMED])
+        assert len(events) == 1
+        assert events[0].addr == "1.2.3.4"
+        assert events[0].port == 80
+        assert events[0].family == "AF_INET"
+
+    def test_split_connect_takes_the_result_from_the_resumed_half(
+        self, parser: StraceParser
+    ) -> None:
+        events = parser.parse_stream(
+            [_UNFINISHED, "8888 14:00:00.000002 <... connect resumed>) = -111"]
+        )
+        assert [e.result for e in events] == [-111]
+
+    def test_split_connect_never_yields_an_addressless_event(self, parser: StraceParser) -> None:
+        events = parser.parse_stream([_UNFINISHED, _RESUMED])
+        assert all(e.family != "AF_UNKNOWN" for e in events)
+
+    def test_interleaved_pids_are_correlated_separately(self, parser: StraceParser) -> None:
+        """Two threads mid-connect at once must not swap destinations."""
+        other = (
+            "9999 14:00:00.000001 connect(12, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("5.6.7.8"), sin_port=htons(443)}, 16 <unfinished ...>'
+        )
+        events = parser.parse_stream(
+            [
+                _UNFINISHED,
+                other,
+                "9999 14:00:00.000003 <... connect resumed>) = -2",
+                "8888 14:00:00.000004 <... connect resumed>) = -1",
+            ]
+        )
+        by_pid = {e.pid: e for e in events}
+        assert by_pid[8888].addr == "1.2.3.4"
+        assert by_pid[8888].result == -1
+        assert by_pid[9999].addr == "5.6.7.8"
+        assert by_pid[9999].result == -2
+
+    def test_unfinished_without_a_resumed_is_still_reported(self, parser: StraceParser) -> None:
+        """A truncated trace still proves the connect was attempted."""
+        events = parser.parse_stream([_UNFINISHED])
+        assert len(events) == 1
+        assert events[0].addr == "1.2.3.4"
+
+    def test_resumed_without_an_unfinished_is_still_reported(self, parser: StraceParser) -> None:
+        """A trace that starts mid-syscall: partial evidence is still evidence."""
+        events = parser.parse_stream([_RESUMED])
+        assert len(events) == 1
+        assert events[0].family == "AF_UNKNOWN"
+        assert events[0].addr is None
+
+    def test_split_connect_does_not_disturb_surrounding_events(self, parser: StraceParser) -> None:
+        complete = (
+            "7777 14:00:00.000000 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("9.9.9.9"), sin_port=htons(53)}, 16) = 0'
+        )
+        events = parser.parse_stream([complete, _UNFINISHED, _RESUMED, complete])
+        assert [e.addr for e in events] == ["9.9.9.9", "1.2.3.4", "9.9.9.9"]
+
     # ------------------------------------------------------------------
     # Malformed / unrecognised lines
     # ------------------------------------------------------------------
@@ -140,6 +245,30 @@ class TestStraceParser:
 
     def test_non_connect_syscall_returns_none(self, parser: StraceParser) -> None:
         line = '1234 12:00:00.000001 read(3, "", 1024) = 0'
+        assert parser.parse_line(line) is None
+
+    def test_af_inet_with_elided_struct_returns_none(self, parser: StraceParser) -> None:
+        """strace abbreviates structs under -e abbrev; half an address is no address."""
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, ...}, 16) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet_without_an_address_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, sin_port=htons(53)}, 16) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet_without_a_port_returns_none(self, parser: StraceParser) -> None:
+        line = (
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("8.8.8.8")}, 16) = 0'
+        )
+        assert parser.parse_line(line) is None
+
+    def test_af_inet6_with_elided_struct_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET6, ...}, 28) = 0"
+        assert parser.parse_line(line) is None
+
+    def test_af_inet6_without_an_address_returns_none(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET6, sin6_port=htons(53)}, 28) = 0"
         assert parser.parse_line(line) is None
 
     # ------------------------------------------------------------------

@@ -1,0 +1,24 @@
+# Build context hygiene — without this, .venv alone adds ~280MB to every build
+# and would be copied into the distribution image.
+.git/
+.github/
+.venv/
+venv/
+site/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.DS_Store
+
+# Local-only development and AI assistant files
+.instructions/
+.claude/
+CLAUDE.md

@@ -41,6 +41,7 @@ netaudit = "netaudit.integrations.pytest_plugin"
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "hypothesis>=6.100",
     "ruff>=0.16,<0.17",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
@@ -57,6 +58,20 @@ select = ["E", "F", "W", "I"]
 
 [tool.mypy]
 strict = true
+
+[tool.coverage.run]
+# Branch coverage, not just statements: a fully-executed line can still leave
+# one side of its condition untested.
+branch = true
+# Scope every process, not just pytest's own — subprocesses read this config
+# via COVERAGE_PROCESS_START and would otherwise measure the test files too.
+source = ["netaudit"]
+# The pytest plugin re-execs itself under strace with os.execvpe. Without
+# parallel data files the child's coverage is silently lost, which made the
+# plugin read as 12% covered by the integration suite when it is really ~81%.
+parallel = true
+# stop() terminates the traced process; save its data before it dies.
+sigterm = true
 
 [tool.pytest.ini_options]
 markers = ["integration: mark test as requiring strace (Linux only)"]

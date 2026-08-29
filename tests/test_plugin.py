@@ -101,6 +101,18 @@ class TestParseMarkers:
         ranges = _parse_markers(f)
         assert ranges == []
 
+    def test_unmatched_end_is_ignored_and_parsing_continues(self, tmp_path: Path) -> None:
+        """A truncated run can leave an END whose START was never written."""
+        f = tmp_path / "markers"
+        f.write_text("END\t9.0\t\ttest_ghost\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        ranges = _parse_markers(f)
+        assert [r.nodeid for r in ranges] == ["test_a"]
+
+    def test_unknown_marker_kind_is_ignored(self, tmp_path: Path) -> None:
+        f = tmp_path / "markers"
+        f.write_text("SETUP\t9.0\t\ttest_a\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        assert [r.nodeid for r in _parse_markers(f)] == ["test_a"]
+
     def test_empty_file(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text("")
@@ -678,6 +690,22 @@ class TestEmitAttributedVerbose:
         session.exitstatus = pytest.ExitCode.OK
         _emit_attributed_verbose([event], al, ranges, session)
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_event_is_attributed_to_a_later_range(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Ranges are scanned in order; a miss must fall through, not drop the event."""
+        ranges = [
+            _TestRange(nodeid="test_a", start=10.0, end=11.0),
+            _TestRange(nodeid="test_b", start=12.0, end=13.0),
+        ]
+        event = self._make_event("1.2.3.4", ts=12.5)
+        al = AllowList([], includes_builtins=False)
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        _emit_attributed_verbose([event], al, ranges, session)
+        out = capsys.readouterr().out
+        assert "test_b" in out
+        assert "test_a" not in out
+        assert "<session>" not in out, "the event belongs to a test, not the session"
 
     def test_no_violations_does_not_set_exit_code(self, capsys: pytest.CaptureFixture[str]) -> None:
         ranges = [_TestRange(nodeid="test_a", start=10.0, end=11.0)]
@@ -1461,3 +1489,52 @@ class TestFailSession:
         session.exitstatus = 0
         _fail_session(session)
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# pytest_sessionfinish — clean run, no markers
+# ---------------------------------------------------------------------------
+
+
+class TestSessionfinishCleanWithoutMarkers:
+    def test_clean_session_leaves_the_exit_status_alone(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Without markers the session-level path still must not fail a clean run."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_LOOPBACK)
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        session.config = _mock_config()
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert session.exitstatus == pytest.ExitCode.OK
+        assert "no violations" in capsys.readouterr().out
+
+    def test_trace_file_is_removed_after_a_clean_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_LOOPBACK)
+
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        session.config = _mock_config()
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert not strace_file.exists()

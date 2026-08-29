@@ -17,8 +17,14 @@ docker run --rm \
   --cap-add SYS_PTRACE \
   -v "$(pwd)/netaudit.yaml:/netaudit.yaml" \
   ghcr.io/cybersecauto-labs/netaudit \
-  run --allowlist /netaudit.yaml -- curl https://example.com
+  run --allowlist /netaudit.yaml -- \
+  python -c "import socket; socket.create_connection(('example.com', 443)).close()"
 ```
+
+!!! note "No HTTP client in the image"
+    The image ships `strace` and a Python interpreter, not a general-purpose userland —
+    there is no `curl` or `wget` in it. Trace your own binaries by mounting them in, or
+    drive a connection with the image's own `python`, as above.
 
 !!! note "SYS_PTRACE capability"
     `strace` requires the `SYS_PTRACE` capability.

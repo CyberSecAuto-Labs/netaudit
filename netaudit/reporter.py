@@ -16,6 +16,20 @@ from typing import Any, TextIO
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent
 
+__all__ = [
+    "Destination",
+    "LoadedReport",
+    "MergedDestination",
+    "REPORT_VERSION",
+    "Reporter",
+    "Violation",
+    "build_run_metadata",
+    "is_external",
+    "load_report",
+    "merge_reports",
+    "supports_color",
+]
+
 #: Schema version of the JSON report envelope. Bump on any breaking change to
 #: the shape, so tools reading saved reports can reject what they cannot parse.
 REPORT_VERSION = 1
@@ -108,6 +122,13 @@ _ViolationKey = tuple[str, str | None, int | None]
 
 @dataclass
 class Violation:
+    """A destination that no allowlist rule permitted.
+
+    One violation aggregates every event to the same
+    ``(family, addr, port)``, so a chatty destination is reported once
+    with a ``count`` rather than once per call.
+    """
+
     family: str
     addr: str | None
     port: int | None
@@ -117,6 +138,7 @@ class Violation:
 
     @property
     def key(self) -> _ViolationKey:
+        """Identity of the destination this violation is about."""
         return (self.family, self.addr, self.port)
 
     def _addr_str(self) -> str:
@@ -148,6 +170,7 @@ class Destination:
 
     @property
     def key(self) -> _ViolationKey:
+        """Identity of this destination: ``(family, addr, port)``."""
         return (self.family, self.addr, self.port)
 
 
@@ -174,6 +197,7 @@ class MergedDestination:
 
     @property
     def key(self) -> _ViolationKey:
+        """Identity of this destination: ``(family, addr, port)``."""
         return (self.family, self.addr, self.port)
 
     @property
@@ -257,6 +281,12 @@ def merge_reports(reports: list[LoadedReport]) -> list[MergedDestination]:
 
 
 class Reporter:
+    """Evaluates events against an allowlist and renders the result.
+
+    All methods are static — the reporter holds no state. ``check`` does
+    the judging; the ``format_*`` methods only render what it returned.
+    """
+
     @staticmethod
     def check(events: list[ConnectEvent], allowlist: AllowList) -> list[Violation]:
         """Return violations — events not matched by any allowlist rule."""

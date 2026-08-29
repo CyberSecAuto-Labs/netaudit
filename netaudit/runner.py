@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
+__all__ = ["StraceNotFoundError", "StraceProcess", "StraceRunner"]
+
 _TERMINATE_TIMEOUT = 5  # seconds to wait for graceful shutdown before SIGKILL
+
+# Signalling the process group is what reaches the traced command; without it
+# only strace dies. Windows has neither call, and no strace either.
+_HAS_PROCESS_GROUPS = hasattr(os, "killpg") and hasattr(os, "getpgid")
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 class StraceNotFoundError(RuntimeError):
@@ -23,21 +32,51 @@ class StraceProcess:
     def __init__(self, proc: subprocess.Popen[bytes]) -> None:
         self._proc = proc
 
+    def _signal_group(self, sig: int) -> bool:
+        """Signal strace and the command it traces; False if that is not possible.
+
+        :meth:`StraceRunner.start` puts the pair in a session of their own, so
+        one ``killpg`` reaches both. Returns False when the platform has no
+        process groups, or the group is already gone, so the caller can fall
+        back to signalling strace alone.
+        """
+        if not _HAS_PROCESS_GROUPS:
+            return False
+        try:
+            os.killpg(os.getpgid(self._proc.pid), sig)
+        except OSError:
+            return False
+        return True
+
+    def _terminate(self) -> None:
+        if not self._signal_group(signal.SIGTERM):
+            self._proc.terminate()
+
+    def _kill(self) -> None:
+        if not self._signal_group(_SIGKILL):
+            self._proc.kill()
+
     def stop(self) -> subprocess.CompletedProcess[bytes]:
         """Wait for the process to finish and return a CompletedProcess.
 
-        On ``KeyboardInterrupt`` (Ctrl-C) the child is sent SIGTERM and given
-        ``_TERMINATE_TIMEOUT`` seconds to exit before being forcibly killed.
-        The interrupt is re-raised after cleanup so the caller can propagate it.
+        On ``KeyboardInterrupt`` (Ctrl-C) the traced command and strace are both
+        sent SIGTERM and given ``_TERMINATE_TIMEOUT`` seconds to exit before
+        being forcibly killed. The interrupt is re-raised after cleanup so the
+        caller can propagate it.
+
+        Signalling strace alone is not enough: it detaches and exits, leaving
+        the traced command running — and holding the stdout/stderr pipes it
+        inherited, which would make this method block until that command
+        finished on its own.
         """
         try:
             stdout, stderr = self._proc.communicate()
         except KeyboardInterrupt:
-            self._proc.terminate()
+            self._terminate()
             try:
                 stdout, stderr = self._proc.communicate(timeout=_TERMINATE_TIMEOUT)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
+                self._kill()
                 stdout, stderr = self._proc.communicate()
             raise
         return subprocess.CompletedProcess(
@@ -78,5 +117,8 @@ class StraceRunner:
             _strace_cmd(output_path) + command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # Own session, so stop() can signal strace and the traced command
+            # together instead of orphaning the latter.
+            start_new_session=True,
         )
         return StraceProcess(proc)

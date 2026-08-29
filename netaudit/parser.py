@@ -7,6 +7,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
+__all__ = ["ConnectEvent", "StraceParser"]
+
 # Lines longer than this are skipped — they can't be valid strace output and
 # would trigger catastrophic regex backtracking on malformed input.
 _MAX_LINE_LEN = 4096
@@ -68,6 +70,24 @@ _RE_RESUMED = re.compile(
 )
 
 
+# strace splits a syscall across two lines when it blocks and another tracee's
+# event needs printing first. The destination is written on the first half and
+# the result on the second.
+_UNFINISHED_MARKER = "<unfinished ...>"
+
+
+def _as_complete_call(line: str) -> str:
+    """Rewrite an ``<unfinished ...>`` line so the ordinary matchers can read it.
+
+    Only the trailing ``) = <result>`` is missing; everything that identifies
+    the destination is already there. A result of 0 stands in for "issued, not
+    yet returned" — :func:`parse_stream` overwrites it with the real value when
+    the resumed half arrives.
+    """
+    head = line[: line.index(_UNFINISHED_MARKER)].rstrip()
+    return f"{head}) = 0"
+
+
 def _normalise_result(result: int, raw_line: str) -> int:
     """Return 0 for EINPROGRESS (non-blocking connect in flight), else result."""
     if result == -1 and "EINPROGRESS" in raw_line:
@@ -99,6 +119,16 @@ def _parse_ts(ts: str) -> float:
 
 @dataclass
 class ConnectEvent:
+    """One observed ``connect()`` syscall.
+
+    This is the unit every other part of netaudit works in: the parser
+    produces them, allowlist rules match against them, and the reporter
+    groups them into violations.
+
+    ``result`` is 0 on success or a negative errno. A non-blocking connect
+    still in flight (``EINPROGRESS``) is normalised to 0 — it egressed.
+    """
+
     pid: int
     timestamp: float
     family: str
@@ -117,7 +147,13 @@ class StraceParser:
     """Parse strace -e trace=connect -tt -f output into ConnectEvents."""
 
     def parse_line(self, line: str) -> ConnectEvent | None:
-        """Return a ConnectEvent for *line*, or None if unrecognised."""
+        """Return a ConnectEvent for *line*, or None if unrecognised.
+
+        A line ending in ``<unfinished ...>`` yields an event for the connect it
+        describes: the destination is on that half, and discarding it would lose
+        the egress entirely. Use :meth:`parse_stream` to pair it with the
+        ``resumed`` half and pick up the real result.
+        """
         line = line.rstrip()
 
         # Guard against extremely long lines (e.g. from corrupted output files)
@@ -125,10 +161,16 @@ class StraceParser:
         if len(line) > _MAX_LINE_LEN:
             return None
 
-        # Skip unfinished lines (the resumed counterpart carries the result)
-        if "<unfinished ...>" in line:
-            return None
+        if _UNFINISHED_MARKER in line:
+            event = self._parse_call(_as_complete_call(line))
+            if event is not None:
+                event.raw_line = line
+            return event
 
+        return self._parse_call(line)
+
+    def _parse_call(self, line: str) -> ConnectEvent | None:
+        """Match *line* against every known connect() shape."""
         # Resumed lines — we can extract pid/ts/result but not family/addr
         m = _RE_RESUMED.match(line)
         if m:
@@ -138,7 +180,7 @@ class StraceParser:
                 family="AF_UNKNOWN",
                 addr=None,
                 port=None,
-                result=int(m.group("result")),
+                result=_normalise_result(int(m.group("result")), line),
                 raw_line=line,
             )
 
@@ -205,10 +247,36 @@ class StraceParser:
         return None
 
     def parse_stream(self, lines: Iterable[str]) -> list[ConnectEvent]:
-        """Parse all lines, returning only recognised ConnectEvents."""
+        """Parse all lines, returning one event per connect() call.
+
+        A syscall strace split across two lines is rejoined into a single
+        event: the destination comes from the ``<unfinished ...>`` half and the
+        result from the ``resumed`` half. Correlation is per-pid, since a
+        thread can only have one connect in flight at a time.
+
+        Halves without a counterpart are kept rather than dropped — a truncated
+        trace is still evidence that the connect was attempted.
+        """
         events: list[ConnectEvent] = []
+        # pid -> index in *events* of a connect awaiting its result.
+        pending: dict[int, int] = {}
+
         for line in lines:
             event = self.parse_line(line)
-            if event is not None:
+            if event is None:
+                continue
+
+            if event.family == "AF_UNKNOWN":
+                index = pending.pop(event.pid, None)
+                if index is not None:
+                    events[index].result = event.result
+                    continue
+                # No pending call: the trace started mid-syscall. Keep it.
                 events.append(event)
+                continue
+
+            if _UNFINISHED_MARKER in event.raw_line:
+                pending[event.pid] = len(events)
+            events.append(event)
+
         return events
