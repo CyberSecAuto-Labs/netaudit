@@ -30,21 +30,34 @@ _DEFAULT_ALLOWLIST = "netaudit.yaml"
 # Exit codes for `analyze` and `undeclared`, which wrap no child process.
 _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
-_EXIT_BAD_REPORT = 2
+_EXIT_BAD_INPUT = 2
 
 # Reserved for `run`. Every other value belongs to the traced command and is
 # passed through, so these sit clear of the ranges a wrapped process may use.
+# A netaudit-side failure must never borrow a value the child could return —
+# exiting 2 here would be indistinguishable from a suite that exited 2.
 _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
+_EXIT_BAD_ALLOWLIST = 85
 
 
-def _load_allowlist(allowlist: str | None) -> AllowList:
-    if allowlist is not None:
-        return AllowList.from_yaml(Path(allowlist))
-    default = Path(_DEFAULT_ALLOWLIST)
-    if default.exists():
-        return AllowList.from_yaml(default)
-    return AllowList.empty()
+def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
+    """Load the allowlist, or exit *bad_input_code* if it cannot be used.
+
+    Callers pass the code appropriate to their exit-code space: `run` reserves
+    one clear of the traced command's range, the others use plain bad input.
+    """
+    try:
+        if allowlist is not None:
+            return AllowList.from_yaml(Path(allowlist))
+        default = Path(_DEFAULT_ALLOWLIST)
+        if default.exists():
+            return AllowList.from_yaml(default)
+        return AllowList.empty()
+    except ValueError as exc:
+        # Report it the way click reports a usage error, not as a traceback.
+        click.echo(f"netaudit: {exc}", err=True)
+        sys.exit(bad_input_code)
 
 
 def _write_report(
@@ -202,7 +215,7 @@ def run_cmd(
         click.echo(f"netaudit: {exc}", err=True)
         sys.exit(_EXIT_STRACE_MISSING)
 
-    al = _load_allowlist(allowlist)
+    al = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
 
     with tempfile.NamedTemporaryFile(suffix=".strace", delete=False) as tf:
         strace_out = Path(tf.name)
@@ -354,18 +367,19 @@ def undeclared_cmd(
     allowlist is the reviewer's decision.
 
     Exits 1 when undeclared egress is found and 0 when there is none, matching
-    `run` and `analyze`, so it works directly as a CI assertion.
+    `analyze`, so it works directly as a CI assertion. (`run` reserves 83 for
+    violations, since it also passes the traced command's exit code through.)
     """
     try:
         loaded = [load_report(Path(r)) for r in reports]
     except ValueError as exc:
         click.echo(f"netaudit: {exc}", err=True)
-        sys.exit(_EXIT_BAD_REPORT)
+        sys.exit(_EXIT_BAD_INPUT)
 
     merged = merge_reports(loaded)
 
     if allowlist is not None:
-        al = AllowList.from_yaml(Path(allowlist))
+        al = _load_allowlist(allowlist)
         merged = [d for d in merged if not al.is_allowed(_as_event(d))]
 
     if not merged:
