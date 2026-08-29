@@ -121,6 +121,9 @@ class NetlinkRule:
 # Built-in defaults
 # ---------------------------------------------------------------------------
 
+# The only allowlist file format this release understands.
+_SCHEMA_VERSION = 1
+
 _BUILTIN_RULES: list[Rule] = [
     IPv4Rule("127.0.0.0/8", name="loopback (IPv4)"),
     IPv6Rule("::1/128", name="loopback (IPv6)"),
@@ -141,6 +144,13 @@ def _parse_port(value: Any) -> int | None:
     """
     if value is None:
         return None
+    # bool is a subclass of int, so `port: true` would otherwise become port 1.
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid port in allowlist entry: {value!r}")
+    # int() truncates, so 80.5 would quietly become 80 — a port the file never
+    # declared. Whole-number floats are fine; fractions are not.
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"Fractional port in allowlist entry: {value!r}")
     try:
         port = int(value)
     except (TypeError, ValueError):
@@ -184,7 +194,12 @@ class AllowList:
     @classmethod
     def from_yaml(cls, path: Path) -> "AllowList":
         """Load an allowlist from a YAML file at *path*."""
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(path.read_text()) or {}
+        version = raw.get("version")
+        if isinstance(version, bool) or version != _SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported allowlist version: {version!r} (expected {_SCHEMA_VERSION})"
+            )
         includes_builtins = raw.get("includes_builtins", True)
         rules: list[Rule] = []
         for entry in raw.get("allowlist", []):

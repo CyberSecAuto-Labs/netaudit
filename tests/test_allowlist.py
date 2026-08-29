@@ -185,6 +185,53 @@ class TestAllowListFromYaml:
         assert not al.is_allowed(_event("AF_INET", "8.8.8.8", 53))
 
 
+class TestAllowListVersion:
+    """The ``version`` header is a compatibility gate, not decoration.
+
+    A file whose version netaudit does not understand is refused rather than
+    parsed on a guess: silently ignoring an unknown header would apply a
+    future file format under today's semantics.
+    """
+
+    def _write(self, tmp_path: Path, body: str) -> Path:
+        y = tmp_path / "netaudit.yaml"
+        y.write_text(body)
+        return y
+
+    def test_version_1_loads(self, tmp_path: Path) -> None:
+        y = self._write(tmp_path, "version: 1\nallowlist: []\n")
+        assert AllowList.from_yaml(y).is_allowed(_event("AF_INET", "127.0.0.1", 80))
+
+    def test_unsupported_version_raises(self, tmp_path: Path) -> None:
+        y = self._write(tmp_path, "version: 2\nallowlist: []\n")
+        with pytest.raises(ValueError, match="version"):
+            AllowList.from_yaml(y)
+
+    def test_missing_version_raises(self, tmp_path: Path) -> None:
+        y = self._write(tmp_path, "allowlist: []\n")
+        with pytest.raises(ValueError, match="version"):
+            AllowList.from_yaml(y)
+
+    def test_non_numeric_version_raises(self, tmp_path: Path) -> None:
+        y = self._write(tmp_path, "version: banana\nallowlist: []\n")
+        with pytest.raises(ValueError, match="version"):
+            AllowList.from_yaml(y)
+
+    def test_boolean_version_raises(self, tmp_path: Path) -> None:
+        # YAML "true" is a bool, and True == 1 would slip past a plain equality
+        # check.
+        y = self._write(tmp_path, "version: true\nallowlist: []\n")
+        with pytest.raises(ValueError, match="version"):
+            AllowList.from_yaml(y)
+
+    def test_empty_file_raises(self, tmp_path: Path) -> None:
+        # yaml.safe_load returns None here; the loader must report a bad
+        # version rather than dying on an attribute of None.
+        y = self._write(tmp_path, "")
+        with pytest.raises(ValueError, match="version"):
+            AllowList.from_yaml(y)
+
+
 class TestRuleName:
     def test_ipv4_rule_default_name(self) -> None:
         assert IPv4Rule("10.0.0.0/8").name == ""
@@ -355,6 +402,32 @@ class TestPortFromYaml:
                 tmp_path,
                 "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: 99999\n",
             )
+
+    def test_fractional_port_raises(self, tmp_path: Path) -> None:
+        # int(80.5) would silently truncate to 80, allowing a port the file
+        # never declared.
+        with pytest.raises(ValueError, match="port"):
+            self._load(
+                tmp_path,
+                "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: 80.5\n",
+            )
+
+    def test_boolean_port_raises(self, tmp_path: Path) -> None:
+        # YAML "true" is a bool, and bool is an int subclass: int(True) == 1.
+        with pytest.raises(ValueError, match="port"):
+            self._load(
+                tmp_path,
+                "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: true\n",
+            )
+
+    def test_integral_float_port_is_accepted(self, tmp_path: Path) -> None:
+        # 443.0 is a whole number, so it survives — only fractions are refused.
+        al = self._load(
+            tmp_path,
+            "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n    port: 443.0\n",
+        )
+        assert al.is_allowed(_event("AF_INET", "1.2.3.4", 443)) is True
+        assert al.is_allowed(_event("AF_INET", "1.2.3.4", 22)) is False
 
 
 # ---------------------------------------------------------------------------
