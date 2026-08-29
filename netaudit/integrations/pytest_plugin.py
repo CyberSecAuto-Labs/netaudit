@@ -164,6 +164,18 @@ def _owns_the_run() -> bool:
     return tracer_pid is None or tracer_pid == str(os.getppid())
 
 
+def _is_xdist_worker(config: pytest.Config) -> bool:
+    """True inside a pytest-xdist worker, which runs *this* session's tests.
+
+    A worker is a descendant of the traced session, so :func:`_owns_the_run`
+    disowns it, but the tests it runs are the run's own and their markers
+    belong in the run's file. (Ranges from parallel workers can overlap, and
+    attribution resolves that first-match — a limitation of ``-n`` itself, not
+    of this check.)
+    """
+    return hasattr(config, "workerinput")
+
+
 def _pyproject_netaudit() -> dict[str, Any]:
     """Read the ``[tool.netaudit]`` table from *pyproject.toml* in the cwd.
 
@@ -498,7 +510,8 @@ def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
-    markers_path = os.environ.get(_ENV_MARKERS_OUT) if _owns_the_run() else None
+    writes_markers = _owns_the_run() or _is_xdist_worker(item.config)
+    markers_path = os.environ.get(_ENV_MARKERS_OUT) if writes_markers else None
     location = _item_location(item)
     if markers_path:
         ts = _now_ts()

@@ -543,6 +543,7 @@ class TestPytestRuntestProtocol:
 
         item = MagicMock(spec=pytest.Item)
         item.nodeid = "nested/test_inner.py::test_inner"
+        item.config = MagicMock(spec=pytest.Config)
 
         gen = pytest_runtest_protocol(item=item, nextitem=None)
         next(gen)
@@ -550,6 +551,29 @@ class TestPytestRuntestProtocol:
             gen.send(None)
 
         assert not markers_file.exists()
+
+    def test_an_xdist_worker_still_writes_markers_for_the_tests_it_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker is a descendant too, but it runs *this* session's tests.
+
+        Disowning it would leave a ``pytest -n`` run with no attribution at all.
+        """
+        markers_file = tmp_path / "markers"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = "tests/test_foo.py::test_bar"
+        item.config = MagicMock(spec=pytest.Config)
+        item.config.workerinput = {"workerid": "gw0"}
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            gen.send(None)
+
+        assert "tests/test_foo.py::test_bar" in markers_file.read_text()
 
     def test_does_nothing_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
