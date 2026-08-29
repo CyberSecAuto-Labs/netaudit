@@ -4,10 +4,14 @@ The names re-exported here are the supported library API: the three data
 types, plus the parser that produces events and the reporter that evaluates
 them against an allowlist.
 
+    from pathlib import Path
+
     from netaudit import AllowList, Reporter, StraceParser
 
-    events = StraceParser().parse_stream(open("strace.log"))
-    violations = Reporter.check(events, AllowList.from_yaml("netaudit.yaml"))
+    allowlist = AllowList.from_yaml(Path("netaudit.yaml"))
+    with open("strace.log") as log:
+        events = StraceParser().parse_stream(log)
+    violations = Reporter.check(events, allowlist)
 
 Anything reachable only through a submodule is not covered by this promise.
 Removing or renaming a name below requires a major version bump.

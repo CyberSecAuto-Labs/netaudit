@@ -76,9 +76,11 @@ See [Undeclared Egress](https://netaudit.readthedocs.io/en/latest/undeclared/).
 Violations are printed in red on a terminal; pass `--no-color` or set `NO_COLOR=1` to
 turn that off.
 
-**Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · any other value
-is the traced command's own exit code, passed through. A failing command takes precedence over
-violations, so wrapping a test suite never hides its failure.
+A failing command takes precedence over violations, so wrapping a test suite never hides
+its failure.
+
+**Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · `85` allowlist
+rejected · any other value is the traced command's own exit code, passed through.
 
 `analyze` and `undeclared` wrap nothing, so they use `0` clean · `1` findings · `2` bad input.
 
@@ -110,7 +112,8 @@ docker pull ghcr.io/cybersecauto-labs/netaudit:latest
 docker run --rm --cap-add SYS_PTRACE \
   -v "$(pwd)/netaudit.yaml:/netaudit.yaml" \
   ghcr.io/cybersecauto-labs/netaudit \
-  run --allowlist /netaudit.yaml -- curl https://example.com
+  run --allowlist /netaudit.yaml -- \
+  python -c "import socket; socket.create_connection(('example.com', 443)).close()"
 ```
 
 ## Documentation

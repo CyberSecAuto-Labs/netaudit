@@ -22,7 +22,7 @@ from netaudit import AllowList, ConnectEvent, Reporter, StraceParser, Violation
 
 | Name | What it is |
 |---|---|
-| `ConnectEvent` | One observed `connect()` call — pid, timestamp, family, addr, port, result |
+| `ConnectEvent` | One observed `connect()` call — pid, timestamp, family, addr, port, result, raw_line |
 | `StraceParser` | Turns strace output lines into `ConnectEvent`s |
 | `AllowList` | The rule set an event is evaluated against |
 | `Reporter` | Evaluates events and formats the result |
