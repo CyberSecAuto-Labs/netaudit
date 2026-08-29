@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -24,6 +26,13 @@ from typing import Any, Iterator
 import pytest
 
 from netaudit import _tempfiles
+
+
+def _dead_pid() -> int:
+    """A pid that has certainly exited: spawn one and reap it."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +59,11 @@ class TestCreate:
         path = _tempfiles.create(".strace", directory=tmp_path)
         assert path.name.startswith(_tempfiles.PREFIX)
         assert path.suffix == ".strace"
+
+    def test_stamps_the_owning_pid_into_the_name(self, tmp_path: Path) -> None:
+        """The sweep needs to know whose file it is, not just how old it is."""
+        path = _tempfiles.create(".strace", directory=tmp_path)
+        assert path.name.startswith(f"{_tempfiles.PREFIX}{os.getpid()}-")
 
     def test_tracks_the_file_for_cleanup(self, tmp_path: Path) -> None:
         path = _tempfiles.create(".markers", directory=tmp_path)
@@ -219,6 +233,41 @@ class TestSweepStale:
     def test_honours_the_age_threshold(self, tmp_path: Path) -> None:
         recent = self._aged(tmp_path / "netaudit-abc.strace", 120)
         assert _tempfiles.sweep_stale(directory=tmp_path, max_age=60) == [recent]
+
+    def test_spares_a_file_whose_owner_is_still_running(self, tmp_path: Path) -> None:
+        """A run older than the threshold is still a run. Age alone cannot tell."""
+        live = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 48 * 3600)
+        assert _tempfiles.sweep_stale(directory=tmp_path) == []
+        assert live.exists()
+
+    def test_removes_a_file_whose_owner_is_gone(self, tmp_path: Path) -> None:
+        dead = self._aged(tmp_path / f"netaudit-{_dead_pid()}-abc.strace", 48 * 3600)
+        assert _tempfiles.sweep_stale(directory=tmp_path) == [dead]
+
+    def test_treats_an_unsignalable_owner_as_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pid owned by another user answers PermissionError — it exists."""
+
+        def refuse(pid: int, sig: int) -> None:
+            raise PermissionError(pid)
+
+        monkeypatch.setattr(os, "kill", refuse)
+        theirs = self._aged(tmp_path / "netaudit-4242-abc.strace", 48 * 3600)
+        assert _tempfiles.sweep_stale(directory=tmp_path) == []
+        assert theirs.exists()
+
+    def test_falls_back_to_age_where_pids_cannot_be_probed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """os.kill(pid, 0) terminates the process on Windows — never probe there."""
+        monkeypatch.setattr(_tempfiles, "_CAN_PROBE_PIDS", False)
+        killed: list[object] = []
+        monkeypatch.setattr(os, "kill", lambda *a: killed.append(a))
+        stale = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 48 * 3600)
+
+        assert _tempfiles.sweep_stale(directory=tmp_path) == [stale]
+        assert killed == [], "probed a pid on a platform where that is destructive"
 
     def test_tolerates_a_file_that_vanishes_mid_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

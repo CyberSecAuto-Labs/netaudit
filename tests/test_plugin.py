@@ -16,6 +16,7 @@ from netaudit.allowlist import AllowList
 from netaudit.integrations.pytest_plugin import (
     _ENV_MARKERS_OUT,
     _ENV_STRACE_OUT,
+    _ENV_TRACER_PID,
     _attribute_violations,
     _emit_attributed,
     _emit_attributed_verbose,
@@ -426,6 +427,48 @@ class TestPytestConfigure:
         finally:
             _tempfiles.remove_tracked()
 
+    def test_records_the_tracer_pid_so_descendants_can_tell_themselves_apart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """execvpe keeps the pid, so this is the pid the traced pytest sees as its parent."""
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        env: dict[str, str] = {}
+        monkeypatch.setattr(os, "execvpe", lambda _n, _a, e: env.update(e))
+
+        pytest_configure(self._make_config(enabled=True))
+        _tempfiles.remove_tracked()
+
+        assert env[_ENV_TRACER_PID] == str(os.getpid())
+
+    def test_a_nested_pytest_does_not_take_over_the_outer_runs_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A test that shells out to pytest — or an xdist worker — inherits the
+        environment, and would otherwise delete a trace that is still being written."""
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.setenv(_ENV_MARKERS_OUT, "/tmp/netaudit-x.markers")
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+        registered: list[tuple[Path, ...]] = []
+        monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert registered == []
+
+    def test_the_traced_session_recognises_itself_by_its_parent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
+        registered: list[tuple[Path, ...]] = []
+        monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert registered == [(Path("/tmp/netaudit-x.strace"),)]
+
     def test_the_traced_process_takes_over_cleanup_of_the_temp_files(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -521,6 +564,27 @@ class TestPytestSessionfinish:
         pytest_sessionfinish(session=session, exitstatus=0)
         # exitstatus not changed
         session.exitstatus  # just access it — no assertion needed
+
+    def test_a_nested_pytest_neither_reports_nor_deletes_the_outer_runs_trace(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The outer run is still going: its trace is incomplete and not ours to read."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert strace_file.exists(), "deleted a trace the outer run is still writing"
+        assert capsys.readouterr().out == ""
+        assert session.exitstatus == pytest.ExitCode.OK
 
     def test_does_nothing_for_empty_strace_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

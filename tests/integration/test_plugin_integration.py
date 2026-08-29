@@ -460,3 +460,40 @@ class TestSuggestFromPluginReport:
         )
         assert recheck.returncode == 0, recheck.stdout
         assert recheck.stdout.strip() == ""
+
+
+class TestNestedPytestRuns:
+    """A traced suite may run pytest itself; the outer run's files are not its to touch."""
+
+    def test_a_nested_pytest_leaves_the_outer_runs_trace_alone(
+        self, pytester: pytest.Pytester
+    ) -> None:
+        """The nested process inherits the environment pointing at a live trace.
+
+        Same shape as an xdist worker: it reaches sessionfinish long before the
+        run it inherited from, and deleting the trace there loses the audit.
+        """
+        pytester.makepyfile(
+            """
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+
+            def test_runs_its_own_pytest(tmp_path):
+                (tmp_path / "test_inner.py").write_text("def test_ok(): pass")
+                inner = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                    cwd=tmp_path,
+                    capture_output=True,
+                    text=True,
+                )
+                assert inner.returncode == 0, inner.stdout + inner.stderr
+                trace = Path(os.environ["NETAUDIT_STRACE_OUT"])
+                assert trace.exists(), "the nested run deleted the outer run's trace"
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import signal
 import tempfile
 import time
@@ -41,9 +42,20 @@ PREFIX = "netaudit-"
 
 _SUFFIXES = (".strace", ".markers")
 
-# Well beyond any plausible test run: the sweep must never delete the trace of
-# a suite that is still running, which would silently disable its auditing.
+# The pid of the process that created the file, stamped into its name. For both
+# entry points that process lives exactly as long as the file is useful — the
+# CLI, or the one that became strace — so its death is what makes the file
+# garbage. Age cannot tell a leftover from a long, quiet run.
+_OWNER_IN_NAME = re.compile(rf"^{PREFIX}(\d+)-")
+
+# Only a backstop now that ownership is the primary signal, but still needed:
+# a file whose owning pid has been reused by an unrelated process would
+# otherwise never be swept. Well beyond any plausible run.
 _STALE_AGE_SECONDS = 24 * 60 * 60
+
+# ``os.kill(pid, 0)`` is a liveness probe on POSIX and a *termination* on
+# Windows, which has no strace and therefore none of these files either.
+_CAN_PROBE_PIDS = os.name == "posix"
 
 # Signals that end the process without unwinding. SIGHUP is absent on Windows,
 # which has no strace either — the tuple is empty there and everything below
@@ -105,12 +117,33 @@ def create(suffix: str, directory: Path | None = None) -> Path:
     holding a second one only risks it outliving the process.
     """
     fd, name = tempfile.mkstemp(
-        suffix=suffix, prefix=PREFIX, dir=str(directory) if directory else None
+        suffix=suffix,
+        prefix=f"{PREFIX}{os.getpid()}-",
+        dir=str(directory) if directory else None,
     )
     os.close(fd)
     path = Path(name)
     remove_on_cancel(path)
     return path
+
+
+def _owner_still_running(path: Path) -> bool:
+    """Whether the process that created *path* is still alive.
+
+    False for a name with no pid in it, and on platforms where the probe is not
+    safe — both fall back to the age threshold alone.
+    """
+    match = _OWNER_IN_NAME.match(path.name)
+    if match is None or not _CAN_PROBE_PIDS:
+        return False
+    try:
+        os.kill(int(match.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # Another user's process: it exists, we simply may not signal it.
+        return True
+    return True
 
 
 def sweep_stale(
@@ -120,6 +153,10 @@ def sweep_stale(
     """Delete leftover netaudit temp files older than *max_age* seconds.
 
     The only recovery from a SIGKILLed run, which cannot clean up after itself.
+    A file is only removed once its owning process is gone *and* it is older
+    than *max_age*: deleting a live run's trace would silently disable its
+    auditing, so every uncertain case errs towards keeping the file.
+
     Returns the paths removed; best-effort, so a file that vanishes underneath
     the sweep — another run doing the same thing — is not an error.
     """
@@ -129,7 +166,7 @@ def sweep_stale(
     for suffix in _SUFFIXES:
         for path in sorted(root.glob(f"{PREFIX}*{suffix}")):
             try:
-                if path.stat().st_mtime > cutoff:
+                if _owner_still_running(path) or path.stat().st_mtime > cutoff:
                     continue
                 path.unlink()
             except OSError:

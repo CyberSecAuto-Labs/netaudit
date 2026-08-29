@@ -40,6 +40,7 @@ from netaudit.reporter import (
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
+_ENV_TRACER_PID = "NETAUDIT_TRACER_PID"
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
 
 
@@ -145,6 +146,22 @@ def _attribute_violations(
             by_test.setdefault("<session>", []).append(event)
 
     return {nodeid: _group_events(evts) for nodeid, evts in by_test.items()}
+
+
+def _owns_the_run() -> bool:
+    """Whether this process is the traced session rather than a descendant of it.
+
+    ``execvpe`` preserves the pid, so the process that re-executed itself
+    *becomes* strace, and the pytest strace forks is its direct child. Anything
+    deeper — a test that shells out to pytest, an xdist worker — inherits the
+    same environment while pointing at a run that is still in progress. It must
+    neither report on that run's trace nor delete it.
+
+    An absent marker means the environment was set by hand rather than by the
+    re-exec; there is nothing to compare against, so ownership is assumed.
+    """
+    tracer_pid = os.environ.get(_ENV_TRACER_PID)
+    return tracer_pid is None or tracer_pid == str(os.getppid())
 
 
 def _pyproject_netaudit() -> dict[str, Any]:
@@ -426,6 +443,8 @@ def pytest_configure(config: pytest.Config) -> None:
         # Already running under strace. The process that made these files is
         # gone — execvpe replaced it — so this one owns removing them, and its
         # sessionfinish is only reached if the run is allowed to finish.
+        if not _owns_the_run():
+            return
         markers_out = os.environ.get(_ENV_MARKERS_OUT)
         paths = [Path(strace_out)]
         if markers_out:
@@ -451,6 +470,9 @@ def pytest_configure(config: pytest.Config) -> None:
         **os.environ,
         _ENV_STRACE_OUT: strace_path,
         _ENV_MARKERS_OUT: markers_path,
+        # Survives the exec as strace's own pid, which is what the pytest it
+        # forks will see as its parent — and no deeper process will.
+        _ENV_TRACER_PID: str(os.getpid()),
     }
     # Reconstruct as `python -m pytest <args>` so the command is valid regardless
     # of whether pytest was invoked via its entry-point script or `python -m pytest`
@@ -499,6 +521,8 @@ def pytest_sessionfinish(
     strace_path = os.environ.get(_ENV_STRACE_OUT)
     if not strace_path:
         return
+    if not _owns_the_run():
+        return  # a nested pytest: the trace belongs to a run still in progress
 
     markers_path_str = os.environ.get(_ENV_MARKERS_OUT)
     strace_file = Path(strace_path)
