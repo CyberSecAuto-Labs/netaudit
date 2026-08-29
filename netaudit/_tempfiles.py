@@ -48,10 +48,14 @@ _SUFFIXES = (".strace", ".markers")
 # garbage. Age cannot tell a leftover from a long, quiet run.
 _OWNER_IN_NAME = re.compile(rf"^{PREFIX}(\d+)-")
 
-# Only a backstop now that ownership is the primary signal, but still needed:
-# a file whose owning pid has been reused by an unrelated process would
-# otherwise never be swept. Well beyond any plausible run.
+# Nothing younger than this is touched at all: it may belong to a run that is
+# still going, and deleting a live trace silently disables its auditing.
 _STALE_AGE_SECONDS = 24 * 60 * 60
+
+# Past this, the file goes even if its recorded pid is still in use — pids are
+# reused, and a week-old trace is not a running test suite. Without it a single
+# unlucky reuse would keep a multi-megabyte file forever.
+_ABANDONED_AGE_SECONDS = 7 * 24 * 60 * 60
 
 # ``os.kill(pid, 0)`` is a liveness probe on POSIX and a *termination* on
 # Windows, which has no strace and therefore none of these files either.
@@ -149,24 +153,28 @@ def _owner_still_running(path: Path) -> bool:
 def sweep_stale(
     directory: Path | None = None,
     max_age: float = _STALE_AGE_SECONDS,
+    abandoned_age: float = _ABANDONED_AGE_SECONDS,
 ) -> list[Path]:
     """Delete leftover netaudit temp files older than *max_age* seconds.
 
     The only recovery from a SIGKILLed run, which cannot clean up after itself.
-    A file is only removed once its owning process is gone *and* it is older
-    than *max_age*: deleting a live run's trace would silently disable its
-    auditing, so every uncertain case errs towards keeping the file.
+    Deleting a live run's trace would silently disable its auditing, so a file
+    is only removed once it is older than *max_age* **and** its owning process
+    is gone — or, past *abandoned_age*, whatever now holds that pid.
 
     Returns the paths removed; best-effort, so a file that vanishes underneath
     the sweep — another run doing the same thing — is not an error.
     """
     root = directory if directory is not None else Path(tempfile.gettempdir())
-    cutoff = time.time() - max_age
+    now = time.time()
     removed: list[Path] = []
     for suffix in _SUFFIXES:
         for path in sorted(root.glob(f"{PREFIX}*{suffix}")):
             try:
-                if _owner_still_running(path) or path.stat().st_mtime > cutoff:
+                age = now - path.stat().st_mtime
+                if age <= max_age:
+                    continue
+                if age <= abandoned_age and _owner_still_running(path):
                     continue
                 path.unlink()
             except OSError:

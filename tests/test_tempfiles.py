@@ -240,6 +240,13 @@ class TestSweepStale:
         assert _tempfiles.sweep_stale(directory=tmp_path) == []
         assert live.exists()
 
+    def test_removes_a_long_abandoned_file_even_if_its_pid_is_in_use(
+        self, tmp_path: Path
+    ) -> None:
+        """A pid gets reused; a week-old trace is not a running test suite."""
+        forgotten = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 8 * 24 * 3600)
+        assert _tempfiles.sweep_stale(directory=tmp_path) == [forgotten]
+
     def test_removes_a_file_whose_owner_is_gone(self, tmp_path: Path) -> None:
         dead = self._aged(tmp_path / f"netaudit-{_dead_pid()}-abc.strace", 48 * 3600)
         assert _tempfiles.sweep_stale(directory=tmp_path) == [dead]

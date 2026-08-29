@@ -498,7 +498,7 @@ def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
-    markers_path = os.environ.get(_ENV_MARKERS_OUT)
+    markers_path = os.environ.get(_ENV_MARKERS_OUT) if _owns_the_run() else None
     location = _item_location(item)
     if markers_path:
         ts = _now_ts()

@@ -531,6 +531,26 @@ class TestPytestRuntestProtocol:
         assert any(line.startswith("END") for line in lines)
         assert all("tests/test_foo.py::test_bar" in line for line in lines)
 
+    def test_a_nested_pytest_does_not_write_into_the_outer_runs_markers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its nodeids do not exist in the outer suite, and its ranges nest
+        inside the outer test's — events would be attributed to a test the
+        report's reader cannot find."""
+        markers_file = tmp_path / "markers"
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = "nested/test_inner.py::test_inner"
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            gen.send(None)
+
+        assert not markers_file.exists()
+
     def test_does_nothing_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         item = MagicMock(spec=pytest.Item)
