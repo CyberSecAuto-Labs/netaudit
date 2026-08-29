@@ -62,9 +62,9 @@ _ABANDONED_AGE_SECONDS = 7 * 24 * 60 * 60
 _CAN_PROBE_PIDS = os.name == "posix"
 
 # Signals that end the process without unwinding. SIGHUP is absent on Windows,
-# which has no strace either — the tuple is empty there and everything below
-# degrades to the atexit path.
-_CANCEL_SIGNALS = tuple(
+# which has no strace either. Shared with the CLI, which installs its own
+# handler for the same set before this module chains onto it.
+CANCEL_SIGNALS = tuple(
     sig for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if sig
 )
 
@@ -104,7 +104,7 @@ def remove_on_cancel(*paths: Path) -> None:
     if not _TRACKED:
         atexit.register(remove_tracked)
     _TRACKED.update(paths)
-    for sig in _CANCEL_SIGNALS:
+    for sig in CANCEL_SIGNALS:
         try:
             previous = signal.signal(sig, _on_cancel)
         except ValueError:

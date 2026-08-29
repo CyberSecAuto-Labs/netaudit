@@ -58,6 +58,18 @@ def _interrupted_proc(*, ignores_sigterm: bool = False) -> MagicMock:
     return proc
 
 
+@pytest.fixture(autouse=True)
+def unprobed_strace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer the ``--kill-on-exit`` probe without spawning anything.
+
+    ``_strace_cmd`` probes lazily the first time it is called, so an unprimed
+    cache would try to spawn a real strace from inside tests that have patched
+    ``subprocess`` — and get a MagicMock back. :func:`_probe` puts the real
+    function back for the tests that are about the probe itself.
+    """
+    monkeypatch.setattr("netaudit.runner._supports_kill_on_exit", lambda: False)
+
+
 def _runner() -> StraceRunner:
     """Build a StraceRunner without requiring strace on PATH."""
     with patch("netaudit.runner.shutil.which", return_value="/usr/bin/strace"):
@@ -93,7 +105,10 @@ def _probe(returncode: int = 0, error: Exception | None = None) -> Iterator[Magi
     """Answer the feature probe without a real strace, and leave no cache behind."""
     _supports_kill_on_exit.cache_clear()
     try:
-        with patch("netaudit.runner.subprocess.run") as run:
+        with (
+            patch("netaudit.runner._supports_kill_on_exit", _supports_kill_on_exit),
+            patch("netaudit.runner.subprocess.run") as run,
+        ):
             if error is not None:
                 run.side_effect = error
             else:
@@ -162,24 +177,40 @@ class TestStraceRunnerInit:
 class TestStraceRunnerRun:
     def test_prefixes_the_command_with_strace_args(self) -> None:
         runner = _runner()
-        with patch("netaudit.runner.subprocess.run") as run:
+        with patch("netaudit.runner.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = (b"", b"")
             runner.run(["echo", "hi"], _OUT)
-        argv = run.call_args.args[0]
+        argv = popen.call_args.args[0]
         assert argv == _strace_cmd(_OUT) + ["echo", "hi"]
 
     def test_captures_output(self) -> None:
         runner = _runner()
-        with patch("netaudit.runner.subprocess.run") as run:
-            runner.run(["echo", "hi"], _OUT)
-        assert run.call_args.kwargs["capture_output"] is True
+        with patch("netaudit.runner.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = (b"out", b"err")
+            result = runner.run(["echo", "hi"], _OUT)
+        assert (result.stdout, result.stderr) == (b"out", b"err")
 
     def test_returns_the_completed_process(self) -> None:
         runner = _runner()
-        expected = subprocess.CompletedProcess(
-            args=["strace"], returncode=7, stdout=b"", stderr=b""
-        )
-        with patch("netaudit.runner.subprocess.run", return_value=expected):
-            assert runner.run(["false"], _OUT) is expected
+        with patch("netaudit.runner.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = (b"", b"")
+            popen.return_value.returncode = 7
+            assert runner.run(["false"], _OUT).returncode == 7
+
+    def test_interrupt_signals_the_whole_traced_group(self) -> None:
+        """The blocking API must not orphan what it traced either.
+
+        Signalling strace alone leaves the command it traced running, holding
+        the pipes this call is waiting on.
+        """
+        runner = _runner()
+        with (
+            patch("netaudit.runner.subprocess.Popen", return_value=_interrupted_proc()),
+            _fake_process_groups() as killpg,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                runner.run(["sleep", "30"], _OUT)
+        assert killpg.call_args_list[0].args == (_GROUP_ID, signal.SIGTERM)
 
 
 # ---------------------------------------------------------------------------

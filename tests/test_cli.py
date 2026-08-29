@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import signal
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from netaudit import _tempfiles
-from netaudit.cli import main
+from netaudit.cli import _cli_cancel_handler, main
 from netaudit.parser import ConnectEvent
 
 # ---------------------------------------------------------------------------
@@ -207,6 +210,70 @@ class TestRunCommand:
             CliRunner().invoke(main, ["run", "--", "echo", "hi"])
 
         sweep.assert_called_once()
+
+    def test_cancellation_stops_the_traced_command(self) -> None:
+        """SIGTERM to netaudit must not leave strace and the command running.
+
+        The runner reacts to KeyboardInterrupt by signalling the traced group,
+        so the handler's job is to turn the signal into one.
+        """
+        mock_runner = MagicMock()
+        mock_runner.run.side_effect = KeyboardInterrupt
+        with patch("netaudit.cli.StraceRunner", return_value=mock_runner):
+            result = CliRunner().invoke(main, ["run", "--", "sleep", "30"])
+
+        assert result.exit_code == 86
+        assert "cancel" in result.output.lower()
+
+    def test_sigterm_becomes_the_interrupt_the_runner_understands(self) -> None:
+        saved = {sig: signal.getsignal(sig) for sig in _tempfiles.CANCEL_SIGNALS}
+        mock_runner = MagicMock()
+        recorded: list[Path] = []
+        mock_runner.run.side_effect = lambda c, out: (
+            recorded.append(out),
+            out.write_text(_STRACE_LOG_CLEAN),
+            MagicMock(returncode=0),
+        )[-1]
+        try:
+            with patch("netaudit.cli.StraceRunner", return_value=mock_runner):
+                CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+            for sig in _tempfiles.CANCEL_SIGNALS:
+                with pytest.raises(KeyboardInterrupt):
+                    _cli_cancel_handler(sig)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
+    def test_the_cleanup_handler_runs_before_the_interrupt(self) -> None:
+        """netaudit's own handler must chain to this one, not replace it.
+
+        Installed first so the temp-file handler records it as its predecessor;
+        the other order would delete the file and never stop the command.
+        """
+        saved = {sig: signal.getsignal(sig) for sig in _tempfiles.CANCEL_SIGNALS}
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+        try:
+            for sig in _tempfiles.CANCEL_SIGNALS:
+                assert _tempfiles._PREVIOUS[sig] is _cli_cancel_handler
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
+    def test_a_cli_started_off_the_main_thread_still_runs(self) -> None:
+        """signal.signal() only works on the main thread; the run must go on."""
+        results: list[int] = []
+
+        def invoke() -> None:
+            with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path([])):
+                results.append(CliRunner().invoke(main, ["run", "--", "echo", "hi"]).exit_code)
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        thread.join()
+
+        assert results == [0]
 
     def test_json_format(self, tmp_path: Path) -> None:
         strace_log = tmp_path / "out.strace"
@@ -899,6 +966,7 @@ class TestRunReservedCodesAreDistinct:
     def test_reserved_codes_do_not_overlap(self) -> None:
         from netaudit.cli import (
             _EXIT_BAD_ALLOWLIST,
+            _EXIT_CANCELLED,
             _EXIT_CLEAN,
             _EXIT_STRACE_MISSING,
             _EXIT_TRACED_VIOLATIONS,
@@ -909,13 +977,15 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_TRACED_VIOLATIONS,
             _EXIT_STRACE_MISSING,
             _EXIT_BAD_ALLOWLIST,
+            _EXIT_CANCELLED,
         }
-        assert len(codes) == 4
+        assert len(codes) == 5
         # Every netaudit-originated code sits in the band left clear of sysexits,
         # the Linux socket errno block, shell codes and signal-derived values.
         assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
         assert 79 <= _EXIT_STRACE_MISSING <= 87
         assert 79 <= _EXIT_BAD_ALLOWLIST <= 87
+        assert 79 <= _EXIT_CANCELLED <= 87
 
     def test_run_never_borrows_an_exit_code_the_command_could_return(self) -> None:
         # The whole point of the reserved band: `run` passes the traced

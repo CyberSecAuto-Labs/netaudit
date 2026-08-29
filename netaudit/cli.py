@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import sys
 from pathlib import Path
+from types import FrameType
+from typing import NoReturn
 
 import click
 
@@ -38,6 +41,32 @@ _EXIT_BAD_INPUT = 2
 _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
 _EXIT_BAD_ALLOWLIST = 85
+_EXIT_CANCELLED = 86
+
+
+def _cli_cancel_handler(signum: int, frame: FrameType | None = None) -> NoReturn:
+    """Turn a cancelling signal into the interrupt the runner already handles.
+
+    :meth:`StraceRunner.run` answers ``KeyboardInterrupt`` by signalling the
+    traced process group. Dying directly from SIGTERM would skip that and leave
+    strace — and the command it traces — running, which is what happens when
+    netaudit is PID 1 and something sends it a plain ``docker stop``.
+    """
+    raise KeyboardInterrupt
+
+
+def _handle_cancellation_as_interrupt() -> None:
+    """Install :func:`_cli_cancel_handler` for every cancelling signal.
+
+    Called before the temp file is created so that the cleanup handler records
+    this one as its predecessor and chains to it: unlink, then stop the command.
+    """
+    for sig in _tempfiles.CANCEL_SIGNALS:
+        try:
+            signal.signal(sig, _cli_cancel_handler)
+        except ValueError:
+            # Not the main thread — the run still has to happen.
+            return
 
 
 def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
@@ -218,11 +247,16 @@ def run_cmd(
 
     # Recover the traces of earlier runs that were killed outright, then take a
     # name the same sweep will recognise if this run is the one that is killed.
+    _handle_cancellation_as_interrupt()
     _tempfiles.sweep_stale()
     strace_out = _tempfiles.create(".strace")
 
     try:
-        completed = runner.run(list(command), strace_out)
+        try:
+            completed = runner.run(list(command), strace_out)
+        except KeyboardInterrupt:
+            click.echo("netaudit: cancelled; the traced command was stopped", err=True)
+            sys.exit(_EXIT_CANCELLED)
         command_code = completed.returncode
         events = StraceParser().parse_stream(strace_out.read_text().splitlines())
         violations = Reporter.check(events, al)

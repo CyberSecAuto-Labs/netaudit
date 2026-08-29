@@ -328,3 +328,60 @@ class TestInterruptDuringStartup:
         # the owning pid is gone, so nothing can be written to them again.
         assert sorted(_tempfiles.sweep_stale(directory=temp_dir, max_age=0)) == remaining
         assert _leftovers(temp_dir) == []
+
+
+class TestCancellingTheCli:
+    """``netaudit run`` has no re-exec: strace is a real child, so the CLI is
+    still there to be signalled — and has to pass that on."""
+
+    def _netaudit(self, temp_dir: Path, command: list[str]) -> subprocess.Popen[bytes]:
+        binary = shutil.which("netaudit")
+        if binary is None:  # pragma: no cover - the integration image installs it
+            pytest.skip("netaudit console script not on PATH")
+        env = {**os.environ, "TMPDIR": str(temp_dir)}
+        return subprocess.Popen(
+            [binary, "run", "--", *command],
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _traced_processes(self) -> list[str]:
+        """Live strace and sleep processes, whoever started them."""
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+                comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+                state = stat[stat.rindex(")") + 2 :].split()[0]
+            except (OSError, ValueError):
+                continue
+            if comm in ("strace", "sleep") and state not in ("Z", "X"):
+                found.append(f"{entry.name}:{comm}")
+        return found
+
+    def test_sigterm_stops_strace_and_the_command_it_traces(self, tmp_path: Path) -> None:
+        """Signalling the CLI alone is what ``docker stop`` does to PID 1."""
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        proc = self._netaudit(temp_dir, ["sleep", "45"])
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not self._traced_processes():
+                time.sleep(0.05)
+            assert self._traced_processes(), "premise broken: nothing was traced"
+
+            os.kill(proc.pid, signal.SIGTERM)
+            returncode = proc.wait(timeout=30)
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and self._traced_processes():
+                time.sleep(0.1)
+            assert self._traced_processes() == [], "the traced command outlived netaudit"
+            assert returncode == 86, "a cancelled run has its own exit code"
+            assert _leftovers(temp_dir) == []
+        finally:
+            _reap(proc.pid)

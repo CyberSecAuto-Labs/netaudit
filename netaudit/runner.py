@@ -134,11 +134,12 @@ class StraceRunner:
 
         strace output is written to *output_path*; stdout/stderr of the wrapped
         command are captured and returned in the CompletedProcess.
+
+        Interruption is handled exactly as in :meth:`StraceProcess.stop`: the
+        traced command is signalled along with strace, rather than being left
+        running once this call has been interrupted out of.
         """
-        return subprocess.run(
-            _strace_cmd(output_path) + command,
-            capture_output=True,
-        )
+        return self.start(command, output_path).stop()
 
     def start(self, command: list[str], output_path: Path) -> StraceProcess:
         """Spawn *command* under strace and return immediately.

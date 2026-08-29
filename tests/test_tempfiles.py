@@ -60,10 +60,10 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Give each test its own tracking state and restore signal dispositions."""
     monkeypatch.setattr(_tempfiles, "_TRACKED", set())
     monkeypatch.setattr(_tempfiles, "_PREVIOUS", {})
-    saved = {sig: signal.getsignal(sig) for sig in _tempfiles._CANCEL_SIGNALS}
+    saved = {sig: signal.getsignal(sig) for sig in _tempfiles.CANCEL_SIGNALS}
     # Another test may already have installed the handler for real; start from
     # the default so what this test observes is what this test caused.
-    for sig in _tempfiles._CANCEL_SIGNALS:
+    for sig in _tempfiles.CANCEL_SIGNALS:
         signal.signal(sig, signal.SIG_DFL)
     yield
     for sig, handler in saved.items():
@@ -105,14 +105,14 @@ class TestRemoveOnCancel:
 
     def test_installs_a_handler_for_every_cancel_signal(self, tmp_path: Path) -> None:
         _tempfiles.remove_on_cancel(tmp_path / "netaudit-x.strace")
-        for sig in _tempfiles._CANCEL_SIGNALS:
+        for sig in _tempfiles.CANCEL_SIGNALS:
             assert signal.getsignal(sig) is _tempfiles._on_cancel
 
     def test_remembers_the_handler_it_replaced(self, tmp_path: Path) -> None:
         def previous(signum: int, frame: Any) -> None:  # pragma: no cover - never called
             pass
 
-        sig = _tempfiles._CANCEL_SIGNALS[0]
+        sig = _tempfiles.CANCEL_SIGNALS[0]
         signal.signal(sig, previous)
         _tempfiles.remove_on_cancel(tmp_path / "netaudit-x.strace")
         assert _tempfiles._PREVIOUS[sig] is previous
@@ -124,7 +124,7 @@ class TestRemoveOnCancel:
         """
         _tempfiles.remove_on_cancel(tmp_path / "a.strace")
         _tempfiles.remove_on_cancel(tmp_path / "b.strace")
-        for sig in _tempfiles._CANCEL_SIGNALS:
+        for sig in _tempfiles.CANCEL_SIGNALS:
             assert _tempfiles._PREVIOUS[sig] is not _tempfiles._on_cancel
 
     def test_survives_registration_from_a_worker_thread(self, tmp_path: Path) -> None:
@@ -185,7 +185,7 @@ class TestCancelHandler:
         def previous(signum: int, frame: Any) -> None:
             seen.append(path.exists())
 
-        sig = _tempfiles._CANCEL_SIGNALS[0]
+        sig = _tempfiles.CANCEL_SIGNALS[0]
         signal.signal(sig, previous)
         _tempfiles.remove_on_cancel(path)
 
@@ -199,7 +199,7 @@ class TestCancelHandler:
         """With no predecessor, restore the default disposition and die from it."""
         path = tmp_path / "netaudit-x.strace"
         path.touch()
-        sig = _tempfiles._CANCEL_SIGNALS[0]
+        sig = _tempfiles.CANCEL_SIGNALS[0]
         signal.signal(sig, signal.SIG_DFL)
         _tempfiles.remove_on_cancel(path)
 
