@@ -20,6 +20,7 @@ Run with: pytest -m integration
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -30,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from netaudit import _tempfiles
 
 pytestmark = [
     pytest.mark.integration,
@@ -277,3 +280,51 @@ class TestSigkillIsRecoveredByTheNextRun:
             _reap(run.pid)
 
         assert recent.exists()
+
+
+class TestInterruptDuringStartup:
+    """There is a window, right after the re-exec, where nothing owns the files.
+
+    strace creates the trace as it starts; the pytest it forks only adopts the
+    files once its own ``pytest_configure`` runs, most of a second later. An
+    interrupt in between kills both without either having cleaned up. Measured
+    across the window, SIGINT to the process group:
+
+        +0.00s   exit -2   leftovers 0            (files not created yet)
+        +0.25s   exit -2   leftovers 2   0 B
+        +0.50s   exit  1   leftovers 2   136 B
+        +0.75s   exit -2   leftovers 2   232 B
+        +1.00s   exit  2   leftovers 0            (adopted, cleaned up)
+
+    Closing it would mean keeping a process of our own alive alongside strace,
+    which is the design the plugin deliberately does not have — and the files
+    at stake here are the ones strace has barely started writing. What is
+    pinned instead is that nothing is left that the next run cannot recover,
+    which is the same guarantee SIGKILL gets.
+
+    (The interrupt is also sometimes swallowed outright in this window — exit 1
+    and exit 2 above are runs that continued. strace blocks fatal signals while
+    it sets up, and the option that changes that, ``-I1``, would also stop
+    Ctrl-C at steady state from letting the suite report.)
+    """
+
+    @pytest.mark.parametrize("delay", [0.0, 0.25, 0.5, 0.75])
+    def test_leaves_nothing_the_next_run_cannot_recover(self, tmp_path: Path, delay: float) -> None:
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        # Short, because the interrupt may be swallowed and the suite then has
+        # to run to completion before this returns.
+        proc = _launch(_write_project(tmp_path / "project", _slow_test(2)), temp_dir)
+        time.sleep(delay)
+        try:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGINT)
+            proc.wait(timeout=120)
+        finally:
+            _reap(proc.pid)
+
+        remaining = _leftovers(temp_dir)
+        # max_age=0 is what the next run's sweep does once these have aged out:
+        # the owning pid is gone, so nothing can be written to them again.
+        assert sorted(_tempfiles.sweep_stale(directory=temp_dir, max_age=0)) == remaining
+        assert _leftovers(temp_dir) == []
