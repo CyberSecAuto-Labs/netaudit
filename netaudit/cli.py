@@ -5,12 +5,11 @@ from __future__ import annotations
 import io
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import click
 
-from netaudit import __version__
+from netaudit import __version__, _tempfiles
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import (
@@ -217,8 +216,10 @@ def run_cmd(
 
     al = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
 
-    with tempfile.NamedTemporaryFile(suffix=".strace", delete=False) as tf:
-        strace_out = Path(tf.name)
+    # Recover the traces of earlier runs that were killed outright, then take a
+    # name the same sweep will recognise if this run is the one that is killed.
+    _tempfiles.sweep_stale()
+    strace_out = _tempfiles.create(".strace")
 
     try:
         completed = runner.run(list(command), strace_out)

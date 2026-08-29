@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +24,7 @@ from typing import Any, Generator
 
 import pytest
 
+from netaudit import _tempfiles
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import (
@@ -421,18 +421,31 @@ def pytest_configure(config: pytest.Config) -> None:
 
     Enabled via ``--netaudit`` or ``enabled = true`` in ``[tool.netaudit]``.
     """
-    if not _resolve_enabled(config) or os.environ.get(_ENV_STRACE_OUT):
-        return  # disabled or already running under strace
+    strace_out = os.environ.get(_ENV_STRACE_OUT)
+    if strace_out:
+        # Already running under strace. The process that made these files is
+        # gone — execvpe replaced it — so this one owns removing them, and its
+        # sessionfinish is only reached if the run is allowed to finish.
+        markers_out = os.environ.get(_ENV_MARKERS_OUT)
+        paths = [Path(strace_out)]
+        if markers_out:
+            paths.append(Path(markers_out))
+        _tempfiles.remove_on_cancel(*paths)
+        return
+
+    if not _resolve_enabled(config):
+        return
 
     if shutil.which("strace") is None:
         raise pytest.UsageError(
             "netaudit: strace is not available on PATH — install it (e.g. apt install strace)."
         )
 
-    strace_fd, strace_path = tempfile.mkstemp(suffix=".strace", prefix="netaudit-")
-    os.close(strace_fd)
-    markers_fd, markers_path = tempfile.mkstemp(suffix=".markers", prefix="netaudit-")
-    os.close(markers_fd)
+    # A SIGKILLed run cannot clean up after itself; the next one does it for it.
+    _tempfiles.sweep_stale()
+
+    strace_path = str(_tempfiles.create(".strace"))
+    markers_path = str(_tempfiles.create(".markers"))
 
     env = {
         **os.environ,

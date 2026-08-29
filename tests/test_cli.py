@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
+from netaudit import _tempfiles
 from netaudit.cli import main
 from netaudit.parser import ConnectEvent
 
@@ -144,9 +145,8 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             # Prevent unlink from removing our fixture
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "echo", "hi"])
@@ -163,13 +163,50 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "curl", "8.8.8.8"])
 
         assert result.exit_code == 83
+
+    def _record_trace_path(self, recorded: list[Path]) -> MagicMock:
+        """A runner mock that writes a real trace to whatever path the CLI chose."""
+
+        def fake_run(command: list[str], output_path: Path) -> MagicMock:
+            recorded.append(output_path)
+            output_path.write_text(_STRACE_LOG_CLEAN)
+            return MagicMock(returncode=0)
+
+        mock_runner = MagicMock()
+        mock_runner.run.side_effect = fake_run
+        return mock_runner
+
+    def test_names_the_trace_file_so_a_later_run_can_sweep_it(self) -> None:
+        """An unprefixed temp name is unrecoverable once the run is SIGKILLed."""
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        assert len(recorded) == 1
+        assert recorded[0].name.startswith(_tempfiles.PREFIX)
+        assert recorded[0].suffix == ".strace"
+
+    def test_registers_the_trace_file_for_removal_on_cancellation(self) -> None:
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        assert recorded[0] in _tempfiles._TRACKED
+
+    def test_sweeps_traces_an_earlier_run_could_not_clean_up(self) -> None:
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path([])),
+            patch("netaudit.cli._tempfiles.sweep_stale") as sweep,
+        ):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        sweep.assert_called_once()
 
     def test_json_format(self, tmp_path: Path) -> None:
         strace_log = tmp_path / "out.strace"
@@ -180,9 +217,8 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(
                     main, ["run", "--format", "json", "--", "curl", "8.8.8.8"]
@@ -265,9 +301,8 @@ class TestVerboseFlag:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--verbose", "--", "echo", "hi"])
 
@@ -284,9 +319,8 @@ class TestVerboseFlag:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(
                     main, ["run", "--verbose", "--format", "json", "--", "curl", "8.8.8.8"]
@@ -777,9 +811,8 @@ class TestRunExitCodes:
         mock_runner.run.return_value = MagicMock(returncode=returncode)
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 return CliRunner().invoke(main, ["run", *args, "--", "pytest"])
 
@@ -835,9 +868,8 @@ class TestRunReservedCodesAreDistinct:
         mock_runner.run.return_value = MagicMock(returncode=2)
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "pytest"])
         assert result.exit_code == 2

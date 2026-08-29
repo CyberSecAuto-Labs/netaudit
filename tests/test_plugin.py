@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from netaudit import _tempfiles
 from netaudit.allowlist import AllowList
 from netaudit.integrations.pytest_plugin import (
     _ENV_MARKERS_OUT,
@@ -394,6 +395,61 @@ class TestPytestConfigure:
         assert "pytest" in args
         assert _ENV_STRACE_OUT in env
         assert _ENV_MARKERS_OUT in env
+
+    def test_sweeps_leftovers_from_a_run_that_could_not_clean_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A SIGKILLed run leaves both files behind; only the next run can recover them."""
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        monkeypatch.setattr(os, "execvpe", lambda *a: None)
+        swept: list[object] = []
+        monkeypatch.setattr(_tempfiles, "sweep_stale", lambda: swept.append(True) or [])
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert swept == [True]
+
+    def test_registers_the_temp_files_it_creates_for_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        env: dict[str, str] = {}
+        monkeypatch.setattr(os, "execvpe", lambda _n, _a, e: env.update(e))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        try:
+            assert Path(env[_ENV_STRACE_OUT]) in _tempfiles._TRACKED
+            assert Path(env[_ENV_MARKERS_OUT]) in _tempfiles._TRACKED
+        finally:
+            _tempfiles.remove_tracked()
+
+    def test_the_traced_process_takes_over_cleanup_of_the_temp_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The process that created them is gone — execvpe replaced it."""
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.setenv(_ENV_MARKERS_OUT, "/tmp/netaudit-x.markers")
+        registered: list[tuple[Path, ...]] = []
+        monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert registered == [(Path("/tmp/netaudit-x.strace"), Path("/tmp/netaudit-x.markers"))]
+
+    def test_takes_over_cleanup_of_the_trace_alone_when_there_are_no_markers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        registered: list[tuple[Path, ...]] = []
+        monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert registered == [(Path("/tmp/netaudit-x.strace"),)]
 
     def test_returns_silently_when_option_not_registered(
         self, monkeypatch: pytest.MonkeyPatch
