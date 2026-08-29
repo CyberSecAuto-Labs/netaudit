@@ -21,11 +21,31 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import pytest
 
 from netaudit import _tempfiles
+
+
+def _probing(
+    monkeypatch: pytest.MonkeyPatch,
+    alive: bool = True,
+    kill: Callable[[int, int], None] | None = None,
+) -> None:
+    """Make the pid probe answer without touching the real process table.
+
+    Windows is in the CI matrix and ``os.kill(pid, 0)`` *terminates* a process
+    there, so these cases cannot probe for real on every platform. The
+    POSIX-only test below is what keeps the answers here honest.
+    """
+    monkeypatch.setattr(_tempfiles, "_CAN_PROBE_PIDS", True)
+
+    def default(pid: int, sig: int) -> None:
+        if not alive:
+            raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "kill", kill if kill is not None else default)
 
 
 def _dead_pid() -> int:
@@ -234,19 +254,28 @@ class TestSweepStale:
         recent = self._aged(tmp_path / "netaudit-abc.strace", 120)
         assert _tempfiles.sweep_stale(directory=tmp_path, max_age=60) == [recent]
 
-    def test_spares_a_file_whose_owner_is_still_running(self, tmp_path: Path) -> None:
+    def test_removes_a_long_abandoned_file_even_if_its_pid_is_in_use(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pid gets reused; a week-old trace is not a running test suite."""
+        _probing(monkeypatch, alive=True)
+        forgotten = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 8 * 24 * 3600)
+        assert _tempfiles.sweep_stale(directory=tmp_path) == [forgotten]
+
+    def test_spares_a_file_whose_owner_is_still_running(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A run older than the threshold is still a run. Age alone cannot tell."""
+        _probing(monkeypatch, alive=True)
         live = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 48 * 3600)
         assert _tempfiles.sweep_stale(directory=tmp_path) == []
         assert live.exists()
 
-    def test_removes_a_long_abandoned_file_even_if_its_pid_is_in_use(self, tmp_path: Path) -> None:
-        """A pid gets reused; a week-old trace is not a running test suite."""
-        forgotten = self._aged(tmp_path / f"netaudit-{os.getpid()}-abc.strace", 8 * 24 * 3600)
-        assert _tempfiles.sweep_stale(directory=tmp_path) == [forgotten]
-
-    def test_removes_a_file_whose_owner_is_gone(self, tmp_path: Path) -> None:
-        dead = self._aged(tmp_path / f"netaudit-{_dead_pid()}-abc.strace", 48 * 3600)
+    def test_removes_a_file_whose_owner_is_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _probing(monkeypatch, alive=False)
+        dead = self._aged(tmp_path / "netaudit-4242-abc.strace", 48 * 3600)
         assert _tempfiles.sweep_stale(directory=tmp_path) == [dead]
 
     def test_treats_an_unsignalable_owner_as_alive(
@@ -257,10 +286,19 @@ class TestSweepStale:
         def refuse(pid: int, sig: int) -> None:
             raise PermissionError(pid)
 
-        monkeypatch.setattr(os, "kill", refuse)
+        _probing(monkeypatch, kill=refuse)
         theirs = self._aged(tmp_path / "netaudit-4242-abc.strace", 48 * 3600)
         assert _tempfiles.sweep_stale(directory=tmp_path) == []
         assert theirs.exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="os.kill(pid, 0) terminates on Windows")
+    def test_reads_the_real_process_table(self, tmp_path: Path) -> None:
+        """The probe against real pids, so the mocked cases above stay honest."""
+        live = self._aged(tmp_path / f"netaudit-{os.getpid()}-live.strace", 48 * 3600)
+        dead = self._aged(tmp_path / f"netaudit-{_dead_pid()}-dead.strace", 48 * 3600)
+
+        assert _tempfiles.sweep_stale(directory=tmp_path) == [dead]
+        assert live.exists()
 
     def test_falls_back_to_age_where_pids_cannot_be_probed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
