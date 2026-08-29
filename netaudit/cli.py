@@ -36,8 +36,6 @@ _EXIT_BAD_INPUT = 2
 
 # Reserved for `run`. Every other value belongs to the traced command and is
 # passed through, so these sit clear of the ranges a wrapped process may use.
-# A netaudit-side failure must never borrow a value the child could return —
-# exiting 2 here would be indistinguishable from a suite that exited 2.
 _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
 _EXIT_BAD_ALLOWLIST = 85
