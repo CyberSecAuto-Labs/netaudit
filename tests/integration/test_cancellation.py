@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -38,16 +39,23 @@ pytestmark = [
 
 _STARTED = "started"
 
-# Long enough that the run cannot plausibly finish before the signal lands.
-_SLOW_TEST = f"""
+
+def _slow_test(seconds: float = 30) -> str:
+    """A suite that announces it has started and then sits there.
+
+    The default is long enough that the run cannot plausibly finish before the
+    signal lands; the short form is for the case that has to run to completion.
+    """
+    return f"""
 import pathlib
 import time
 
 
 def test_slow():
     pathlib.Path({_STARTED!r}).write_text("yes")
-    time.sleep(30)
+    time.sleep({seconds})
 """
+
 
 _FAST_TEST = """
 def test_fast():
@@ -94,7 +102,12 @@ def _wait_for_steady_state(project: Path, timeout: float = 60.0) -> None:
 
 
 def _members_of(group: int) -> list[int]:
-    """Every live process in process group *group*, via procfs."""
+    """Every *running* process in process group *group*, via procfs.
+
+    Zombies do not count: a killed process reparented to init stays in
+    ``/proc`` until something reaps it, and nothing in this container does.
+    It is dead, and reporting it as a survivor would be a false alarm.
+    """
     members: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -102,10 +115,10 @@ def _members_of(group: int) -> list[int]:
         try:
             stat = (entry / "stat").read_text()
             fields = stat[stat.rindex(")") + 2 :].split()
-            pgid = int(fields[2])
+            state, pgid = fields[0], int(fields[2])
         except (OSError, ValueError, IndexError):
             continue
-        if pgid == group:
+        if pgid == group and state not in ("Z", "X"):
             members.append(int(entry.name))
     return members
 
@@ -122,20 +135,43 @@ def _reap(group: int) -> None:
         pass
 
 
-def _cancel_with(sig: int, project: Path, temp_dir: Path) -> subprocess.Popen[bytes]:
-    """Run a traced suite to steady state, signal its whole group, and wait."""
-    proc = _launch(_write_project(project, _SLOW_TEST), temp_dir)
+@dataclass
+class _Cancelled:
+    returncode: int
+    survivors: list[int]
+    """Processes still in the run's group after it was signalled — measured
+    before anything cleans up, or the assertion would be about the cleanup."""
+
+
+def _cancel_with(
+    sig: int,
+    project: Path,
+    temp_dir: Path,
+    whole_group: bool = True,
+    seconds: float = 30,
+) -> _Cancelled:
+    """Run a traced suite to steady state, signal it, and wait for it to end.
+
+    *whole_group* is how every real cancellation arrives — CI runners kill the
+    tree, ``timeout`` signals the group. Signalling the single pid instead hits
+    only strace, which the re-exec turned this process into.
+    """
+    proc = _launch(_write_project(project, _slow_test(seconds)), temp_dir)
     try:
         _wait_for_steady_state(project)
-        os.killpg(proc.pid, sig)
-        proc.wait(timeout=30)
+        if whole_group:
+            os.killpg(proc.pid, sig)
+        else:
+            os.kill(proc.pid, sig)
+        proc.wait(timeout=60)
+        # The group dies asynchronously; give its members a moment to be reaped.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _members_of(proc.pid):
+            time.sleep(0.05)
+        survivors = _members_of(proc.pid)
     finally:
         _reap(proc.pid)
-    # The group dies asynchronously; give the members a moment to be reaped.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and _members_of(proc.pid):
-        time.sleep(0.05)
-    return proc
+    return _Cancelled(returncode=proc.returncode, survivors=survivors)
 
 
 class TestCancellationCleansUp:
@@ -150,14 +186,52 @@ class TestCancellationCleansUp:
         """Cleaning up must not disguise the cancellation as a normal exit."""
         temp_dir = tmp_path / "tmp"
         temp_dir.mkdir()
-        proc = _cancel_with(signal.SIGTERM, tmp_path / "project", temp_dir)
-        assert proc.returncode == -signal.SIGTERM
+        cancelled = _cancel_with(signal.SIGTERM, tmp_path / "project", temp_dir)
+        assert cancelled.returncode == -signal.SIGTERM
 
     def test_sigterm_leaves_nothing_running(self, tmp_path: Path) -> None:
         temp_dir = tmp_path / "tmp"
         temp_dir.mkdir()
-        proc = _cancel_with(signal.SIGTERM, tmp_path / "project", temp_dir)
-        assert _members_of(proc.pid) == []
+        cancelled = _cancel_with(signal.SIGTERM, tmp_path / "project", temp_dir)
+        assert cancelled.survivors == []
+
+    def test_sigkill_leaves_nothing_running(self, tmp_path: Path) -> None:
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        cancelled = _cancel_with(signal.SIGKILL, tmp_path / "project", temp_dir)
+        assert cancelled.survivors == []
+
+
+class TestSignallingStraceAlone:
+    """The re-exec makes the top-level pid strace itself, so a signal aimed at
+    "the pytest process" lands on strace and never on the suite."""
+
+    def test_killing_strace_outright_takes_the_traced_suite_with_it(self, tmp_path: Path) -> None:
+        """SIGKILL cannot be handled, so no cleanup this process could install
+        would help: strace must have been asked up front to take its tracees
+        down with it."""
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        cancelled = _cancel_with(signal.SIGKILL, tmp_path / "project", temp_dir, whole_group=False)
+        assert cancelled.survivors == []
+
+    def test_terminating_strace_alone_lets_the_suite_finish(self, tmp_path: Path) -> None:
+        """A limitation, pinned so that changing it is a decision.
+
+        strace detaches on SIGTERM rather than dying, which clears the kernel's
+        kill-on-exit flag, so the suite it was tracing runs to completion —
+        cleaning up after itself, but not cancelled. Every real cancellation
+        signals the process group, which does reach the suite; this is the
+        shape ``docker stop`` produces when pytest is PID 1.
+        """
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        cancelled = _cancel_with(
+            signal.SIGTERM, tmp_path / "project", temp_dir, whole_group=False, seconds=3
+        )
+        assert cancelled.returncode == 0
+        assert cancelled.survivors == []
+        assert _leftovers(temp_dir) == []
 
     def test_sigint_leaves_no_temp_files(self, tmp_path: Path) -> None:
         """Ctrl-C unwinds through sessionfinish; this pins that it stays that way."""

@@ -10,6 +10,7 @@ Run with: pytest -m integration
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -28,6 +29,10 @@ pytestmark = pytest.mark.integration
 
 # Long enough that the process cannot plausibly exit on its own mid-test.
 _SLEEPER = [sys.executable, "-c", "import time; time.sleep(30)"]
+
+# Windows has no SIGKILL and no strace; the constant only has to survive import
+# there, since every test in this module needs a real strace to run at all.
+_SIGKILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 @pytest.fixture
@@ -48,7 +53,23 @@ def _pid_of(process: StraceProcess) -> int:
 
 
 def _is_alive(pid: int) -> bool:
-    return Path(f"/proc/{pid}").exists()
+    """Running, not merely present in ``/proc``.
+
+    A killed process whose parent is gone is reparented to init and stays in
+    ``/proc`` as a zombie until something reaps it — which, inside the test
+    container, nothing does. Counting that as alive would report a dead tracee
+    as a survivor.
+    """
+    return _state_of(pid) not in ("", "Z", "X")
+
+
+def _state_of(pid: int) -> str:
+    """The single-letter process state from procfs, or "" if the pid is gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return ""
+    return stat[stat.rindex(")") + 2 :].split()[0]
 
 
 def _children_of(pid: int) -> list[int]:
@@ -228,6 +249,29 @@ class TestInterruptKillsTheChild:
             process.stop()
 
         assert _wait_until_gone(pid), "traced process survived SIGKILL"
+
+
+class TestStraceDyingOutright:
+    def test_killing_strace_does_not_orphan_the_traced_command(
+        self, runner: StraceRunner, tmp_path: Path
+    ) -> None:
+        """SIGKILL cannot be handled, so nothing in ``stop()`` runs.
+
+        The process group fix from the interrupt path is unreachable here: by
+        the time strace is gone there is no code of ours left to signal anyone.
+        Only the kernel can take the tracee down, and only if strace asked it
+        to up front.
+        """
+        process = runner.start(_SLEEPER, tmp_path / "out.log")
+        traced = _traced_pid(process)
+
+        os.kill(_pid_of(process), _SIGKILL_SIGNAL)
+        try:
+            assert _wait_until_gone(traced), "the traced command outlived strace"
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(traced, _SIGKILL_SIGNAL)
+            process._proc.wait()
 
 
 # ---------------------------------------------------------------------------

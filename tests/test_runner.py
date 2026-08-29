@@ -16,12 +16,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from netaudit.runner import (
+    _KILL_ON_EXIT,
     _SIGKILL,
     _TERMINATE_TIMEOUT,
     StraceNotFoundError,
     StraceProcess,
     StraceRunner,
     _strace_cmd,
+    _supports_kill_on_exit,
 )
 
 _OUT = Path("/tmp/netaudit-test.log")
@@ -79,6 +81,60 @@ class TestStraceCmd:
         out = Path("/var/log/somewhere.log")
         cmd = _strace_cmd(out)
         assert cmd[cmd.index("-o") + 1] == str(out)
+
+
+# ---------------------------------------------------------------------------
+# --kill-on-exit — strace 5.2+, and strace has no documented minimum version
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _probe(returncode: int = 0, error: Exception | None = None) -> Iterator[MagicMock]:
+    """Answer the feature probe without a real strace, and leave no cache behind."""
+    _supports_kill_on_exit.cache_clear()
+    try:
+        with patch("netaudit.runner.subprocess.run") as run:
+            if error is not None:
+                run.side_effect = error
+            else:
+                run.return_value = subprocess.CompletedProcess(
+                    args=[], returncode=returncode, stdout=b"", stderr=b""
+                )
+            yield run
+    finally:
+        _supports_kill_on_exit.cache_clear()
+
+
+class TestKillOnExit:
+    def test_asks_the_kernel_to_take_the_tracees_down_with_strace(self) -> None:
+        """SIGKILL cannot be handled, so nothing else can reach the traced process."""
+        with _probe(returncode=0):
+            assert _KILL_ON_EXIT in _strace_cmd(_OUT)
+
+    def test_is_left_out_when_strace_is_too_old_to_know_it(self) -> None:
+        """An unknown option makes strace refuse to start — the tool would break."""
+        with _probe(returncode=1):
+            assert _KILL_ON_EXIT not in _strace_cmd(_OUT)
+
+    def test_is_left_out_when_the_probe_cannot_run_at_all(self) -> None:
+        with _probe(error=FileNotFoundError("strace")):
+            assert _KILL_ON_EXIT not in _strace_cmd(_OUT)
+
+    def test_is_left_out_when_the_probe_hangs(self) -> None:
+        with _probe(error=subprocess.TimeoutExpired(cmd="strace", timeout=5)):
+            assert _KILL_ON_EXIT not in _strace_cmd(_OUT)
+
+    def test_the_probe_traces_nothing_and_starts_nothing(self) -> None:
+        with _probe(returncode=0) as run:
+            _strace_cmd(_OUT)
+        assert run.call_args.args[0] == ["strace", _KILL_ON_EXIT, "-V"]
+
+    def test_the_probe_runs_once_however_many_commands_are_built(self) -> None:
+        with _probe(returncode=0) as run:
+            _strace_cmd(_OUT)
+            _strace_cmd(_OUT)
+            _strace_cmd(Path("/tmp/other.log"))
+        assert run.call_count == 1
 
 
 # ---------------------------------------------------------------------------

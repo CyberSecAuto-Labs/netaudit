@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -40,6 +41,7 @@ from netaudit.integrations.pytest_plugin import (
 )
 from netaudit.parser import ConnectEvent
 from netaudit.reporter import Violation
+from netaudit.runner import _strace_cmd, _supports_kill_on_exit
 
 
 def _event(
@@ -493,6 +495,35 @@ class TestPytestConfigure:
         pytest_configure(self._make_config(enabled=True))
 
         assert registered == [(Path("/tmp/netaudit-x.strace"),)]
+
+    def test_traces_with_the_same_command_the_runner_builds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One place decides the strace flags. Two would drift — and one of them
+        would silently stop killing its tracees."""
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        captured: list[tuple[list[str], dict[str, str]]] = []
+        monkeypatch.setattr(os, "execvpe", lambda _n, a, e: captured.append((a, e)))
+
+        # Force the feature probe to say yes, so the assertion is about sharing
+        # the builder rather than about whichever strace this machine has.
+        _supports_kill_on_exit.cache_clear()
+        monkeypatch.setattr(
+            "netaudit.runner.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(args=[], returncode=0),
+        )
+        try:
+            pytest_configure(self._make_config(enabled=True))
+            _tempfiles.remove_tracked()
+
+            args, env = captured[0]
+            expected = _strace_cmd(Path(env[_ENV_STRACE_OUT]))
+        finally:
+            _supports_kill_on_exit.cache_clear()
+
+        assert "--kill-on-exit" in expected, "the probe was not forced on"
+        assert args == expected + [sys.executable, "-m", "pytest", *sys.argv[1:]]
 
     def test_returns_silently_when_option_not_registered(
         self, monkeypatch: pytest.MonkeyPatch

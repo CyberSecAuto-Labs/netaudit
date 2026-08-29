@@ -37,6 +37,7 @@ from netaudit.reporter import (
     build_run_metadata,
     supports_color,
 )
+from netaudit.runner import _strace_cmd
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
@@ -489,18 +490,11 @@ def pytest_configure(config: pytest.Config) -> None:
     # Reconstruct as `python -m pytest <args>` so the command is valid regardless
     # of whether pytest was invoked via its entry-point script or `python -m pytest`
     # (in the latter case sys.argv[0] is the non-executable __main__.py path).
-    cmd = [
-        "strace",
-        "-e",
-        "trace=connect",
-        "-f",
-        "-tt",
-        "-o",
-        strace_path,
-        sys.executable,
-        "-m",
-        "pytest",
-    ] + sys.argv[1:]
+    #
+    # The strace flags come from the runner rather than being spelled out again:
+    # a second copy would drift, and the copy that lost --kill-on-exit would go
+    # back to orphaning its tracees without anything failing to say so.
+    cmd = _strace_cmd(Path(strace_path)) + [sys.executable, "-m", "pytest"] + sys.argv[1:]
     os.execvpe("strace", cmd, env)
     # unreachable — execvpe replaces the current process image
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import signal
@@ -17,13 +18,45 @@ _TERMINATE_TIMEOUT = 5  # seconds to wait for graceful shutdown before SIGKILL
 _HAS_PROCESS_GROUPS = hasattr(os, "killpg") and hasattr(os, "getpgid")
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
+# Asks the kernel to take the tracees down whenever strace goes away, however
+# it goes away. This is the only thing that reaches a SIGKILLed strace, which
+# by definition runs no cleanup of its own — killpg from stop() cannot help.
+_KILL_ON_EXIT = "--kill-on-exit"
+
+# Long enough for a loaded machine to start a process that only prints a version.
+_PROBE_TIMEOUT = 5
+
 
 class StraceNotFoundError(RuntimeError):
     """Raised when strace is not available on PATH."""
 
 
+@functools.lru_cache(maxsize=1)
+def _supports_kill_on_exit() -> bool:
+    """Whether the strace on PATH understands ``--kill-on-exit`` (5.2+).
+
+    strace is a documented system dependency with no minimum version, and an
+    option it does not recognise makes it refuse to start — so the flag has to
+    be probed rather than assumed. ``-V`` parses the options and prints the
+    version, so the probe traces nothing and starts nothing; it is cached
+    because the answer cannot change while the process runs.
+    """
+    try:
+        probe = subprocess.run(
+            ["strace", _KILL_ON_EXIT, "-V"],
+            capture_output=True,
+            timeout=_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 def _strace_cmd(output_path: Path) -> list[str]:
-    return ["strace", "-e", "trace=connect", "-f", "-tt", "-o", str(output_path)]
+    cmd = ["strace", "-e", "trace=connect", "-f", "-tt", "-o", str(output_path)]
+    if _supports_kill_on_exit():
+        cmd.insert(1, _KILL_ON_EXIT)
+    return cmd
 
 
 class StraceProcess:
