@@ -43,7 +43,7 @@ nav:
   - Overview: index.md
   - CLI Reference: cli-reference.md
   - Allowlist DSL: allowlist-dsl.md
-  - Undeclared Egress: undeclared.md
+  - Triage: triage.md
   - pytest Plugin: pytest-plugin.md
   - Docker: docker.md
   - Python API: python-api.md

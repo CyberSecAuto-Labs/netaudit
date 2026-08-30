@@ -50,11 +50,11 @@ netaudit run --suggest-rules -- pytest
 
 # Save a report, then review undeclared egress across many saved runs
 netaudit run --format json --output report.json -- pytest
-netaudit undeclared reports/*.json
+netaudit triage reports/*.json
 ```
 
-`undeclared` reports what those runs touched that your allowlist does not permit — candidates
-to triage, not recommendations. See [Undeclared Egress](undeclared.md).
+`triage` reports what those runs touched that your allowlist does not permit — candidates
+to review, not recommendations. See [Triage](triage.md).
 
 Exit codes for `netaudit run`:
 
@@ -75,7 +75,7 @@ Exit codes for `netaudit analyze`:
 | 0 | No violations found in log |
 | 1 | One or more violations found |
 
-Exit codes for `netaudit undeclared`:
+Exit codes for `netaudit triage`:
 
 | Code | Meaning |
 |------|---------|
@@ -83,7 +83,7 @@ Exit codes for `netaudit undeclared`:
 | 1 | Undeclared egress found |
 | 2 | A report could not be read, or its schema version is unsupported |
 
-`analyze` and `undeclared` wrap nothing, so they keep the whole exit-code space and use `1`
+`analyze` and `triage` wrap nothing, so they keep the whole exit-code space and use `1`
 for findings. See the [CLI reference](cli-reference.md#exit-codes) for details.
 
 ## How it works

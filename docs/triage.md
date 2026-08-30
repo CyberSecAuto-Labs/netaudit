@@ -1,6 +1,6 @@
-# Reviewing undeclared egress
+# Triaging undeclared egress
 
-`netaudit undeclared` reports the egress that earlier runs observed but your allowlist does
+`netaudit triage` reports the egress that earlier runs observed but your allowlist does
 not permit, merged into one reviewable set with the evidence behind each entry.
 
 ## What this command does and does not claim
@@ -17,7 +17,7 @@ not permit, merged into one reviewable set with the evidence behind each entry.
 
 ## How it differs from `--suggest-rules`
 
-| | `--suggest-rules` | `netaudit undeclared` |
+| | `--suggest-rules` | `netaudit triage` |
 |---|---|---|
 | Question | *What would unblock the run I just did?* | *What undeclared egress have these runs observed?* |
 | Input | The run in progress | One or more saved reports |
@@ -48,7 +48,7 @@ too. Upload the directory as a CI artifact.
 ### 2. Suggest rules across them
 
 ```bash
-netaudit undeclared reports/*.json
+netaudit triage reports/*.json
 ```
 
 ```yaml
@@ -115,7 +115,7 @@ Pass your current allowlist and only the delta is emitted — the destinations y
 already decided about:
 
 ```bash
-netaudit undeclared --allowlist netaudit.yaml reports/*.json
+netaudit triage --allowlist netaudit.yaml reports/*.json
 ```
 
 Filtering uses the real rule engine, so CIDR blocks and port scoping are honoured.
@@ -129,14 +129,14 @@ Filtering uses the real rule engine, so CIDR blocks and port scoping are honoure
 | 2 | A report could not be read, or its schema version is unsupported |
 
 This is the same sense as `run` and `analyze` — non-zero means something needs attention —
-so `undeclared` works as a CI gate with no extra flag:
+so `triage` works as a CI gate with no extra flag:
 
 ```yaml
 - name: Assert no new undeclared egress
-  run: netaudit undeclared --allowlist netaudit.yaml reports/*.json
+  run: netaudit triage --allowlist netaudit.yaml reports/*.json
 ```
 
-Status messages go to stderr, so `netaudit undeclared ... > rules.yaml` only ever writes YAML.
+Status messages go to stderr, so `netaudit triage ... > rules.yaml` only ever writes YAML.
 
 Reports whose schema version this netaudit does not recognise are refused rather than
 parsed optimistically — misreading evidence is worse than failing.
@@ -147,5 +147,5 @@ parsed optimistically — misreading evidence is worse than failing.
 `total_reports`, `external` and `tests` per rule.
 
 ```bash
-netaudit undeclared --format json reports/*.json
+netaudit triage --format json reports/*.json
 ```

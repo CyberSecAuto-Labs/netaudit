@@ -64,14 +64,14 @@ Save a report from each CI run, then review the egress they observed that your a
 does not permit:
 
 ```bash
-netaudit undeclared reports/*.json
+netaudit triage reports/*.json
 ```
 
 Each entry is annotated with how many connections were seen, which reports saw it, whether
 the address is on the public internet, and which tests were responsible. These are
 candidates to triage, not recommendations — netaudit cannot tell a dependency phoning home
 from your own API, so which of them belong in the allowlist is your call.
-See [Undeclared Egress](https://netaudit.readthedocs.io/en/latest/undeclared/).
+See [Triage](https://netaudit.readthedocs.io/en/latest/triage/).
 
 Violations are printed in red on a terminal; pass `--no-color` or set `NO_COLOR=1` to
 turn that off.
@@ -82,7 +82,7 @@ its failure.
 **Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · `85` allowlist
 rejected · any other value is the traced command's own exit code, passed through.
 
-`analyze` and `undeclared` wrap nothing, so they use `0` clean · `1` findings · `2` bad input.
+`analyze` and `triage` wrap nothing, so they use `0` clean · `1` findings · `2` bad input.
 
 ## pytest plugin
 
