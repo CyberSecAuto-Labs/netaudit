@@ -29,7 +29,7 @@ from netaudit.runner import StraceNotFoundError, StraceRunner
 
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
 
-# Exit codes for `analyze` and `undeclared`, which wrap no child process.
+# Exit codes for `analyze` and `triage`, which wrap no child process.
 _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
 _EXIT_BAD_INPUT = 2
@@ -352,7 +352,7 @@ def analyze_cmd(
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
 
 
-@main.command("undeclared")
+@main.command("triage")
 @click.option(
     "--allowlist",
     default=None,
@@ -382,14 +382,14 @@ def analyze_cmd(
     help="Write the rules to PATH instead of stdout (never coloured).",
 )
 @click.argument("reports", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False))
-def undeclared_cmd(
+def triage_cmd(
     allowlist: str | None,
     fmt: str,
     no_color: bool,
     output: str | None,
     reports: tuple[str, ...],
 ) -> None:
-    """Report egress observed across saved JSON REPORTS that is not allowed.
+    """Triage the egress observed across saved JSON REPORTS that is not allowed.
 
     Merges the destinations those runs reached but the allowlist does not permit,
     and renders them as candidate rules annotated with the evidence behind each.
@@ -397,7 +397,8 @@ def undeclared_cmd(
     These are candidates to review, not recommendations: the reports contain
     violations, and netaudit cannot distinguish egress nobody has declared yet
     from egress that should never have happened. Which of them belong in the
-    allowlist is the reviewer's decision.
+    allowlist is the reviewer's decision — hence `triage` rather than a name
+    that implies the tool is advising.
 
     Exits 1 when undeclared egress is found and 0 when there is none, matching
     `analyze`, so it works directly as a CI assertion. (`run` reserves 83 for
