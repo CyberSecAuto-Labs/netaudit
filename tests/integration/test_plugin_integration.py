@@ -347,7 +347,7 @@ class TestPluginSuggestRules:
 
 
 class TestPluginSavedReport:
-    """The saved report is the durable input `netaudit undeclared` will consume."""
+    """The saved report is the durable input `netaudit triage` will consume."""
 
     _EGRESS = """
         def test_external():
@@ -394,7 +394,7 @@ class TestPluginSavedReport:
 
 
 class TestSuggestFromPluginReport:
-    """End-to-end: a plugin report feeds `netaudit undeclared` with test attribution."""
+    """End-to-end: a plugin report feeds `netaudit triage` with test attribution."""
 
     _EGRESS = """
         def test_external():
@@ -417,7 +417,7 @@ class TestSuggestFromPluginReport:
         pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
 
         out = subprocess.run(
-            [_netaudit_bin(), "undeclared", str(report)],
+            [_netaudit_bin(), "triage", str(report)],
             capture_output=True,
             text=True,
         )
@@ -439,7 +439,7 @@ class TestSuggestFromPluginReport:
         rules = pytester.path / "rules.yaml"
         # Not check=True: finding undeclared egress is a non-zero exit by design.
         suggested = subprocess.run(
-            [_netaudit_bin(), "undeclared", "--output", str(rules), str(report)],
+            [_netaudit_bin(), "triage", "--output", str(rules), str(report)],
             capture_output=True,
             text=True,
         )
@@ -454,7 +454,7 @@ class TestSuggestFromPluginReport:
 
         # And the detector agrees: nothing undeclared remains against that allowlist.
         recheck = subprocess.run(
-            [_netaudit_bin(), "undeclared", "--allowlist", str(allowlist), str(report)],
+            [_netaudit_bin(), "triage", "--allowlist", str(allowlist), str(report)],
             capture_output=True,
             text=True,
         )

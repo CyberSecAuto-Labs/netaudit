@@ -639,7 +639,7 @@ class TestOutputFile:
 
 
 # ---------------------------------------------------------------------------
-# netaudit undeclared
+# netaudit triage
 # ---------------------------------------------------------------------------
 
 
@@ -673,17 +673,17 @@ _D2: dict[str, object] = {
 }
 
 
-class TestSuggestCommand:
+class TestTriageCommand:
     def test_clean_message_goes_to_stderr_not_stdout(self, tmp_path: Path) -> None:
         """stdout is data — a status line must not end up in a redirected rules file."""
         r = _report_file(tmp_path / "a.json")
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.stdout.strip() == ""
         assert "no undeclared egress" in result.stderr
 
     def test_emits_rules_from_one_report(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert "family: AF_INET" in result.output
         assert "addr: 198.51.100.1" in result.output
         assert "port: 443" in result.output
@@ -691,22 +691,22 @@ class TestSuggestCommand:
     def test_merges_across_reports(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert result.output.count("addr: 198.51.100.1") == 1
 
     def test_distinct_destinations_each_get_a_rule(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.output.count("- name:") == 2
 
     def test_exit_1_when_undeclared_egress_found(self, tmp_path: Path) -> None:
         """Same sense as `run` and `analyze`: non-zero means something needs attention."""
         r = _report_file(tmp_path / "a.json", _D1)
-        assert CliRunner().invoke(main, ["undeclared", str(r)]).exit_code == 1
+        assert CliRunner().invoke(main, ["triage", str(r)]).exit_code == 1
 
     def test_exit_0_when_nothing_undeclared(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json")
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.exit_code == 0
 
     def test_existing_allowlist_filters_known_destinations(self, tmp_path: Path) -> None:
@@ -715,7 +715,7 @@ class TestSuggestCommand:
         al.write_text(
             "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 198.51.100.1\n    port: 443\n"
         )
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(al), str(r)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(al), str(r)])
         assert "198.51.100.1" not in result.output
         assert "203.0.113.7" in result.output
 
@@ -725,33 +725,33 @@ class TestSuggestCommand:
         al.write_text(
             "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 198.51.100.1\n    port: 443\n"
         )
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(al), str(r)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(al), str(r)])
         assert result.exit_code == 0
 
     def test_json_format(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", "--format", "json", str(r)])
+        result = CliRunner().invoke(main, ["triage", "--format", "json", str(r)])
         data = json.loads(result.output)
         assert data["suggested_rules"][0]["addr"] == "198.51.100.1"
 
     def test_unreadable_report_reports_the_filename(self, tmp_path: Path) -> None:
         bad = tmp_path / "broken.json"
         bad.write_text("{not json")
-        result = CliRunner().invoke(main, ["undeclared", str(bad)])
+        result = CliRunner().invoke(main, ["triage", str(bad)])
         assert result.exit_code == 2
         assert "broken.json" in result.output
 
     def test_unknown_schema_version_is_refused(self, tmp_path: Path) -> None:
         bad = tmp_path / "future.json"
         bad.write_text(json.dumps({"version": 99, "summary": {"by_destination": []}}))
-        result = CliRunner().invoke(main, ["undeclared", str(bad)])
+        result = CliRunner().invoke(main, ["triage", str(bad)])
         assert result.exit_code == 2
         assert "version" in result.output
 
     def test_output_flag_writes_to_file(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
         out = tmp_path / "rules.yaml"
-        CliRunner().invoke(main, ["undeclared", "--output", str(out), str(r)])
+        CliRunner().invoke(main, ["triage", "--output", str(out), str(r)])
         assert "addr: 198.51.100.1" in out.read_text()
 
 
@@ -771,14 +771,14 @@ class TestSuggestEvidence:
     def test_yaml_output_carries_evidence(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "across 2 runs" in result.output
         assert "2/2 runs" in result.output
         assert "a.json" in result.output and "b.json" in result.output
 
     def test_header_frames_output_as_a_question(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         assert "Undeclared egress observed" in result.output
         assert "not a recommendation" in result.output
 
@@ -786,19 +786,19 @@ class TestSuggestEvidence:
         """The case the rarity heuristic missed: consistent, high-volume, public."""
         a = _report_file(tmp_path / "a.json", _EXTERNAL)
         b = _report_file(tmp_path / "b.json", _EXTERNAL)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "external host reached on every run (2/2)" in result.output
         assert "never declared" in result.output
 
     def test_intermittent_external_egress_is_flagged(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _EXTERNAL, _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "external host reached in 1 of 2 runs" in result.output
 
     def test_internal_egress_is_not_flagged(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         assert "never declared" not in result.output
         assert "internal" in result.output
 
@@ -806,14 +806,14 @@ class TestSuggestEvidence:
         d = dict(_D1)
         d["tests"] = ["tests/test_api.py::test_fetch"]
         r = _report_file(tmp_path / "a.json", d)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert "tests/test_api.py::test_fetch" in result.output
 
     def test_output_still_parses_as_yaml(self, tmp_path: Path) -> None:
         import yaml as _yaml
 
         a = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         rules = _yaml.safe_load(result.output)
         assert len(rules) == 2
         assert {r["addr"] for r in rules} == {"198.51.100.1", "203.0.113.7"}
@@ -824,9 +824,7 @@ class TestSuggestEvidence:
         from netaudit.parser import ConnectEvent
 
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(
-            main, ["undeclared", "--output", str(tmp_path / "s.yaml"), str(r)]
-        )
+        result = CliRunner().invoke(main, ["triage", "--output", str(tmp_path / "s.yaml"), str(r)])
         assert result.exit_code == 1
         al_file = tmp_path / "al.yaml"
         al_file.write_text("version: 1\nallowlist:\n" + (tmp_path / "s.yaml").read_text())
@@ -855,7 +853,7 @@ class TestSuggestEvidence:
     def test_json_output_carries_evidence(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", "--format", "json", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", "--format", "json", str(a), str(b)])
         rule = json.loads(result.output)["suggested_rules"][0]
         assert rule["count"] == 6
         assert rule["reports"] == ["a.json", "b.json"]
@@ -954,12 +952,12 @@ class TestRunReservedCodesAreDistinct:
         assert "netaudit: Unsupported allowlist version" in result.output
         assert "Traceback" not in result.output
 
-    def test_undeclared_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
+    def test_triage_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
         report = tmp_path / "r.json"
         report.write_text('{"version": 1, "violations": [], "summary": {"by_destination": []}}')
         bad = tmp_path / "bad.yaml"
         bad.write_text("version: 2\nallowlist: []\n")
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(bad), str(report)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(bad), str(report)])
         assert result.exit_code == 2
         assert "netaudit: Unsupported allowlist version" in result.output
 
