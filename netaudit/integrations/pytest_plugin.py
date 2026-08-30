@@ -264,7 +264,7 @@ def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) ->
 
     This is the only place test attribution survives into a durable artifact —
     the CLI has no notion of tests — so ``summary.by_destination[].tests`` is
-    populated here for later consumers such as ``netaudit undeclared``.
+    populated here for later consumers such as ``netaudit triage``.
     """
     merged, tests_by_key = _merge_by_destination(violations_by_test)
     body = Reporter.format_json(
@@ -430,7 +430,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--netaudit-report",
         metavar="PATH",
         default=None,
-        help="Write a JSON report to PATH for later analysis (e.g. netaudit undeclared).",
+        help="Write a JSON report to PATH for later analysis (e.g. netaudit triage).",
     )
     group.addoption(
         "--netaudit-suggest-rules",
