@@ -175,6 +175,31 @@ Violations that happen outside of any test (e.g. during session setup) are group
    passing session — it never overwrites a more severe pytest status such as an internal
    or usage error, so a violation cannot mask a worse failure.
 
+## Cancelling a run
+
+The trace is written to a temp file that only exists for the length of the run, and cancelling
+one cleans it up:
+
+| How the run ends | Temp files | Traced processes |
+|---|---|---|
+| Ctrl-C (SIGINT) | removed | none left |
+| SIGTERM — CI cancellation, `docker stop`, `timeout` | removed | none left |
+| SIGKILL | swept by a later run | none left |
+
+SIGKILL cannot be handled, so nothing runs to clean up after it. Two files are left behind —
+`netaudit-*.strace` and `netaudit-*.markers` in the system temp directory — and the next netaudit
+run deletes them once they are a day old and the process that created them is gone. The traced
+suite itself is not orphaned: netaudit passes `--kill-on-exit` to strace where it is supported
+(5.2+), so the kernel takes the tracees down with it.
+
+The same applies to a cancellation that lands in the first second of a run, before the traced
+pytest has taken ownership of the files.
+
+Signal the process group rather than the pytest pid alone — `kill -TERM -<pgid>`, which is what CI
+cancellation and `timeout` already do. The re-exec means the original pid *is* strace, and strace
+answers a SIGTERM aimed at it by detaching and exiting, which leaves the suite it was tracing to
+run to completion untraced.
+
 ## Example allowlist
 
 ```yaml

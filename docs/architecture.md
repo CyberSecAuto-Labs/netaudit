@@ -10,7 +10,7 @@ netaudit/
 ├── parser.py          # Parses strace lines → ConnectEvent
 ├── allowlist.py       # YAML-driven rule engine
 ├── reporter.py        # Groups violations, formats output
-├── cli.py             # CLI entry point (run / analyze / undeclared)
+├── cli.py             # CLI entry point (run / analyze / triage)
 └── integrations/
     └── pytest_plugin.py   # pytest integration (test attribution)
 ```
@@ -52,7 +52,7 @@ merge_reports()       ← one MergedDestination per (family, addr, port)
 format_suggestions_with_evidence()  → allowlist YAML + provenance comments
 ```
 
-This is what `netaudit undeclared` runs. Reports carry a schema `version`, and one whose
+This is what `netaudit triage` runs. Reports carry a schema `version`, and one whose
 version is unrecognised is refused rather than parsed optimistically.
 
 ---
@@ -145,7 +145,7 @@ Both accept `--allowlist` (defaults to `netaudit.yaml` in cwd) and `--format {te
 Exit codes: **0** clean, **83** violations, **84** strace missing, anything else the traced
 command's own status passed through. `run` shares its exit space with the process it wraps,
 so violations take a reserved code and a failing command is never masked; `analyze` and
-`undeclared` wrap nothing and use **1** for findings.
+`triage` wrap nothing and use **1** for findings.
 
 ---
 

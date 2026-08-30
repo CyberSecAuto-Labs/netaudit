@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +24,7 @@ from typing import Any, Generator
 
 import pytest
 
+from netaudit import _tempfiles
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import (
@@ -37,9 +37,11 @@ from netaudit.reporter import (
     build_run_metadata,
     supports_color,
 )
+from netaudit.runner import _strace_cmd
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
+_ENV_TRACER_PID = "NETAUDIT_TRACER_PID"
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
 
 
@@ -147,6 +149,34 @@ def _attribute_violations(
     return {nodeid: _group_events(evts) for nodeid, evts in by_test.items()}
 
 
+def _owns_the_run() -> bool:
+    """Whether this process is the traced session rather than a descendant of it.
+
+    ``execvpe`` preserves the pid, so the process that re-executed itself
+    *becomes* strace, and the pytest strace forks is its direct child. Anything
+    deeper — a test that shells out to pytest, an xdist worker — inherits the
+    same environment while pointing at a run that is still in progress. It must
+    neither report on that run's trace nor delete it.
+
+    An absent marker means the environment was set by hand rather than by the
+    re-exec; there is nothing to compare against, so ownership is assumed.
+    """
+    tracer_pid = os.environ.get(_ENV_TRACER_PID)
+    return tracer_pid is None or tracer_pid == str(os.getppid())
+
+
+def _is_xdist_worker(config: pytest.Config) -> bool:
+    """True inside a pytest-xdist worker, which runs *this* session's tests.
+
+    A worker is a descendant of the traced session, so :func:`_owns_the_run`
+    disowns it, but the tests it runs are the run's own and their markers
+    belong in the run's file. (Ranges from parallel workers can overlap, and
+    attribution resolves that first-match — a limitation of ``-n`` itself, not
+    of this check.)
+    """
+    return hasattr(config, "workerinput")
+
+
 def _pyproject_netaudit() -> dict[str, Any]:
     """Read the ``[tool.netaudit]`` table from *pyproject.toml* in the cwd.
 
@@ -234,7 +264,7 @@ def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) ->
 
     This is the only place test attribution survives into a durable artifact —
     the CLI has no notion of tests — so ``summary.by_destination[].tests`` is
-    populated here for later consumers such as ``netaudit undeclared``.
+    populated here for later consumers such as ``netaudit triage``.
     """
     merged, tests_by_key = _merge_by_destination(violations_by_test)
     body = Reporter.format_json(
@@ -400,7 +430,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--netaudit-report",
         metavar="PATH",
         default=None,
-        help="Write a JSON report to PATH for later analysis (e.g. netaudit undeclared).",
+        help="Write a JSON report to PATH for later analysis (e.g. netaudit triage).",
     )
     group.addoption(
         "--netaudit-suggest-rules",
@@ -421,39 +451,50 @@ def pytest_configure(config: pytest.Config) -> None:
 
     Enabled via ``--netaudit`` or ``enabled = true`` in ``[tool.netaudit]``.
     """
-    if not _resolve_enabled(config) or os.environ.get(_ENV_STRACE_OUT):
-        return  # disabled or already running under strace
+    strace_out = os.environ.get(_ENV_STRACE_OUT)
+    if strace_out:
+        # Already running under strace. The process that made these files is
+        # gone — execvpe replaced it — so this one owns removing them, and its
+        # sessionfinish is only reached if the run is allowed to finish.
+        if not _owns_the_run():
+            return
+        markers_out = os.environ.get(_ENV_MARKERS_OUT)
+        paths = [Path(strace_out)]
+        if markers_out:
+            paths.append(Path(markers_out))
+        _tempfiles.remove_on_cancel(*paths)
+        return
+
+    if not _resolve_enabled(config):
+        return
 
     if shutil.which("strace") is None:
         raise pytest.UsageError(
             "netaudit: strace is not available on PATH — install it (e.g. apt install strace)."
         )
 
-    strace_fd, strace_path = tempfile.mkstemp(suffix=".strace", prefix="netaudit-")
-    os.close(strace_fd)
-    markers_fd, markers_path = tempfile.mkstemp(suffix=".markers", prefix="netaudit-")
-    os.close(markers_fd)
+    # A SIGKILLed run cannot clean up after itself; the next one does it for it.
+    _tempfiles.sweep_stale()
+
+    strace_path = str(_tempfiles.create(".strace"))
+    markers_path = str(_tempfiles.create(".markers"))
 
     env = {
         **os.environ,
         _ENV_STRACE_OUT: strace_path,
         _ENV_MARKERS_OUT: markers_path,
+        # Survives the exec as strace's own pid, which is what the pytest it
+        # forks will see as its parent — and no deeper process will.
+        _ENV_TRACER_PID: str(os.getpid()),
     }
     # Reconstruct as `python -m pytest <args>` so the command is valid regardless
     # of whether pytest was invoked via its entry-point script or `python -m pytest`
     # (in the latter case sys.argv[0] is the non-executable __main__.py path).
-    cmd = [
-        "strace",
-        "-e",
-        "trace=connect",
-        "-f",
-        "-tt",
-        "-o",
-        strace_path,
-        sys.executable,
-        "-m",
-        "pytest",
-    ] + sys.argv[1:]
+    #
+    # The strace flags come from the runner rather than being spelled out again:
+    # a second copy would drift, and the copy that lost --kill-on-exit would go
+    # back to orphaning its tracees without anything failing to say so.
+    cmd = _strace_cmd(Path(strace_path)) + [sys.executable, "-m", "pytest"] + sys.argv[1:]
     os.execvpe("strace", cmd, env)
     # unreachable — execvpe replaces the current process image
 
@@ -463,7 +504,8 @@ def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
-    markers_path = os.environ.get(_ENV_MARKERS_OUT)
+    writes_markers = _owns_the_run() or _is_xdist_worker(item.config)
+    markers_path = os.environ.get(_ENV_MARKERS_OUT) if writes_markers else None
     location = _item_location(item)
     if markers_path:
         ts = _now_ts()
@@ -486,6 +528,8 @@ def pytest_sessionfinish(
     strace_path = os.environ.get(_ENV_STRACE_OUT)
     if not strace_path:
         return
+    if not _owns_the_run():
+        return  # a nested pytest: the trace belongs to a run still in progress
 
     markers_path_str = os.environ.get(_ENV_MARKERS_OUT)
     strace_file = Path(strace_path)

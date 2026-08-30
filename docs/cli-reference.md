@@ -41,10 +41,14 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | 83 | Command succeeded, but unallowed connections were detected |
 | 84 | `strace` binary not found on PATH |
 | 85 | The allowlist was rejected; the command was never started |
+| 86 | The run was cancelled by a signal; the traced command was stopped |
 | *other* | The traced command's own exit code, passed through unchanged |
 
 `run` wraps another process, so most of the exit-code space belongs to that process.
-`83`, `84` and `85` are netaudit's own; every other value is the command's, passed through.
+`83` to `86` are netaudit's own; every other value is the command's, passed through.
+
+A SIGTERM or SIGHUP aimed at `netaudit run` — `docker stop`, a CI cancellation — stops strace and
+the command it traces before exiting `86`, rather than leaving them running. Ctrl-C does the same.
 
 **A failing command takes precedence over violations.** A command that died part-way may
 have produced an incomplete trace, so its failure is the more reliable signal — but any
@@ -53,7 +57,7 @@ violations found are still printed.
 Whenever the traced command exits non-zero, netaudit writes
 `netaudit: traced command exited with N` to stderr and records `run.command_exit_code` in
 the JSON report. That also resolves the ambiguous cases: a command that itself exits
-`83`, `84` or `85`.
+`83`, `84`, `85` or `86`.
 
 !!! tip "Scripting against the result"
     Read the JSON report rather than the exit code. It states the command's status and the
@@ -197,20 +201,21 @@ The non-verbose report is already one row per destination, so no summary is adde
 In `--format json` the same data is always available under `summary.by_destination`,
 regardless of `--verbose`.
 
-## `netaudit undeclared`
+## `netaudit triage`
 
 ```
-netaudit undeclared [OPTIONS] REPORT [REPORT ...]
+netaudit triage [OPTIONS] REPORT [REPORT ...]
 ```
 
 Reports the egress that one or more **saved** JSON reports observed but the allowlist does
 not permit, merged across them with the evidence behind each entry. Entries are candidates
-to review, not recommendations — see [Undeclared Egress](undeclared.md) for the full workflow
-and how to read the annotations. Distinct from `--suggest-rules`, which describes only the run that just
-happened; `undeclared` answers what egress has been observed that the allowlist does not permit.
+to review, not recommendations — see [Triage](triage.md) for the full workflow and how to
+read the annotations. Distinct from `--suggest-rules`, which describes only the run that
+just happened; `triage` answers what egress has been observed that the allowlist does not
+permit.
 
 ```bash
-netaudit undeclared ci-reports/*.json
+netaudit triage ci-reports/*.json
 ```
 
 ### Options
@@ -230,11 +235,11 @@ netaudit undeclared ci-reports/*.json
 | 1 | Undeclared egress found |
 | 2 | A report could not be read, or its schema version is unsupported |
 
-Same sense as `run` and `analyze`: non-zero means something needs attention. `undeclared` can
+Same sense as `run` and `analyze`: non-zero means something needs attention. `triage` can
 therefore be used directly as a CI assertion, with no flag to flip its meaning:
 
 ```bash
-netaudit undeclared --allowlist netaudit.yaml reports/*.json
+netaudit triage --allowlist netaudit.yaml reports/*.json
 ```
 
 Status messages go to stderr, so a redirected rules file only ever contains YAML. Reports

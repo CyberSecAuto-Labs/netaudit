@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import signal
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
-from netaudit.cli import main
+from netaudit import _tempfiles
+from netaudit.cli import _cli_cancel_handler, main
 from netaudit.parser import ConnectEvent
 
 # ---------------------------------------------------------------------------
@@ -144,9 +148,8 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             # Prevent unlink from removing our fixture
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "echo", "hi"])
@@ -163,13 +166,114 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "curl", "8.8.8.8"])
 
         assert result.exit_code == 83
+
+    def _record_trace_path(self, recorded: list[Path]) -> MagicMock:
+        """A runner mock that writes a real trace to whatever path the CLI chose."""
+
+        def fake_run(command: list[str], output_path: Path) -> MagicMock:
+            recorded.append(output_path)
+            output_path.write_text(_STRACE_LOG_CLEAN)
+            return MagicMock(returncode=0)
+
+        mock_runner = MagicMock()
+        mock_runner.run.side_effect = fake_run
+        return mock_runner
+
+    def test_names_the_trace_file_so_a_later_run_can_sweep_it(self) -> None:
+        """An unprefixed temp name is unrecoverable once the run is SIGKILLed."""
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        assert len(recorded) == 1
+        assert recorded[0].name.startswith(_tempfiles.PREFIX)
+        assert recorded[0].suffix == ".strace"
+
+    def test_registers_the_trace_file_for_removal_on_cancellation(self) -> None:
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        assert recorded[0] in _tempfiles._TRACKED
+
+    def test_sweeps_traces_an_earlier_run_could_not_clean_up(self) -> None:
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path([])),
+            patch("netaudit.cli._tempfiles.sweep_stale") as sweep,
+        ):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+
+        sweep.assert_called_once()
+
+    def test_cancellation_stops_the_traced_command(self) -> None:
+        """SIGTERM to netaudit must not leave strace and the command running.
+
+        The runner reacts to KeyboardInterrupt by signalling the traced group,
+        so the handler's job is to turn the signal into one.
+        """
+        mock_runner = MagicMock()
+        mock_runner.run.side_effect = KeyboardInterrupt
+        with patch("netaudit.cli.StraceRunner", return_value=mock_runner):
+            result = CliRunner().invoke(main, ["run", "--", "sleep", "30"])
+
+        assert result.exit_code == 86
+        assert "cancel" in result.output.lower()
+
+    def test_sigterm_becomes_the_interrupt_the_runner_understands(self) -> None:
+        saved = {sig: signal.getsignal(sig) for sig in _tempfiles.CANCEL_SIGNALS}
+        mock_runner = MagicMock()
+        recorded: list[Path] = []
+        mock_runner.run.side_effect = lambda c, out: (
+            recorded.append(out),
+            out.write_text(_STRACE_LOG_CLEAN),
+            MagicMock(returncode=0),
+        )[-1]
+        try:
+            with patch("netaudit.cli.StraceRunner", return_value=mock_runner):
+                CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+            for sig in _tempfiles.CANCEL_SIGNALS:
+                with pytest.raises(KeyboardInterrupt):
+                    _cli_cancel_handler(sig)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
+    def test_the_cleanup_handler_runs_before_the_interrupt(self) -> None:
+        """netaudit's own handler must chain to this one, not replace it.
+
+        Installed first so the temp-file handler records it as its predecessor;
+        the other order would delete the file and never stop the command.
+        """
+        saved = {sig: signal.getsignal(sig) for sig in _tempfiles.CANCEL_SIGNALS}
+        recorded: list[Path] = []
+        with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path(recorded)):
+            CliRunner().invoke(main, ["run", "--", "echo", "hi"])
+        try:
+            for sig in _tempfiles.CANCEL_SIGNALS:
+                assert _tempfiles._PREVIOUS[sig] is _cli_cancel_handler
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
+    def test_a_cli_started_off_the_main_thread_still_runs(self) -> None:
+        """signal.signal() only works on the main thread; the run must go on."""
+        results: list[int] = []
+
+        def invoke() -> None:
+            with patch("netaudit.cli.StraceRunner", return_value=self._record_trace_path([])):
+                results.append(CliRunner().invoke(main, ["run", "--", "echo", "hi"]).exit_code)
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        thread.join()
+
+        assert results == [0]
 
     def test_json_format(self, tmp_path: Path) -> None:
         strace_log = tmp_path / "out.strace"
@@ -180,9 +284,8 @@ class TestRunCommand:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(
                     main, ["run", "--format", "json", "--", "curl", "8.8.8.8"]
@@ -265,9 +368,8 @@ class TestVerboseFlag:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--verbose", "--", "echo", "hi"])
 
@@ -284,9 +386,8 @@ class TestVerboseFlag:
 
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(
                     main, ["run", "--verbose", "--format", "json", "--", "curl", "8.8.8.8"]
@@ -538,7 +639,7 @@ class TestOutputFile:
 
 
 # ---------------------------------------------------------------------------
-# netaudit undeclared
+# netaudit triage
 # ---------------------------------------------------------------------------
 
 
@@ -572,17 +673,17 @@ _D2: dict[str, object] = {
 }
 
 
-class TestSuggestCommand:
+class TestTriageCommand:
     def test_clean_message_goes_to_stderr_not_stdout(self, tmp_path: Path) -> None:
         """stdout is data — a status line must not end up in a redirected rules file."""
         r = _report_file(tmp_path / "a.json")
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.stdout.strip() == ""
         assert "no undeclared egress" in result.stderr
 
     def test_emits_rules_from_one_report(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert "family: AF_INET" in result.output
         assert "addr: 198.51.100.1" in result.output
         assert "port: 443" in result.output
@@ -590,22 +691,22 @@ class TestSuggestCommand:
     def test_merges_across_reports(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert result.output.count("addr: 198.51.100.1") == 1
 
     def test_distinct_destinations_each_get_a_rule(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.output.count("- name:") == 2
 
     def test_exit_1_when_undeclared_egress_found(self, tmp_path: Path) -> None:
         """Same sense as `run` and `analyze`: non-zero means something needs attention."""
         r = _report_file(tmp_path / "a.json", _D1)
-        assert CliRunner().invoke(main, ["undeclared", str(r)]).exit_code == 1
+        assert CliRunner().invoke(main, ["triage", str(r)]).exit_code == 1
 
     def test_exit_0_when_nothing_undeclared(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json")
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert result.exit_code == 0
 
     def test_existing_allowlist_filters_known_destinations(self, tmp_path: Path) -> None:
@@ -614,7 +715,7 @@ class TestSuggestCommand:
         al.write_text(
             "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 198.51.100.1\n    port: 443\n"
         )
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(al), str(r)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(al), str(r)])
         assert "198.51.100.1" not in result.output
         assert "203.0.113.7" in result.output
 
@@ -624,33 +725,33 @@ class TestSuggestCommand:
         al.write_text(
             "version: 1\nallowlist:\n  - family: AF_INET\n    addr: 198.51.100.1\n    port: 443\n"
         )
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(al), str(r)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(al), str(r)])
         assert result.exit_code == 0
 
     def test_json_format(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", "--format", "json", str(r)])
+        result = CliRunner().invoke(main, ["triage", "--format", "json", str(r)])
         data = json.loads(result.output)
         assert data["suggested_rules"][0]["addr"] == "198.51.100.1"
 
     def test_unreadable_report_reports_the_filename(self, tmp_path: Path) -> None:
         bad = tmp_path / "broken.json"
         bad.write_text("{not json")
-        result = CliRunner().invoke(main, ["undeclared", str(bad)])
+        result = CliRunner().invoke(main, ["triage", str(bad)])
         assert result.exit_code == 2
         assert "broken.json" in result.output
 
     def test_unknown_schema_version_is_refused(self, tmp_path: Path) -> None:
         bad = tmp_path / "future.json"
         bad.write_text(json.dumps({"version": 99, "summary": {"by_destination": []}}))
-        result = CliRunner().invoke(main, ["undeclared", str(bad)])
+        result = CliRunner().invoke(main, ["triage", str(bad)])
         assert result.exit_code == 2
         assert "version" in result.output
 
     def test_output_flag_writes_to_file(self, tmp_path: Path) -> None:
         r = _report_file(tmp_path / "a.json", _D1)
         out = tmp_path / "rules.yaml"
-        CliRunner().invoke(main, ["undeclared", "--output", str(out), str(r)])
+        CliRunner().invoke(main, ["triage", "--output", str(out), str(r)])
         assert "addr: 198.51.100.1" in out.read_text()
 
 
@@ -670,14 +771,14 @@ class TestSuggestEvidence:
     def test_yaml_output_carries_evidence(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "across 2 runs" in result.output
         assert "2/2 runs" in result.output
         assert "a.json" in result.output and "b.json" in result.output
 
     def test_header_frames_output_as_a_question(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         assert "Undeclared egress observed" in result.output
         assert "not a recommendation" in result.output
 
@@ -685,19 +786,19 @@ class TestSuggestEvidence:
         """The case the rarity heuristic missed: consistent, high-volume, public."""
         a = _report_file(tmp_path / "a.json", _EXTERNAL)
         b = _report_file(tmp_path / "b.json", _EXTERNAL)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "external host reached on every run (2/2)" in result.output
         assert "never declared" in result.output
 
     def test_intermittent_external_egress_is_flagged(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _EXTERNAL, _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", str(a), str(b)])
         assert "external host reached in 1 of 2 runs" in result.output
 
     def test_internal_egress_is_not_flagged(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         assert "never declared" not in result.output
         assert "internal" in result.output
 
@@ -705,14 +806,14 @@ class TestSuggestEvidence:
         d = dict(_D1)
         d["tests"] = ["tests/test_api.py::test_fetch"]
         r = _report_file(tmp_path / "a.json", d)
-        result = CliRunner().invoke(main, ["undeclared", str(r)])
+        result = CliRunner().invoke(main, ["triage", str(r)])
         assert "tests/test_api.py::test_fetch" in result.output
 
     def test_output_still_parses_as_yaml(self, tmp_path: Path) -> None:
         import yaml as _yaml
 
         a = _report_file(tmp_path / "a.json", _D1, _D2)
-        result = CliRunner().invoke(main, ["undeclared", str(a)])
+        result = CliRunner().invoke(main, ["triage", str(a)])
         rules = _yaml.safe_load(result.output)
         assert len(rules) == 2
         assert {r["addr"] for r in rules} == {"198.51.100.1", "203.0.113.7"}
@@ -723,9 +824,7 @@ class TestSuggestEvidence:
         from netaudit.parser import ConnectEvent
 
         r = _report_file(tmp_path / "a.json", _D1)
-        result = CliRunner().invoke(
-            main, ["undeclared", "--output", str(tmp_path / "s.yaml"), str(r)]
-        )
+        result = CliRunner().invoke(main, ["triage", "--output", str(tmp_path / "s.yaml"), str(r)])
         assert result.exit_code == 1
         al_file = tmp_path / "al.yaml"
         al_file.write_text("version: 1\nallowlist:\n" + (tmp_path / "s.yaml").read_text())
@@ -754,7 +853,7 @@ class TestSuggestEvidence:
     def test_json_output_carries_evidence(self, tmp_path: Path) -> None:
         a = _report_file(tmp_path / "a.json", _D1)
         b = _report_file(tmp_path / "b.json", _D1)
-        result = CliRunner().invoke(main, ["undeclared", "--format", "json", str(a), str(b)])
+        result = CliRunner().invoke(main, ["triage", "--format", "json", str(a), str(b)])
         rule = json.loads(result.output)["suggested_rules"][0]
         assert rule["count"] == 6
         assert rule["reports"] == ["a.json", "b.json"]
@@ -777,9 +876,8 @@ class TestRunExitCodes:
         mock_runner.run.return_value = MagicMock(returncode=returncode)
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 return CliRunner().invoke(main, ["run", *args, "--", "pytest"])
 
@@ -835,9 +933,8 @@ class TestRunReservedCodesAreDistinct:
         mock_runner.run.return_value = MagicMock(returncode=2)
         with (
             patch("netaudit.cli.StraceRunner", return_value=mock_runner),
-            patch("netaudit.cli.tempfile.NamedTemporaryFile") as mock_tf,
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
         ):
-            mock_tf.return_value.__enter__.return_value.name = str(strace_log)
             with patch("pathlib.Path.unlink"):
                 result = CliRunner().invoke(main, ["run", "--", "pytest"])
         assert result.exit_code == 2
@@ -855,18 +952,19 @@ class TestRunReservedCodesAreDistinct:
         assert "netaudit: Unsupported allowlist version" in result.output
         assert "Traceback" not in result.output
 
-    def test_undeclared_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
+    def test_triage_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
         report = tmp_path / "r.json"
         report.write_text('{"version": 1, "violations": [], "summary": {"by_destination": []}}')
         bad = tmp_path / "bad.yaml"
         bad.write_text("version: 2\nallowlist: []\n")
-        result = CliRunner().invoke(main, ["undeclared", "--allowlist", str(bad), str(report)])
+        result = CliRunner().invoke(main, ["triage", "--allowlist", str(bad), str(report)])
         assert result.exit_code == 2
         assert "netaudit: Unsupported allowlist version" in result.output
 
     def test_reserved_codes_do_not_overlap(self) -> None:
         from netaudit.cli import (
             _EXIT_BAD_ALLOWLIST,
+            _EXIT_CANCELLED,
             _EXIT_CLEAN,
             _EXIT_STRACE_MISSING,
             _EXIT_TRACED_VIOLATIONS,
@@ -877,13 +975,15 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_TRACED_VIOLATIONS,
             _EXIT_STRACE_MISSING,
             _EXIT_BAD_ALLOWLIST,
+            _EXIT_CANCELLED,
         }
-        assert len(codes) == 4
+        assert len(codes) == 5
         # Every netaudit-originated code sits in the band left clear of sysexits,
         # the Linux socket errno block, shell codes and signal-derived values.
         assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
         assert 79 <= _EXIT_STRACE_MISSING <= 87
         assert 79 <= _EXIT_BAD_ALLOWLIST <= 87
+        assert 79 <= _EXIT_CANCELLED <= 87
 
     def test_run_never_borrows_an_exit_code_the_command_could_return(self) -> None:
         # The whole point of the reserved band: `run` passes the traced

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import sys
-import tempfile
 from pathlib import Path
+from types import FrameType
+from typing import NoReturn
 
 import click
 
-from netaudit import __version__
+from netaudit import __version__, _tempfiles
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, StraceParser
 from netaudit.reporter import (
@@ -27,18 +29,42 @@ from netaudit.runner import StraceNotFoundError, StraceRunner
 
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
 
-# Exit codes for `analyze` and `undeclared`, which wrap no child process.
+# Exit codes for `analyze` and `triage`, which wrap no child process.
 _EXIT_CLEAN = 0
 _EXIT_VIOLATIONS = 1
 _EXIT_BAD_INPUT = 2
 
 # Reserved for `run`. Every other value belongs to the traced command and is
 # passed through, so these sit clear of the ranges a wrapped process may use.
-# A netaudit-side failure must never borrow a value the child could return —
-# exiting 2 here would be indistinguishable from a suite that exited 2.
 _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
 _EXIT_BAD_ALLOWLIST = 85
+_EXIT_CANCELLED = 86
+
+
+def _cli_cancel_handler(signum: int, frame: FrameType | None = None) -> NoReturn:
+    """Turn a cancelling signal into the interrupt the runner already handles.
+
+    :meth:`StraceRunner.run` answers ``KeyboardInterrupt`` by signalling the
+    traced process group. Dying directly from SIGTERM would skip that and leave
+    strace — and the command it traces — running, which is what happens when
+    netaudit is PID 1 and something sends it a plain ``docker stop``.
+    """
+    raise KeyboardInterrupt
+
+
+def _handle_cancellation_as_interrupt() -> None:
+    """Install :func:`_cli_cancel_handler` for every cancelling signal.
+
+    Called before the temp file is created so that the cleanup handler records
+    this one as its predecessor and chains to it: unlink, then stop the command.
+    """
+    for sig in _tempfiles.CANCEL_SIGNALS:
+        try:
+            signal.signal(sig, _cli_cancel_handler)
+        except ValueError:
+            # Not the main thread — the run still has to happen.
+            return
 
 
 def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
@@ -217,11 +243,18 @@ def run_cmd(
 
     al = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
 
-    with tempfile.NamedTemporaryFile(suffix=".strace", delete=False) as tf:
-        strace_out = Path(tf.name)
+    # Recover the traces of earlier runs that were killed outright, then take a
+    # name the same sweep will recognise if this run is the one that is killed.
+    _handle_cancellation_as_interrupt()
+    _tempfiles.sweep_stale()
+    strace_out = _tempfiles.create(".strace")
 
     try:
-        completed = runner.run(list(command), strace_out)
+        try:
+            completed = runner.run(list(command), strace_out)
+        except KeyboardInterrupt:
+            click.echo("netaudit: cancelled; the traced command was stopped", err=True)
+            sys.exit(_EXIT_CANCELLED)
         command_code = completed.returncode
         events = StraceParser().parse_stream(strace_out.read_text().splitlines())
         violations = Reporter.check(events, al)
@@ -319,7 +352,7 @@ def analyze_cmd(
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
 
 
-@main.command("undeclared")
+@main.command("triage")
 @click.option(
     "--allowlist",
     default=None,
@@ -349,14 +382,14 @@ def analyze_cmd(
     help="Write the rules to PATH instead of stdout (never coloured).",
 )
 @click.argument("reports", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False))
-def undeclared_cmd(
+def triage_cmd(
     allowlist: str | None,
     fmt: str,
     no_color: bool,
     output: str | None,
     reports: tuple[str, ...],
 ) -> None:
-    """Report egress observed across saved JSON REPORTS that is not allowed.
+    """Triage the egress observed across saved JSON REPORTS that is not allowed.
 
     Merges the destinations those runs reached but the allowlist does not permit,
     and renders them as candidate rules annotated with the evidence behind each.
@@ -364,7 +397,8 @@ def undeclared_cmd(
     These are candidates to review, not recommendations: the reports contain
     violations, and netaudit cannot distinguish egress nobody has declared yet
     from egress that should never have happened. Which of them belong in the
-    allowlist is the reviewer's decision.
+    allowlist is the reviewer's decision — hence `triage` rather than a name
+    that implies the tool is advising.
 
     Exits 1 when undeclared egress is found and 0 when there is none, matching
     `analyze`, so it works directly as a CI assertion. (`run` reserves 83 for

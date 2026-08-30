@@ -347,7 +347,7 @@ class TestPluginSuggestRules:
 
 
 class TestPluginSavedReport:
-    """The saved report is the durable input `netaudit undeclared` will consume."""
+    """The saved report is the durable input `netaudit triage` will consume."""
 
     _EGRESS = """
         def test_external():
@@ -394,7 +394,7 @@ class TestPluginSavedReport:
 
 
 class TestSuggestFromPluginReport:
-    """End-to-end: a plugin report feeds `netaudit undeclared` with test attribution."""
+    """End-to-end: a plugin report feeds `netaudit triage` with test attribution."""
 
     _EGRESS = """
         def test_external():
@@ -417,7 +417,7 @@ class TestSuggestFromPluginReport:
         pytester.runpytest_subprocess("--netaudit", "--netaudit-report", str(report))
 
         out = subprocess.run(
-            [_netaudit_bin(), "undeclared", str(report)],
+            [_netaudit_bin(), "triage", str(report)],
             capture_output=True,
             text=True,
         )
@@ -439,7 +439,7 @@ class TestSuggestFromPluginReport:
         rules = pytester.path / "rules.yaml"
         # Not check=True: finding undeclared egress is a non-zero exit by design.
         suggested = subprocess.run(
-            [_netaudit_bin(), "undeclared", "--output", str(rules), str(report)],
+            [_netaudit_bin(), "triage", "--output", str(rules), str(report)],
             capture_output=True,
             text=True,
         )
@@ -454,9 +454,46 @@ class TestSuggestFromPluginReport:
 
         # And the detector agrees: nothing undeclared remains against that allowlist.
         recheck = subprocess.run(
-            [_netaudit_bin(), "undeclared", "--allowlist", str(allowlist), str(report)],
+            [_netaudit_bin(), "triage", "--allowlist", str(allowlist), str(report)],
             capture_output=True,
             text=True,
         )
         assert recheck.returncode == 0, recheck.stdout
         assert recheck.stdout.strip() == ""
+
+
+class TestNestedPytestRuns:
+    """A traced suite may run pytest itself; the outer run's files are not its to touch."""
+
+    def test_a_nested_pytest_leaves_the_outer_runs_trace_alone(
+        self, pytester: pytest.Pytester
+    ) -> None:
+        """The nested process inherits the environment pointing at a live trace.
+
+        Same shape as an xdist worker: it reaches sessionfinish long before the
+        run it inherited from, and deleting the trace there loses the audit.
+        """
+        pytester.makepyfile(
+            """
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+
+            def test_runs_its_own_pytest(tmp_path):
+                (tmp_path / "test_inner.py").write_text("def test_ok(): pass")
+                inner = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                    cwd=tmp_path,
+                    capture_output=True,
+                    text=True,
+                )
+                assert inner.returncode == 0, inner.stdout + inner.stderr
+                trace = Path(os.environ["NETAUDIT_STRACE_OUT"])
+                assert trace.exists(), "the nested run deleted the outer run's trace"
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
