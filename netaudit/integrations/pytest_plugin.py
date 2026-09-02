@@ -96,12 +96,12 @@ def _emit_canary(address: str) -> None:
     alike, so the run plants one connect() of its own: if it is missing from the
     trace, nothing else in the trace can be trusted either.
 
-    This catches breakage and tampering from outside the session — the address
-    is unique per run and is never written to the environment or the filesystem.
-    It cannot catch the tests themselves: they share this interpreter, so they
-    can read the address and the trace path out of :data:`_RUN` and rewrite the
-    trace around it. Auditing untrusted code means running it under
-    ``netaudit run --``, where the audit is a different process.
+    What this catches is a trace that never happened, was emptied, or vanished.
+    It is not a check against a rewritten one: the address is in the trace file
+    by construction, so anything that can write that file can keep the canary
+    line and drop the rest — the tests included, since they share this
+    interpreter and can read :data:`_RUN` outright. Auditing untrusted code
+    means ``netaudit run --``, where the audit is a different process.
     """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:

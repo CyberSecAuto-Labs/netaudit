@@ -65,9 +65,11 @@ profile blocked it, the trace did not survive the run — the session fails rath
 reporting the run as clean. "Nothing connected" and "nothing was watching" are not the same
 result.
 
-This is a check against breakage, not a sandbox. The tests share the interpreter that runs
-the audit, so code that sets out to defeat the check can reach its internals. Where the code
-under audit is not trusted, run it as a separate process under `netaudit run -- pytest`.
+This is a check against breakage, not a sandbox: it catches a trace that never happened, was
+emptied, or vanished, not one that was rewritten around the marker. The tests share the
+interpreter that runs the audit, so code that sets out to defeat the check can reach its
+internals. Where the code under audit is not trusted, run it as a separate process under
+`netaudit run -- pytest`.
 
 ## CLI options
 
