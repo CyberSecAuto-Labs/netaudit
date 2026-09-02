@@ -80,7 +80,8 @@ A failing command takes precedence over violations, so wrapping a test suite nev
 its failure.
 
 **Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · `85` allowlist
-rejected · any other value is the traced command's own exit code, passed through.
+rejected · `87` tracing failed · any other value is the traced command's own exit code,
+passed through.
 
 `analyze` and `triage` wrap nothing, so they use `0` clean · `1` findings · `2` bad input.
 
