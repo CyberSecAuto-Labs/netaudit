@@ -40,6 +40,7 @@ _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
 _EXIT_BAD_ALLOWLIST = 85
 _EXIT_CANCELLED = 86
+_EXIT_TRACE_FAILED = 87
 
 
 def _cli_cancel_handler(signum: int, frame: FrameType | None = None) -> NoReturn:
@@ -65,6 +66,13 @@ def _handle_cancellation_as_interrupt() -> None:
         except ValueError:
             # Not the main thread — the run still has to happen.
             return
+
+
+def _echo_strace_error(stderr: bytes | None) -> None:
+    """Relay what strace said when it could not trace, and nothing when it said nothing."""
+    message = (stderr or b"").decode("utf-8", errors="replace").strip()
+    if message:
+        click.echo(message, err=True)
 
 
 def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
@@ -256,7 +264,16 @@ def run_cmd(
             click.echo("netaudit: cancelled; the traced command was stopped", err=True)
             sys.exit(_EXIT_CANCELLED)
         command_code = completed.returncode
-        events = StraceParser().parse_stream(strace_out.read_text().splitlines())
+        trace = strace_out.read_text()
+        if command_code != 0 and not trace:
+            # strace records the command's exit even when it makes no connect()
+            # call, so an empty trace means the command never ran under it: no
+            # ptrace permission, a seccomp filter, an unusable command. Parsing
+            # that into zero violations would report it as a clean run.
+            click.echo(f"netaudit: strace wrote no trace and exited {command_code}", err=True)
+            _echo_strace_error(completed.stderr)
+            sys.exit(_EXIT_TRACE_FAILED)
+        events = StraceParser().parse_stream(trace.splitlines())
         violations = Reporter.check(events, al)
         _emit(
             violations,
