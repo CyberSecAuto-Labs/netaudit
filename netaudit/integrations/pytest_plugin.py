@@ -14,7 +14,9 @@ tests, and fails the session if any are found.
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
+import socket
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -54,6 +56,53 @@ def _now_ts() -> float:
     """Seconds-since-midnight — matches the strace ``-tt`` timestamp format."""
     now = datetime.now()
     return now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
+
+
+@dataclass
+class _TracedRun:
+    """The state and the policy of the run this process is the traced session of.
+
+    Settled in ``pytest_configure`` and never re-read: every input behind it —
+    *pyproject.toml*, the allowlist, the report destination — is named by a
+    relative path, and by the time ``pytest_sessionfinish`` runs, the cwd is
+    whatever the tests left it as. A test that chdirs into a directory of its
+    own would otherwise choose the allowlist it is judged against.
+    """
+
+    trace: Path
+    markers: Path | None
+    canary: str
+    """AF_UNIX address of the connect() emitted at startup — see :func:`_emit_canary`."""
+    allowlist: AllowList
+    verbose: bool
+    report: Path | None
+    suggest_rules: bool
+
+
+_RUN: _TracedRun | None = None
+"""Set once, in the traced session's ``pytest_configure``. None in every other process."""
+
+
+def _emit_canary(address: str) -> None:
+    """Connect to a path that does not exist, purely to be traced.
+
+    A session that reaches its end with an empty trace is either a session that
+    connected to nothing or one that was never traced — an unprivileged
+    container, a seccomp filter, a trace file truncated by the code under audit.
+    Those must not read alike, so the run plants one connect() of its own: if it
+    is missing from the trace, nothing else in the trace can be trusted either.
+
+    The address is unique per run and never leaves this process, so nothing
+    outside it can forge the syscall.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(address)
+    except OSError:
+        # ENOENT is the expected answer; the syscall is the point, not its result.
+        pass
+    finally:
+        sock.close()
 
 
 @dataclass
@@ -177,14 +226,28 @@ def _is_xdist_worker(config: pytest.Config) -> bool:
     return hasattr(config, "workerinput")
 
 
-def _pyproject_netaudit() -> dict[str, Any]:
-    """Read the ``[tool.netaudit]`` table from *pyproject.toml* in the cwd.
+def _rootdir(config: pytest.Config) -> Path:
+    """pytest's rootdir — the directory the run's configuration belongs to."""
+    return Path(config.rootpath)
+
+
+def _anchored(value: str, root: Path) -> Path:
+    """Resolve a configured path against *root* while the cwd is still the run's own."""
+    return (root / value).resolve()
+
+
+def _pyproject_netaudit(root: Path) -> dict[str, Any]:
+    """Read the ``[tool.netaudit]`` table from *pyproject.toml* under *root*.
+
+    *root* is pytest's rootdir rather than the cwd: the cwd is whatever the
+    tests last left it as, and the run's own configuration cannot come from
+    a directory the run under audit chose.
 
     Returns an empty mapping when the file is absent, unreadable, malformed,
     or carries no ``[tool.netaudit]`` table — configuration is best-effort and
     must never break collection.
     """
-    pyproject = Path("pyproject.toml")
+    pyproject = root / "pyproject.toml"
     if not pyproject.exists():
         return {}
     try:
@@ -236,7 +299,7 @@ def _resolve_suggest_rules(config: pytest.Config) -> bool:
     except (ValueError, pytest.UsageError):
         return False
 
-    value = _pyproject_netaudit().get("suggest_rules")
+    value = _pyproject_netaudit(_rootdir(config)).get("suggest_rules")
     return value if isinstance(value, bool) else False
 
 
@@ -246,17 +309,18 @@ def _fail_session(session: pytest.Session) -> None:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
-def _resolve_report_path(config: pytest.Config) -> str | None:
+def _resolve_report_path(config: pytest.Config) -> Path | None:
     """Resolve the saved-report path: CLI flag > pyproject.toml > None."""
+    root = _rootdir(config)
     try:
         cli_value = config.getoption("--netaudit-report")
     except (ValueError, pytest.UsageError):
         return None
     if cli_value:
-        return str(cli_value)
+        return _anchored(str(cli_value), Path.cwd())
 
-    value = _pyproject_netaudit().get("report")
-    return value if isinstance(value, str) else None
+    value = _pyproject_netaudit(root).get("report")
+    return _anchored(value, root) if isinstance(value, str) else None
 
 
 def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) -> None:
@@ -299,7 +363,7 @@ def _resolve_enabled(config: pytest.Config) -> bool:
         # (e.g. a nested pytester session). Never auto-enable in that case.
         return False
 
-    enabled = _pyproject_netaudit().get("enabled")
+    enabled = _pyproject_netaudit(_rootdir(config)).get("enabled")
     return enabled if isinstance(enabled, bool) else False
 
 
@@ -311,29 +375,61 @@ def _resolve_verbose(config: pytest.Config) -> bool:
     except (ValueError, pytest.UsageError):
         pass
 
-    verbose = _pyproject_netaudit().get("verbose")
+    verbose = _pyproject_netaudit(_rootdir(config)).get("verbose")
     return verbose if isinstance(verbose, bool) else False
 
 
 def _resolve_allowlist(config: pytest.Config) -> AllowList:
     """Resolve allowlist: CLI flag > pyproject.toml > netaudit.yaml > builtins."""
+    root = _rootdir(config)
     cli_path: str | None = config.getoption("--netaudit-allowlist")
     if cli_path is not None:
-        return AllowList.from_yaml(Path(cli_path))
+        return AllowList.from_yaml(_anchored(cli_path, Path.cwd()))
 
-    al_path = _pyproject_netaudit().get("allowlist")
+    al_path = _pyproject_netaudit(root).get("allowlist")
     if isinstance(al_path, str):
         try:
-            return AllowList.from_yaml(Path(al_path))
+            return AllowList.from_yaml(_anchored(al_path, root))
         except Exception:
             # Unreadable/malformed allowlist — fall through to the defaults below.
             pass
 
-    default = Path(_DEFAULT_ALLOWLIST)
+    default = _anchored(_DEFAULT_ALLOWLIST, root)
     if default.exists():
         return AllowList.from_yaml(default)
 
     return AllowList.empty()
+
+
+def _adopt_the_traced_run(strace_out: str, config: pytest.Config) -> _TracedRun:
+    """Take ownership of this run's files and settle the policy it is judged by."""
+    markers_out = os.environ.get(_ENV_MARKERS_OUT)
+    trace = Path(strace_out)
+    markers = Path(markers_out) if markers_out else None
+    _tempfiles.remove_on_cancel(*(p for p in (trace, markers) if p is not None))
+    return _TracedRun(
+        trace=trace,
+        markers=markers,
+        canary=f"/nonexistent/netaudit-canary-{secrets.token_hex(8)}",
+        allowlist=_resolve_allowlist(config),
+        verbose=_resolve_verbose(config),
+        report=_resolve_report_path(config),
+        suggest_rules=_resolve_suggest_rules(config),
+    )
+
+
+def _emit_untraced(session: pytest.Session) -> None:
+    """Fail the session that produced no trace of its own canary connect()."""
+    border = "=" * 60
+    color = _resolve_color(session)
+    print(f"\n{border}")
+    print(_paint("  netaudit: the session was not audited", _BOLD + _RED, color))
+    print(border)
+    print("\n  No trace was produced. strace may lack ptrace permission here, or")
+    print("  the trace was removed while the session ran; either way nothing")
+    print("  observed this run, so it cannot be reported as clean.")
+    print(f"{border}\n")
+    _fail_session(session)
 
 
 def _emit_attributed_verbose(
@@ -451,18 +547,20 @@ def pytest_configure(config: pytest.Config) -> None:
 
     Enabled via ``--netaudit`` or ``enabled = true`` in ``[tool.netaudit]``.
     """
-    strace_out = os.environ.get(_ENV_STRACE_OUT)
-    if strace_out:
+    global _RUN
+
+    # Popped rather than read: the path to the trace is what would let the code
+    # under audit empty its own evidence, and past this point nothing needs it
+    # in the environment. Descendants are told they are inside a traced run by
+    # _ENV_TRACER_PID alone.
+    strace_out = os.environ.pop(_ENV_STRACE_OUT, None)
+    if strace_out is not None or _ENV_TRACER_PID in os.environ:
         # Already running under strace. The process that made these files is
         # gone — execvpe replaced it — so this one owns removing them, and its
         # sessionfinish is only reached if the run is allowed to finish.
-        if not _owns_the_run():
-            return
-        markers_out = os.environ.get(_ENV_MARKERS_OUT)
-        paths = [Path(strace_out)]
-        if markers_out:
-            paths.append(Path(markers_out))
-        _tempfiles.remove_on_cancel(*paths)
+        if strace_out is not None and _owns_the_run():
+            _RUN = _adopt_the_traced_run(strace_out, config)
+            _emit_canary(_RUN.canary)
         return
 
     if not _resolve_enabled(config):
@@ -525,32 +623,32 @@ def pytest_sessionfinish(
     exitstatus: int | pytest.ExitCode,
 ) -> None:
     """Parse strace output, attribute violations to tests, and fail if any found."""
-    strace_path = os.environ.get(_ENV_STRACE_OUT)
-    if not strace_path:
+    run = _RUN
+    if run is None:
+        # Not the traced session: a nested pytest, or auditing was never enabled.
         return
-    if not _owns_the_run():
-        return  # a nested pytest: the trace belongs to a run still in progress
 
-    markers_path_str = os.environ.get(_ENV_MARKERS_OUT)
-    strace_file = Path(strace_path)
+    strace_file = run.trace
 
     try:
-        if not strace_file.exists() or strace_file.stat().st_size == 0:
+        trace = strace_file.read_text() if strace_file.exists() else ""
+        events = StraceParser().parse_stream(trace.splitlines())
+        if not any(e.addr == run.canary for e in events):
+            _emit_untraced(session)
             return
+        events = [e for e in events if e.addr != run.canary]
 
-        events = StraceParser().parse_stream(strace_file.read_text().splitlines())
-        allowlist = _resolve_allowlist(session.config)
-        verbose = _resolve_verbose(session.config)
+        allowlist = run.allowlist
+        verbose = run.verbose
 
-        markers_file = Path(markers_path_str) if markers_path_str else None
+        markers_file = run.markers
         if markers_file and markers_file.exists():
             test_ranges = _parse_markers(markers_file)
             violations_by_test = _attribute_violations(events, allowlist, test_ranges)
-            report_path = _resolve_report_path(session.config)
-            if report_path:
+            if run.report:
                 # Written regardless of verbosity or whether anything violated —
                 # a clean report is still evidence of what the run observed.
-                _write_report(violations_by_test, Path(report_path))
+                _write_report(violations_by_test, run.report)
             if verbose:
                 _emit_attributed_verbose(events, allowlist, test_ranges, session)
             else:
@@ -562,7 +660,7 @@ def pytest_sessionfinish(
                         violations_by_test,
                         session,
                         locations=locations,
-                        suggest_rules=_resolve_suggest_rules(session.config),
+                        suggest_rules=run.suggest_rules,
                     )
         else:
             violations = Reporter.check(events, allowlist)
@@ -574,5 +672,5 @@ def pytest_sessionfinish(
                 _fail_session(session)
     finally:
         strace_file.unlink(missing_ok=True)
-        if markers_path_str:
-            Path(markers_path_str).unlink(missing_ok=True)
+        if run.markers:
+            run.markers.unlink(missing_ok=True)

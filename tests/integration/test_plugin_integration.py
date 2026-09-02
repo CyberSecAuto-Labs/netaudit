@@ -478,6 +478,7 @@ class TestNestedPytestRuns:
             import os
             import subprocess
             import sys
+            import tempfile
             from pathlib import Path
 
 
@@ -490,10 +491,34 @@ class TestNestedPytestRuns:
                     text=True,
                 )
                 assert inner.returncode == 0, inner.stdout + inner.stderr
-                trace = Path(os.environ["NETAUDIT_STRACE_OUT"])
-                assert trace.exists(), "the nested run deleted the outer run's trace"
+                # execvpe kept the pid, so the trace is still named after the tracer.
+                tracer = os.environ["NETAUDIT_TRACER_PID"]
+                traces = list(Path(tempfile.gettempdir()).glob(f"netaudit-{tracer}-*.strace"))
+                assert traces, "the nested run deleted the outer run's trace"
             """
         )
         result = pytester.runpytest_subprocess("--netaudit")
         result.assert_outcomes(passed=1)
         assert result.ret == 0
+
+
+class TestTraceIntegrity:
+    """A session that was not observed must not be reported as a clean one."""
+
+    def test_a_session_that_truncates_its_own_trace_fails(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            import os
+            import tempfile
+            from pathlib import Path
+
+
+            def test_empties_the_trace():
+                tracer = os.environ["NETAUDIT_TRACER_PID"]
+                for trace in Path(tempfile.gettempdir()).glob(f"netaudit-{tracer}-*.strace"):
+                    trace.write_text("")
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*not audited*"])
