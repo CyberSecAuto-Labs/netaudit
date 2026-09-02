@@ -87,6 +87,9 @@ _RUN: _TracedRun | None = None
 """Set once, in the traced session's ``pytest_configure``. None in every other process."""
 
 
+_CANARY_FAMILY: int | None = getattr(socket, "AF_UNIX", None)
+
+
 def _emit_canary(address: str) -> None:
     """Connect to a path that does not exist, purely to be traced.
 
@@ -103,7 +106,11 @@ def _emit_canary(address: str) -> None:
     interpreter and can read :data:`_RUN` outright. Auditing untrusted code
     means ``netaudit run --``, where the audit is a different process.
     """
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if _CANARY_FAMILY is None:
+        # No AF_UNIX means no Linux, so no strace either: nothing re-execs, no
+        # run is ever adopted, and the check this feeds is never reached.
+        return
+    sock = socket.socket(_CANARY_FAMILY, socket.SOCK_STREAM)
     try:
         sock.connect(address)
     except OSError:

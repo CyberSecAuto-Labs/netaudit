@@ -604,6 +604,16 @@ class TestPytestConfigure:
         """A path that cannot exist: the syscall is the point, not the connection."""
         pytest_plugin._emit_canary(str(tmp_path / "netaudit-canary-nowhere"))
 
+    def test_the_canary_is_skipped_where_there_are_no_unix_sockets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows has neither AF_UNIX nor strace, so nothing there reads the trace."""
+        monkeypatch.setattr(pytest_plugin, "_CANARY_FAMILY", None)
+        monkeypatch.setattr(
+            pytest_plugin.socket, "socket", lambda *a: pytest.fail("opened a socket")
+        )
+        pytest_plugin._emit_canary("/nonexistent/netaudit-canary")
+
     def test_traces_with_the_same_command_the_runner_builds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
