@@ -922,6 +922,40 @@ class TestRunExitCodes:
         assert data["run"]["command_exit_code"] == 5
 
 
+class TestRunTracingFailure:
+    """strace failing to trace must never read as a run that saw nothing."""
+
+    def _invoke(self, tmp_path: Path, returncode: int, stderr: bytes) -> "object":
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text("")
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=returncode, stderr=stderr)
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+        ):
+            with patch("pathlib.Path.unlink"):
+                return CliRunner().invoke(main, ["run", "--", "pytest"])
+
+    def test_empty_trace_and_a_failing_strace_is_a_netaudit_failure(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"strace: ptrace(PTRACE_SEIZE): Operation not permitted")
+        assert result.exit_code == 87  # type: ignore[attr-defined]
+
+    def test_the_strace_diagnostic_is_surfaced(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"strace: Cannot find executable 'nope'")
+        assert "Cannot find executable" in result.output  # type: ignore[attr-defined]
+
+    def test_a_silent_strace_still_reports_the_failure(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"")
+        assert result.exit_code == 87  # type: ignore[attr-defined]
+        assert "no trace" in result.output  # type: ignore[attr-defined]
+
+    def test_an_empty_trace_from_a_successful_run_is_still_analysed(self, tmp_path: Path) -> None:
+        """Only the pairing is conclusive: strace records the command's exit either way."""
+        result = self._invoke(tmp_path, 0, b"")
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+
+
 class TestRunReservedCodesAreDistinct:
     """netaudit's own codes must not be reachable by the traced command."""
 
@@ -967,6 +1001,7 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_CANCELLED,
             _EXIT_CLEAN,
             _EXIT_STRACE_MISSING,
+            _EXIT_TRACE_FAILED,
             _EXIT_TRACED_VIOLATIONS,
         )
 
@@ -976,14 +1011,16 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_STRACE_MISSING,
             _EXIT_BAD_ALLOWLIST,
             _EXIT_CANCELLED,
+            _EXIT_TRACE_FAILED,
         }
-        assert len(codes) == 5
+        assert len(codes) == 6
         # Every netaudit-originated code sits in the band left clear of sysexits,
         # the Linux socket errno block, shell codes and signal-derived values.
         assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
         assert 79 <= _EXIT_STRACE_MISSING <= 87
         assert 79 <= _EXIT_BAD_ALLOWLIST <= 87
         assert 79 <= _EXIT_CANCELLED <= 87
+        assert 79 <= _EXIT_TRACE_FAILED <= 87
 
     def test_run_never_borrows_an_exit_code_the_command_could_return(self) -> None:
         # The whole point of the reserved band: `run` passes the traced

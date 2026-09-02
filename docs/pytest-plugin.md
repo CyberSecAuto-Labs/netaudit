@@ -37,9 +37,10 @@ Resolution order for `enabled`:
 | 2 | `enabled = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
 
-The `pyproject.toml` is read from the current working directory. Because activation
-re-executes the test process under strace, it is resolved before collection starts —
-so `enabled` must live in `pyproject.toml`, not in a conftest or an ini option.
+The `pyproject.toml` is read from pytest's rootdir, so running pytest from a
+subdirectory audits the same way. Because activation re-executes the test process under
+strace, it is resolved before collection starts — so `enabled` must live in
+`pyproject.toml`, not in a conftest or an ini option.
 
 ## Allowlist resolution
 
@@ -49,8 +50,26 @@ The plugin resolves the allowlist in this priority order:
 |---|---|
 | 1 | `--netaudit-allowlist <file>` CLI flag |
 | 2 | `allowlist = "..."` in `[tool.netaudit]` in `pyproject.toml` |
-| 3 | `netaudit.yaml` in the current working directory |
+| 3 | `netaudit.yaml` in pytest's rootdir |
 | 4 | Built-in defaults only (loopback, Unix sockets, Netlink) |
+
+Every one of these is resolved when the session starts, before the first test runs: a test
+that changes the working directory cannot move the allowlist the run is judged against, nor
+the destination of `--netaudit-report`.
+
+## Trace integrity
+
+The audited session plants a `connect()` of its own before collection and expects to find it
+in the trace afterwards. If it is missing — strace has no ptrace permission, a seccomp
+profile blocked it, the trace did not survive the run — the session fails rather than
+reporting the run as clean. "Nothing connected" and "nothing was watching" are not the same
+result.
+
+This is a check against breakage, not a sandbox: it catches a trace that never happened, was
+emptied, or vanished, not one that was rewritten around the marker. The tests share the
+interpreter that runs the audit, so code that sets out to defeat the check can reach its
+internals. Where the code under audit is not trusted, run it as a separate process under
+`netaudit run -- pytest`.
 
 ## CLI options
 

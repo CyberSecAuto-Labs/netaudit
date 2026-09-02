@@ -94,6 +94,15 @@ class TestStraceCmd:
         cmd = _strace_cmd(out)
         assert cmd[cmd.index("-o") + 1] == str(out)
 
+    def test_ends_the_flags_with_a_separator(self) -> None:
+        assert _strace_cmd(_OUT)[-1] == "--"
+
+    def test_a_command_starting_with_a_dash_is_not_read_as_an_strace_option(self) -> None:
+        """Without the separator this second -o would win and empty the trace."""
+        argv = _strace_cmd(_OUT) + ["-o", "/dev/null"]
+        assert argv.index("--") < argv.index("-o", argv.index("--"))
+        assert argv[argv.index("-o") + 1] == str(_OUT)
+
 
 # ---------------------------------------------------------------------------
 # --kill-on-exit — strace 5.2+, and strace has no documented minimum version
@@ -235,6 +244,13 @@ class TestStraceRunnerStart:
         assert popen.call_args.kwargs["stdout"] is subprocess.PIPE
         assert popen.call_args.kwargs["stderr"] is subprocess.PIPE
         assert isinstance(handle, StraceProcess)
+
+    def test_rejects_an_empty_command(self) -> None:
+        runner = _runner()
+        with patch("netaudit.runner.subprocess.Popen") as popen:
+            with pytest.raises(ValueError, match="no command"):
+                runner.start([], _OUT)
+        popen.assert_not_called()
 
     def test_does_not_wait_for_the_process(self) -> None:
         runner = _runner()

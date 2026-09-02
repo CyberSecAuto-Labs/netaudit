@@ -53,9 +53,17 @@ def _supports_kill_on_exit() -> bool:
 
 
 def _strace_cmd(output_path: Path) -> list[str]:
+    """strace and its flags, terminated by ``--``.
+
+    Without the separator a traced command whose first token starts with ``-``
+    is read as an option of strace's own: a second ``-o`` redirects the trace
+    away from the file netaudit parses, and ``-p`` retargets it at another
+    process — either way the audit passes on an empty trace.
+    """
     cmd = ["strace", "-e", "trace=connect", "-f", "-tt", "-o", str(output_path)]
     if _supports_kill_on_exit():
         cmd.insert(1, _KILL_ON_EXIT)
+    cmd.append("--")
     return cmd
 
 
@@ -147,6 +155,9 @@ class StraceRunner:
         Call `.stop()` on the returned :class:`StraceProcess` to wait for
         completion and retrieve the result.
         """
+        if not command:
+            # strace with no command traces nothing and waits on nothing.
+            raise ValueError("no command to trace")
         proc: subprocess.Popen[bytes] = subprocess.Popen(
             _strace_cmd(output_path) + command,
             stdout=subprocess.PIPE,

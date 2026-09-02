@@ -14,6 +14,7 @@ import pytest
 
 from netaudit import _tempfiles
 from netaudit.allowlist import AllowList
+from netaudit.integrations import pytest_plugin
 from netaudit.integrations.pytest_plugin import (
     _ENV_MARKERS_OUT,
     _ENV_STRACE_OUT,
@@ -33,6 +34,7 @@ from netaudit.integrations.pytest_plugin import (
     _resolve_suggest_rules,
     _resolve_verbose,
     _TestRange,
+    _TracedRun,
     _write_report,
     pytest_addoption,
     pytest_configure,
@@ -60,6 +62,57 @@ def _event(
         result=0,
         raw_line="",
     )
+
+
+_CANARY = "/nonexistent/netaudit-canary-0123456789abcdef"
+
+
+def _canary_line(address: str = _CANARY) -> str:
+    """The trace line strace writes for the canary connect()."""
+    return (
+        "9 12:00:00.000000 connect(3, {sa_family=AF_UNIX, "
+        f'sun_path="{address}"}}, 43) = -1 ENOENT (No such file or directory)\n'
+    )
+
+
+_CANARY_LINE = _canary_line()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test starts out looking like the traced session, and none leaves it set."""
+    monkeypatch.setattr(pytest_plugin, "_RUN", None)
+
+
+def _spec_config() -> MagicMock:
+    """A pytest.Config double: the options, plus the rootdir paths are anchored to."""
+    config = MagicMock(spec=["getoption", "rootpath"])
+    config.rootpath = Path.cwd()
+    return config
+
+
+def _run_state(trace: Path, markers: Path | None = None, **policy: object) -> _TracedRun:
+    """A traced run with the policy its configure would have settled."""
+    settled: dict[str, object] = {
+        "allowlist": AllowList.empty(),
+        "verbose": False,
+        "report": None,
+        "suggest_rules": False,
+    }
+    settled.update(policy)
+    return _TracedRun(trace=trace, markers=markers, canary=_CANARY, **settled)  # type: ignore[arg-type]
+
+
+def _traced_run(
+    monkeypatch: pytest.MonkeyPatch, trace: Path, markers: Path | None = None, **policy: object
+) -> None:
+    """Put this process in the state the traced session's configure leaves it in.
+
+    The canary is appended to the trace because a real traced run always carries
+    it: strace records it before the first test runs.
+    """
+    trace.write_text(trace.read_text() + _CANARY_LINE)
+    monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(trace, markers, **policy))
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +275,7 @@ class TestNowTs:
 
 
 def _mock_config(allowlist_opt: str | None = None) -> MagicMock:
-    config = MagicMock(spec=["getoption"])
+    config = _spec_config()
     config.getoption.side_effect = lambda name, *default: allowlist_opt
     return config
 
@@ -346,9 +399,12 @@ class TestPytestAddoption:
 
 
 class TestPytestConfigure:
-    def _make_config(self, enabled: bool = True, strace_env: str | None = None) -> MagicMock:
-        config = MagicMock(spec=pytest.Config)
-        config.getoption.return_value = enabled
+    def _make_config(self, enabled: bool = True) -> MagicMock:
+        config = MagicMock(spec=["getoption", "rootpath"])
+        config.rootpath = Path.cwd()
+        config.getoption.side_effect = lambda name, *default: (
+            enabled if name == "--netaudit" else None
+        )
         return config
 
     def test_does_nothing_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -496,6 +552,68 @@ class TestPytestConfigure:
 
         assert registered == [(Path("/tmp/netaudit-x.strace"),)]
 
+    def test_the_trace_path_does_not_survive_into_the_traced_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tests about to run must not be handed the path to their own evidence."""
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert _ENV_STRACE_OUT not in os.environ
+        assert pytest_plugin._RUN is not None
+        assert pytest_plugin._RUN.trace == Path("/tmp/netaudit-x.strace")
+
+    def test_the_traced_session_plants_a_canary_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its absence from the trace is the only proof tracing never happened."""
+        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        connected: list[str] = []
+        monkeypatch.setattr(pytest_plugin, "_emit_canary", connected.append)
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert pytest_plugin._RUN is not None
+        assert connected == [pytest_plugin._RUN.canary]
+
+    def test_the_canary_address_is_unique_to_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pytest_plugin, "_emit_canary", lambda _address: None)
+        canaries = []
+        for _ in range(2):
+            monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+            pytest_configure(self._make_config(enabled=True))
+            assert pytest_plugin._RUN is not None
+            canaries.append(pytest_plugin._RUN.canary)
+        assert canaries[0] != canaries[1]
+
+    def test_a_descendant_of_the_traced_session_claims_no_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It inherits the tracer pid but not the trace path, which was popped."""
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getpid()))
+        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd inside a traced run"))
+
+        pytest_configure(self._make_config(enabled=True))
+
+        assert pytest_plugin._RUN is None
+
+    def test_the_canary_connects_to_the_address_it_is_given(self, tmp_path: Path) -> None:
+        """A path that cannot exist: the syscall is the point, not the connection."""
+        pytest_plugin._emit_canary(str(tmp_path / "netaudit-canary-nowhere"))
+
+    def test_the_canary_is_skipped_where_there_are_no_unix_sockets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows has neither AF_UNIX nor strace, so nothing there reads the trace."""
+        monkeypatch.setattr(pytest_plugin, "_CANARY_FAMILY", None)
+        monkeypatch.setattr(
+            pytest_plugin.socket, "socket", lambda *a: pytest.fail("opened a socket")
+        )
+        pytest_plugin._emit_canary("/nonexistent/netaudit-canary")
+
     def test_traces_with_the_same_command_the_runner_builds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -632,13 +750,11 @@ _STRACE_EXTERNAL = (
 
 
 class TestPytestSessionfinish:
-    def test_does_nothing_when_env_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+    def test_does_nothing_when_this_process_owns_no_run(self) -> None:
         session = MagicMock()
         session.exitstatus = pytest.ExitCode.OK
         pytest_sessionfinish(session=session, exitstatus=0)
-        # exitstatus not changed
-        session.exitstatus  # just access it — no assertion needed
+        assert session.exitstatus == pytest.ExitCode.OK
 
     def test_a_nested_pytest_neither_reports_nor_deletes_the_outer_runs_trace(
         self,
@@ -649,9 +765,8 @@ class TestPytestSessionfinish:
         """The outer run is still going: its trace is incomplete and not ours to read."""
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+        pytest_configure(_mock_config())
         session = MagicMock()
         session.exitstatus = pytest.ExitCode.OK
 
@@ -661,17 +776,61 @@ class TestPytestSessionfinish:
         assert capsys.readouterr().out == ""
         assert session.exitstatus == pytest.ExitCode.OK
 
-    def test_does_nothing_for_empty_strace_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_an_empty_trace_fails_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Nothing observed the run — which is not the same as observing nothing."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text("")
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+        assert "not audited" in capsys.readouterr().out
+
+    def test_a_truncated_trace_fails_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Events without the canary mean the trace was rewritten under the run."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+        assert "198.51.100.1" not in capsys.readouterr().out
+
+    def test_a_trace_that_vanished_fails_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "gone.strace"))
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_the_canary_is_not_reported_as_egress(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text("")
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        _traced_run(monkeypatch, strace_file)
         session = MagicMock()
         session.exitstatus = pytest.ExitCode.OK
+        session.config = _mock_config()
+
         pytest_sessionfinish(session=session, exitstatus=0)
-        # No exception, no exit code change
+
+        assert _CANARY not in capsys.readouterr().out
+        assert session.exitstatus == pytest.ExitCode.OK
 
     def test_reports_violation_and_sets_exit_code(
         self,
@@ -684,8 +843,7 @@ class TestPytestSessionfinish:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)  # no netaudit.yaml → builtin-only allowlist
 
         config = _mock_config()
@@ -712,8 +870,7 @@ class TestPytestSessionfinish:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
 
         config = _mock_config()
@@ -735,8 +892,7 @@ class TestPytestSessionfinish:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
@@ -756,8 +912,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
@@ -776,7 +931,7 @@ class TestPytestSessionfinish:
 
 
 def _mock_config_verbose(verbose: bool = False, allowlist_opt: str | None = None) -> MagicMock:
-    config = MagicMock(spec=["getoption"])
+    config = _spec_config()
 
     def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit-verbose":
@@ -832,7 +987,7 @@ class TestResolveVerbose:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
         config.getoption.side_effect = ValueError("unknown option")
         assert _resolve_verbose(config) is False  # type: ignore[arg-type]
 
@@ -964,8 +1119,7 @@ class TestPytestSessionfinishVerbose:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file, verbose=True)
         monkeypatch.chdir(tmp_path)
 
         session = self._make_session(verbose=True)
@@ -985,8 +1139,7 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        _traced_run(monkeypatch, strace_file, verbose=True)
         monkeypatch.chdir(tmp_path)
 
         session = self._make_session(verbose=True)
@@ -1008,8 +1161,7 @@ class TestPytestSessionfinishVerbose:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file, verbose=True)
         monkeypatch.chdir(tmp_path)
 
         session = self._make_session(verbose=True)
@@ -1031,8 +1183,7 @@ class TestPytestSessionfinishVerbose:
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
 
         session = self._make_session(verbose=False)
@@ -1050,7 +1201,7 @@ class TestPytestSessionfinishVerbose:
 
 
 def _mock_config_enabled(cli_flag: bool = False) -> MagicMock:
-    config = MagicMock(spec=["getoption"])
+    config = _spec_config()
 
     def _getoption(name: str, *default: object) -> object:
         if name == "--netaudit":
@@ -1130,7 +1281,7 @@ class TestResolveEnabled:
         """
         monkeypatch.chdir(tmp_path)
         (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
         config.getoption.side_effect = ValueError("unknown option")
         assert _resolve_enabled(config) is False  # type: ignore[arg-type]
 
@@ -1443,7 +1594,7 @@ class TestRuntestProtocolLocation:
 
 class TestResolveSuggestRules:
     def _cfg(self, cli_flag: bool) -> MagicMock:
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
 
         def _getoption(name: str, *default: object) -> object:
             if name == "--netaudit-suggest-rules":
@@ -1468,7 +1619,7 @@ class TestResolveSuggestRules:
 
     def test_option_not_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
         config.getoption.side_effect = ValueError("unknown option")
         assert _resolve_suggest_rules(config) is False  # type: ignore[arg-type]
 
@@ -1510,7 +1661,7 @@ class TestEmitAttributedSuggestions:
 
 class TestResolveReportPath:
     def _cfg(self, cli_value: str | None) -> MagicMock:
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
 
         def _getoption(name: str, *default: object) -> object:
             if name == "--netaudit-report":
@@ -1522,7 +1673,7 @@ class TestResolveReportPath:
 
     def test_cli_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
-        assert _resolve_report_path(self._cfg("r.json")) == "r.json"  # type: ignore[arg-type]
+        assert _resolve_report_path(self._cfg("r.json")) == tmp_path / "r.json"  # type: ignore[arg-type]
 
     def test_none_by_default(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
@@ -1531,16 +1682,16 @@ class TestResolveReportPath:
     def test_pyproject_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nreport = "out.json"\n')
-        assert _resolve_report_path(self._cfg(None)) == "out.json"  # type: ignore[arg-type]
+        assert _resolve_report_path(self._cfg(None)) == tmp_path / "out.json"  # type: ignore[arg-type]
 
     def test_cli_overrides_pyproject(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nreport = "out.json"\n')
-        assert _resolve_report_path(self._cfg("cli.json")) == "cli.json"  # type: ignore[arg-type]
+        assert _resolve_report_path(self._cfg("cli.json")) == tmp_path / "cli.json"  # type: ignore[arg-type]
 
     def test_option_not_registered(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
         config.getoption.side_effect = ValueError("unknown option")
         assert _resolve_report_path(config) is None  # type: ignore[arg-type]
 
@@ -1586,7 +1737,7 @@ class TestWriteReport:
 
 class TestSessionfinishWritesReport:
     def _make_session(self, report: str | None) -> MagicMock:
-        config = MagicMock(spec=["getoption"])
+        config = _spec_config()
 
         def _getoption(name: str, *default: object) -> object:
             if name == "--netaudit-report":
@@ -1603,20 +1754,21 @@ class TestSessionfinishWritesReport:
         session.config = config
         return session
 
-    def _setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _setup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: Path | None = None
+    ) -> None:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
         markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        _traced_run(monkeypatch, strace_file, markers_file, report=report)
         monkeypatch.chdir(tmp_path)
 
     def test_report_written_when_requested(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        self._setup(tmp_path, monkeypatch)
         out = tmp_path / "report.json"
+        self._setup(tmp_path, monkeypatch, report=out)
         pytest_sessionfinish(session=self._make_session(str(out)), exitstatus=0)
         capsys.readouterr()
         data = json.loads(out.read_text())
@@ -1634,7 +1786,7 @@ class TestSessionfinishWritesReport:
     def test_report_does_not_change_exit_status(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        self._setup(tmp_path, monkeypatch)
+        self._setup(tmp_path, monkeypatch, report=tmp_path / "report.json")
         session = self._make_session(str(tmp_path / "report.json"))
         pytest_sessionfinish(session=session, exitstatus=0)
         capsys.readouterr()
@@ -1702,8 +1854,7 @@ class TestSessionfinishCleanWithoutMarkers:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_LOOPBACK)
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
@@ -1723,8 +1874,7 @@ class TestSessionfinishCleanWithoutMarkers:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_LOOPBACK)
 
-        monkeypatch.setenv(_ENV_STRACE_OUT, str(strace_file))
-        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
         session = MagicMock()
@@ -1733,3 +1883,87 @@ class TestSessionfinishCleanWithoutMarkers:
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert not strace_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Policy is settled before the tests run
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyIsSettledBeforeTestsRun:
+    """A test that chdirs must not get to choose the rules it is judged by."""
+
+    def _config(self, root: Path, report: str | None = None) -> MagicMock:
+        config = _spec_config()
+        config.rootpath = root
+        config.getoption.side_effect = lambda name, *default: (
+            report if name == "--netaudit-report" else None
+        )
+        return config
+
+    def _project(self, tmp_path: Path) -> tuple[Path, Path]:
+        root = tmp_path / "project"
+        root.mkdir()
+        (root / "netaudit.yaml").write_text("version: 1\nallowlist: []\n")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "netaudit.yaml").write_text(
+            "version: 1\nallowlist:\n"
+            '  - name: "anything at all"\n    family: AF_INET\n    cidr: 0.0.0.0/0\n'
+        )
+        return root, elsewhere
+
+    def _configure(self, root: Path, monkeypatch: pytest.MonkeyPatch, **options: str) -> Path:
+        trace = root / "run.strace"
+        trace.write_text("")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.chdir(root)
+        pytest_configure(self._config(root, **options))
+        assert pytest_plugin._RUN is not None
+        trace.write_text(_canary_line(pytest_plugin._RUN.canary) + _STRACE_EXTERNAL)
+        return trace
+
+    def test_a_chdir_during_the_run_cannot_swap_the_allowlist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root, elsewhere = self._project(tmp_path)
+        self._configure(root, monkeypatch)
+
+        monkeypatch.chdir(elsewhere)  # where the tests left the process
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        session.config = _spec_config()
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert "198.51.100.1" in capsys.readouterr().out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_the_report_lands_where_the_run_started(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root, elsewhere = self._project(tmp_path)
+        self._configure(root, monkeypatch, report="report.json")
+        (root / "markers").write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        assert pytest_plugin._RUN is not None
+        pytest_plugin._RUN.markers = root / "markers"
+
+        monkeypatch.chdir(elsewhere)
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        session.config = _spec_config()
+        pytest_sessionfinish(session=session, exitstatus=0)
+        capsys.readouterr()
+
+        assert (root / "report.json").exists()
+        assert not (elsewhere / "report.json").exists()
+
+    def test_configuration_comes_from_the_rootdir_not_the_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pytest run from a subdirectory still audits — the rootdir is what it read."""
+        root, elsewhere = self._project(tmp_path)
+        (root / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
+        monkeypatch.chdir(elsewhere)
+
+        assert _resolve_enabled(self._config(root)) is True  # type: ignore[arg-type]
