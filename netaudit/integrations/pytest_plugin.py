@@ -67,6 +67,10 @@ class _TracedRun:
     relative path, and by the time ``pytest_sessionfinish`` runs, the cwd is
     whatever the tests left it as. A test that chdirs into a directory of its
     own would otherwise choose the allowlist it is judged against.
+
+    Settling it does not put it out of reach: tests run in this interpreter and
+    can assign to these fields directly. The boundary this holds is against the
+    cwd, not against code that means to defeat it.
     """
 
     trace: Path
@@ -88,12 +92,16 @@ def _emit_canary(address: str) -> None:
 
     A session that reaches its end with an empty trace is either a session that
     connected to nothing or one that was never traced — an unprivileged
-    container, a seccomp filter, a trace file truncated by the code under audit.
-    Those must not read alike, so the run plants one connect() of its own: if it
-    is missing from the trace, nothing else in the trace can be trusted either.
+    container, a seccomp filter, a trace nothing survived. Those must not read
+    alike, so the run plants one connect() of its own: if it is missing from the
+    trace, nothing else in the trace can be trusted either.
 
-    The address is unique per run and never leaves this process, so nothing
-    outside it can forge the syscall.
+    This catches breakage and tampering from outside the session — the address
+    is unique per run and is never written to the environment or the filesystem.
+    It cannot catch the tests themselves: they share this interpreter, so they
+    can read the address and the trace path out of :data:`_RUN` and rewrite the
+    trace around it. Auditing untrusted code means running it under
+    ``netaudit run --``, where the audit is a different process.
     """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
