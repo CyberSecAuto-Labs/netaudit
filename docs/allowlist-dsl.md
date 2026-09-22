@@ -84,6 +84,9 @@ Fields:
 | `path_glob` | one of `path_glob`/`path_prefix` | Full glob pattern |
 | `path_prefix` | one of `path_glob`/`path_prefix` | Prefix; expands to `prefix*` |
 
+One of the two is required, and both must be strings: an `AF_UNIX` entry that names no path
+is rejected rather than read as "every socket".
+
 Socket paths are canonicalised before they are matched: `.` and `..` are collapsed the way
 the kernel collapses them, so `/run/gvmd/../../tmp/attacker.sock` is judged as
 `/tmp/attacker.sock` and a rule scoped to `/run/gvmd/` does not permit it. Write rules in
