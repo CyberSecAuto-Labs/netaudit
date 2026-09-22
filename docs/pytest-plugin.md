@@ -65,6 +65,10 @@ profile blocked it, the trace did not survive the run — the session fails rath
 reporting the run as clean. "Nothing connected" and "nothing was watching" are not the same
 result.
 
+A session whose trace holds a `connect()` netaudit cannot parse fails the same way: the
+destination is unknown, so the part of the trace that did parse cannot stand for the whole
+run.
+
 This is a check against breakage, not a sandbox: it catches a trace that never happened, was
 emptied, or vanished, not one that was rewritten around the marker. The tests share the
 interpreter that runs the audit, so code that sets out to defeat the check can reach its

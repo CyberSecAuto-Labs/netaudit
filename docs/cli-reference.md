@@ -42,7 +42,7 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | 84 | `strace` binary not found on PATH |
 | 85 | The allowlist was rejected; the command was never started |
 | 86 | The run was cancelled by a signal; the traced command was stopped |
-| 87 | strace produced no trace and failed; nothing was audited |
+| 87 | The trace could not be used: strace failed and wrote nothing, or it held `connect()` lines netaudit cannot read |
 | *other* | The traced command's own exit code, passed through unchanged |
 
 `run` wraps another process, so most of the exit-code space belongs to that process.
@@ -108,7 +108,13 @@ netaudit analyze [OPTIONS] STRACE_LOG
 |------|---------|
 | 0 | No violations found in log |
 | 1 | One or more violations found |
-| 2 | Bad input: log file could not be read / allowlist was rejected |
+| 2 | Bad input: log file could not be read / allowlist was rejected / the log held `connect()` lines netaudit cannot read |
+
+!!! warning "An unreadable `connect()` fails the run"
+    A `connect()` line netaudit cannot parse is a destination it cannot judge, so both
+    commands refuse the trace rather than report on the part of it they did read. Reaching
+    this usually means the log came from an strace whose sockaddr rendering this version
+    does not cover — please open an issue with the line.
 
 ### Examples
 
