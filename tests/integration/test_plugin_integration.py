@@ -512,9 +512,10 @@ class TestNestedPytestRuns:
                     text=True,
                 )
                 assert inner.returncode == 0, inner.stdout + inner.stderr
-                # execvpe kept the pid, so the trace is still named after the tracer.
+                # execvpe kept the pid, so the run directory is named after the tracer.
                 tracer = os.environ["NETAUDIT_TRACER_PID"]
-                traces = list(Path(tempfile.gettempdir()).glob(f"netaudit-{tracer}-*.strace"))
+                tmp = Path(tempfile.gettempdir())
+                traces = list(tmp.glob(f"netaudit-{tracer}-*/*.strace"))
                 assert traces, "the nested run deleted the outer run's trace"
             """
         )
@@ -536,7 +537,8 @@ class TestTraceIntegrity:
 
             def test_empties_the_trace():
                 tracer = os.environ["NETAUDIT_TRACER_PID"]
-                for trace in Path(tempfile.gettempdir()).glob(f"netaudit-{tracer}-*.strace"):
+                tmp = Path(tempfile.gettempdir())
+                for trace in tmp.glob(f"netaudit-{tracer}-*/*.strace"):
                     trace.write_text("")
             """
         )

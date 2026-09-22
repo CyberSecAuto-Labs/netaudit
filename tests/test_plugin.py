@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -65,13 +66,21 @@ def _event(
     )
 
 
-def _tracked(suffix: str) -> Path:
-    """A temp file named the way :func:`_tempfiles.create` names one.
+def _tracked(suffix: str, owner: int | None = None) -> Path:
+    """A temp file shaped the way :func:`_tempfiles.create` shapes one.
 
-    The plugin only adopts a path from the environment when it has that shape,
-    so a bare ``tmp_path`` file is rejected and the run is never taken over.
+    The plugin only adopts a path from the environment when it has that shape
+    *and* the run directory is named for the tracer's pid, so *owner* is what
+    a test sets ``NETAUDIT_TRACER_PID`` to. A bare ``tmp_path`` file is
+    rejected and the run is never taken over.
     """
-    path = _tempfiles.create(suffix)
+    pid = os.getpid() if owner is None else owner
+    directory = Path(tempfile.mkdtemp(prefix=f"{_tempfiles.PREFIX}{pid}-"))
+    fd, name = tempfile.mkstemp(
+        suffix=suffix, prefix=f"{_tempfiles.PREFIX}{pid}-", dir=str(directory)
+    )
+    os.close(fd)
+    path = Path(name)
     _TRACKED_FOR_TESTS.append(path)
     return path
 
@@ -83,7 +92,10 @@ _TRACKED_FOR_TESTS: list[Path] = []
 def _clean_up_tracked() -> Iterator[None]:
     yield
     while _TRACKED_FOR_TESTS:
-        _TRACKED_FOR_TESTS.pop().unlink(missing_ok=True)
+        path = _TRACKED_FOR_TESTS.pop()
+        path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            path.parent.rmdir()
 
 
 _CANARY = "/nonexistent/netaudit-canary-0123456789abcdef"
@@ -603,7 +615,7 @@ class TestPytestConfigure:
     def test_the_traced_session_recognises_itself_by_its_parent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        trace = _tracked(".strace")
+        trace = _tracked(".strace", owner=os.getppid())
         monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
@@ -795,6 +807,56 @@ class TestPathsFromTheEnvironment:
 
         assert victim.read_text() == "payload"
 
+    def test_a_trace_from_another_run_is_not_adopted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Right shape, wrong run: the directory's pid is not the tracer's."""
+        stranger = _tracked(".strace", owner=os.getppid() + 100000)
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(stranger))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
+
+        pytest_configure(_mock_config())
+
+        assert pytest_plugin._RUN is None
+        assert stranger.exists()
+
+    def test_a_symlink_wearing_the_right_name_is_not_adopted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        victim = tmp_path / "important.db"
+        victim.write_text("payload")
+        real = _tracked(".strace")
+        link = real.parent / f"netaudit-{os.getpid()}-link.strace"
+        link.symlink_to(victim)
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(link))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.delenv(_ENV_TRACER_PID, raising=False)
+        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd"))
+
+        pytest_configure(_spec_config())
+
+        assert pytest_plugin._RUN is None
+        link.unlink()
+        assert victim.read_text() == "payload"
+
+    def test_the_descriptor_is_closed_when_wrapping_it_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A raw descriptor leaked per test would exhaust the process's table."""
+        markers = tmp_path / "markers"
+        markers.touch()
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers))
+        closed: list[int] = []
+        monkeypatch.setattr(os, "fdopen", lambda *a, **kw: (_ for _ in ()).throw(OSError("no")))
+        monkeypatch.setattr(os, "close", closed.append)
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = "tests/test_foo.py::test_bar"
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        with pytest.raises(OSError):
+            next(gen)
+
+        assert len(closed) == 1
+
     def test_the_markers_file_is_not_written_through_a_symlink(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -871,7 +933,7 @@ class TestPytestRuntestProtocol:
 
         Disowning it would leave a ``pytest -n`` run with no attribution at all.
         """
-        markers_file = _tracked(".markers")
+        markers_file = _tracked(".markers", owner=os.getppid() + 100000)
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
 

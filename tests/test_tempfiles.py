@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -345,10 +346,20 @@ class TestIsOwnName:
         try:
             assert _tempfiles.is_own_name(path)
         finally:
-            path.unlink(missing_ok=True)
+            _tempfiles.remove_tracked()
 
     def test_rejects_a_path_outside_the_temp_directory(self, tmp_path: Path) -> None:
         assert not _tempfiles.is_own_name(tmp_path / "netaudit-1-x.strace")
+
+    def test_rejects_a_name_directly_in_the_temp_directory(self) -> None:
+        """The layout that preceded the private directory is no longer adopted."""
+        root = Path(tempfile.gettempdir())
+        path = root / f"netaudit-{os.getpid()}-flat.strace"
+        path.write_text("")
+        try:
+            assert not _tempfiles.is_own_name(path)
+        finally:
+            path.unlink()
 
     def test_rejects_an_unrelated_name_in_the_temp_directory(self) -> None:
         root = Path(tempfile.gettempdir())
@@ -365,3 +376,125 @@ class TestIsOwnName:
     def test_rejects_a_traversal_back_out_of_the_temp_directory(self) -> None:
         root = Path(tempfile.gettempdir())
         assert not _tempfiles.is_own_name(root / ".." / "netaudit-1-x.strace")
+
+    def test_rejects_a_name_that_does_not_exist(self) -> None:
+        directory = _tempfiles.own_directory()
+        assert not _tempfiles.is_own_name(directory / "netaudit-1-gone.strace")
+
+    def test_rejects_a_symlink_wearing_the_right_name(self, tmp_path: Path) -> None:
+        victim = tmp_path / "important.db"
+        victim.write_text("payload")
+        link = _tempfiles.own_directory() / f"netaudit-{os.getpid()}-link.strace"
+        link.symlink_to(victim)
+        try:
+            assert not _tempfiles.is_own_name(link)
+        finally:
+            link.unlink()
+
+    def test_rejects_a_hard_link_wearing_the_right_name(self, tmp_path: Path) -> None:
+        """A second name for someone else's inode is not a file this module made."""
+        directory = _tempfiles.own_directory()
+        victim = directory / "victim"
+        victim.write_text("payload")
+        link = directory / f"netaudit-{os.getpid()}-hard.strace"
+        os.link(victim, link)
+        try:
+            assert not _tempfiles.is_own_name(link)
+        finally:
+            link.unlink()
+            victim.unlink()
+
+    def test_rejects_a_directory_wearing_the_right_name(self) -> None:
+        path = _tempfiles.own_directory() / f"netaudit-{os.getpid()}-dir.strace"
+        path.mkdir()
+        try:
+            assert not _tempfiles.is_own_name(path)
+        finally:
+            path.rmdir()
+
+
+class TestOwnDirectory:
+    """strace reopens the trace by name; the directory is what makes that safe."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """One directory per process is shared by the whole session otherwise."""
+        monkeypatch.setattr(_tempfiles, "_TRACKED", set())
+        monkeypatch.setattr(_tempfiles, "_OWN_DIRECTORY", None)
+        yield
+        _tempfiles.remove_tracked()
+
+    def test_is_private_to_this_user(self) -> None:
+        assert stat.S_IMODE(_tempfiles.own_directory().stat().st_mode) == 0o700
+
+    def test_the_trace_lands_inside_it(self) -> None:
+        path = _tempfiles.create(".strace")
+        try:
+            assert path.parent == _tempfiles.own_directory()
+        finally:
+            _tempfiles.remove_tracked()
+
+    def test_cleanup_takes_the_directory_with_it(self) -> None:
+        path = _tempfiles.create(".strace")
+        directory = path.parent
+
+        _tempfiles.remove_tracked()
+
+        assert not directory.exists()
+
+    def test_a_directory_with_something_else_in_it_is_left_alone(self) -> None:
+        path = _tempfiles.create(".strace")
+        directory = path.parent
+        stranger = directory / "not-ours"
+        stranger.write_text("")
+        try:
+            _tempfiles.remove_tracked()
+            assert directory.exists()
+        finally:
+            stranger.unlink()
+            directory.rmdir()
+
+    def test_a_removed_directory_is_made_again(self) -> None:
+        """A second run in the same process still needs somewhere to write."""
+        first = _tempfiles.create(".strace")
+        _tempfiles.remove_tracked()
+
+        second = _tempfiles.create(".strace")
+        try:
+            assert second.parent.is_dir()
+            assert second.parent != first.parent
+        finally:
+            _tempfiles.remove_tracked()
+
+
+class TestSweepRemovesRunDirectories:
+    def test_a_stale_run_directory_goes_with_its_contents(self, tmp_path: Path) -> None:
+        directory = tmp_path / f"{_tempfiles.PREFIX}999999-abc"
+        directory.mkdir()
+        (directory / f"{_tempfiles.PREFIX}999999-abc.strace").write_text("x")
+        old = time.time() - 48 * 3600
+        for path in (directory / f"{_tempfiles.PREFIX}999999-abc.strace", directory):
+            os.utime(path, (old, old))
+
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == [directory]
+        assert not directory.exists()
+
+    def test_a_directory_whose_trace_is_still_growing_is_kept(self, tmp_path: Path) -> None:
+        """The directory's own mtime stops moving; the trace inside it does not."""
+        directory = tmp_path / f"{_tempfiles.PREFIX}999999-abc"
+        directory.mkdir()
+        (directory / f"{_tempfiles.PREFIX}999999-abc.strace").write_text("x")
+        old = time.time() - 48 * 3600
+        os.utime(directory, (old, old))
+
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
+        assert directory.exists()
+
+    def test_an_unrelated_entry_is_left_alone(self, tmp_path: Path) -> None:
+        stranger = tmp_path / f"{_tempfiles.PREFIX}999999-abc.log"
+        stranger.write_text("x")
+        old = time.time() - 48 * 3600
+        os.utime(stranger, (old, old))
+
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
+        assert stranger.exists()

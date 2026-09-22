@@ -189,7 +189,12 @@ def _markers_target(config: pytest.Config) -> Path | None:
 def _append_marker(path: Path, kind: str, location: str, nodeid: str) -> None:
     """Append one tab-separated marker record to *path*, never through a symlink."""
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | _NO_SYMLINK)
-    with os.fdopen(fd, "a") as f:
+    try:
+        handle = os.fdopen(fd, "a")
+    except OSError:
+        os.close(fd)
+        raise
+    with handle as f:
         f.write(f"{kind}\t{_now_ts():.6f}\t{location}\t{nodeid}\n")
 
 
@@ -473,19 +478,29 @@ def _resolve_allowlist(config: pytest.Config) -> AllowList:
 
 
 def _from_env(name: str) -> Path | None:
-    """The path *name* holds, when it is one netaudit itself could have made.
+    """The path *name* holds, when it is one *this* run could have made.
 
     The re-exec passes the trace and markers paths in the environment, and this
     process goes on to append to one and unlink both. Anything else that sets
     the variable — the plugin loads in every pytest run on the machine, via the
     ``pytest11`` entry point — would otherwise be choosing a file for netaudit
     to delete.
+
+    Two things have to hold. The path must have the shape ``_tempfiles``
+    gives its own files: a regular, unshared file of this uid inside a private
+    run directory. And the pid stamped into that directory must be the tracer's
+    — ``execvpe`` keeps the pid, so the process that created the directory is
+    the one that became strace, and ``NETAUDIT_TRACER_PID`` records it. A path
+    left over from some other run therefore does not qualify.
     """
     value = os.environ.get(name)
     if value is None:
         return None
     path = Path(value)
-    return path if _tempfiles.is_own_name(path) else None
+    if not _tempfiles.is_own_name(path):
+        return None
+    tracer_pid = os.environ.get(_ENV_TRACER_PID)
+    return path if tracer_pid is None or _tempfiles.owner_of(path.parent) == tracer_pid else None
 
 
 def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:

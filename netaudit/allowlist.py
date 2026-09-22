@@ -237,8 +237,7 @@ class AllowList:
         version = raw.get("version")
         if isinstance(version, bool) or version != _SCHEMA_VERSION:
             raise ValueError(
-                f"Allowlist {path}: unsupported version {version!r} "
-                f"(expected {_SCHEMA_VERSION})"
+                f"Allowlist {path}: unsupported version {version!r} (expected {_SCHEMA_VERSION})"
             )
 
         includes_builtins = raw.get("includes_builtins", True)

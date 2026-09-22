@@ -30,7 +30,9 @@ from __future__ import annotations
 import atexit
 import os
 import re
+import shutil
 import signal
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -80,6 +82,25 @@ def remove_tracked() -> None:
         except OSError:
             # A cleanup failure must not mask whatever is actually ending the run.
             pass
+    _remove_own_directories()
+
+
+def _remove_own_directories() -> None:
+    """Remove the private directories the tracked files lived in, once empty.
+
+    Derived from the tracked paths rather than remembered, because ``execvpe``
+    throws away anything this module remembered: the process that made the
+    directory is replaced by strace, and the pytest it forks is the one that
+    cleans up. ``rmdir`` rather than a recursive delete — a directory with
+    something else still in it is not one this module has finished with.
+    """
+    for parent in {path.parent for path in _TRACKED}:
+        if not is_own_directory(parent):
+            continue
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
 
 
 def _on_cancel(signum: int, frame: FrameType | None) -> None:
@@ -114,21 +135,60 @@ def remove_on_cancel(*paths: Path) -> None:
             _PREVIOUS[sig] = previous
 
 
+_OWN_DIRECTORY: Path | None = None
+
+
+def own_directory() -> Path:
+    """The private directory this process's temp files live in.
+
+    ``mkdtemp`` makes it 0700, so nothing outside this uid can put an entry in
+    it — which is what makes handing strace a *name* safe. :func:`create`
+    closes its descriptor before strace reopens the path, and on a ``$TMPDIR``
+    that is shared or not sticky (several CI runners point it at a
+    group-writable job workspace) the name could otherwise be replaced with a
+    symlink in that window, sending the trace to the link's target.
+
+    One directory per process, holding both files, so a run that is killed
+    outright leaves one thing behind rather than two.
+    """
+    global _OWN_DIRECTORY
+    # Re-made rather than remembered blindly: a cleanup this process already
+    # ran will have removed it, and a second run in the same process needs
+    # somewhere to write.
+    if _OWN_DIRECTORY is None or not _OWN_DIRECTORY.is_dir():
+        _OWN_DIRECTORY = Path(tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-"))
+    return _OWN_DIRECTORY
+
+
 def create(suffix: str, directory: Path | None = None) -> Path:
     """Create an empty temp file whose lifetime this module owns.
 
     The descriptor is closed immediately: strace opens the path by name, and
-    holding a second one only risks it outliving the process.
+    holding a second one only risks it outliving the process. What keeps that
+    safe is the private directory, not the descriptor.
     """
     fd, name = tempfile.mkstemp(
         suffix=suffix,
         prefix=f"{PREFIX}{os.getpid()}-",
-        dir=str(directory) if directory else None,
+        dir=str(directory) if directory else str(own_directory()),
     )
     os.close(fd)
     path = Path(name)
     remove_on_cancel(path)
     return path
+
+
+def owner_of(path: Path) -> str | None:
+    """The pid stamped into *path*'s name, or None when there is none."""
+    match = _OWNER_IN_NAME.match(path.name)
+    return match.group(1) if match else None
+
+
+def is_own_directory(path: Path) -> bool:
+    """Whether *path* is a private run directory :func:`own_directory` made."""
+    return (
+        path.parent == Path(tempfile.gettempdir()) and _OWNER_IN_NAME.match(path.name) is not None
+    )
 
 
 def is_own_name(path: Path) -> bool:
@@ -142,11 +202,17 @@ def is_own_name(path: Path) -> bool:
     Constraining the shape to this module's own names keeps the damage to
     files this module would have owned anyway.
     """
-    return (
-        path.parent == Path(tempfile.gettempdir())
-        and path.suffix in _SUFFIXES
-        and _OWNER_IN_NAME.match(path.name) is not None
-    )
+    if path.suffix not in _SUFFIXES or _OWNER_IN_NAME.match(path.name) is None:
+        return False
+    if not is_own_directory(path.parent):
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    # lstat rather than stat: a symlink is not a file this module created, and
+    # a link count above one means the name is shared with something else.
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid()
 
 
 def _owner_still_running(path: Path) -> bool:
@@ -168,6 +234,20 @@ def _owner_still_running(path: Path) -> bool:
     return True
 
 
+def _newest_mtime(path: Path) -> float:
+    """The most recent mtime of *path* or of anything directly inside it.
+
+    A run directory's own mtime stops moving once both files exist, while the
+    trace inside it grows for the whole run. Taking the newest keeps a long,
+    quiet suite from looking abandoned.
+    """
+    newest = path.stat().st_mtime
+    if path.is_dir():
+        for child in path.iterdir():
+            newest = max(newest, child.stat().st_mtime)
+    return newest
+
+
 def sweep_stale(
     directory: Path | None = None,
     max_age: float = _STALE_AGE_SECONDS,
@@ -186,16 +266,22 @@ def sweep_stale(
     root = directory if directory is not None else Path(tempfile.gettempdir())
     now = time.time()
     removed: list[Path] = []
-    for suffix in _SUFFIXES:
-        for path in sorted(root.glob(f"{PREFIX}*{suffix}")):
-            try:
-                age = now - path.stat().st_mtime
-                if age <= max_age:
-                    continue
-                if age <= abandoned_age and _owner_still_running(path):
-                    continue
-                path.unlink()
-            except OSError:
+    for path in sorted(root.glob(f"{PREFIX}*")):
+        try:
+            is_dir = path.is_dir()
+            # A run directory, or a bare file from the layout that preceded it.
+            if not is_dir and path.suffix not in _SUFFIXES:
                 continue
-            removed.append(path)
+            age = now - _newest_mtime(path)
+            if age <= max_age:
+                continue
+            if age <= abandoned_age and _owner_still_running(path):
+                continue
+            if is_dir:
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError:
+            continue
+        removed.append(path)
     return removed
