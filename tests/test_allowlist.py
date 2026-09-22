@@ -91,8 +91,13 @@ class TestUnixSocketRule:
 
     def test_an_abstract_name_is_matched_literally(self) -> None:
         """Its bytes are opaque: `/` and `..` inside one are not path syntax."""
-        rule = UnixSocketRule("@/run/gvmd/../x")
-        assert rule.matches(_event("AF_UNIX", "@/run/gvmd/../x"))
+        rule = UnixSocketRule("\\0run/gvmd/../x")
+        assert rule.matches(_event("AF_UNIX", "\\0run/gvmd/../x"))
+
+    def test_a_pathname_socket_starting_with_at_cannot_escape_its_rule(self) -> None:
+        """A leading `@` in a *pathname* socket is part of the name, not a marker."""
+        rule = UnixSocketRule("@trusted/*")
+        assert not rule.matches(_event("AF_UNIX", "@trusted/../../outside.sock"))
 
     def test_an_address_with_nothing_identifying_left_matches_nothing(self) -> None:
         """`fnmatch("", "*")` is true, so the empty case has to be refused outright."""
@@ -525,3 +530,34 @@ class TestFromYamlReportsOneErrorType:
 
     def test_an_empty_allowlist_key_still_loads(self, tmp_path: Path) -> None:
         assert isinstance(self._load(tmp_path, "version: 1\nallowlist:\n"), AllowList)
+
+    def test_a_falsy_allowlist_value_is_rejected(self, tmp_path: Path) -> None:
+        """Reading `allowlist: {}` as "no entries" would leave the built-ins standing."""
+        with pytest.raises(ValueError, match="must be a list"):
+            self._load(tmp_path, "version: 1\nallowlist: {}\n")
+
+    def test_a_non_string_path_prefix_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'path_prefix' must be a string"):
+            self._load(
+                tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n    path_prefix: 1\n"
+            )
+
+    def test_a_non_string_path_glob_is_rejected(self, tmp_path: Path) -> None:
+        """It would otherwise build a rule that only failed later, inside fnmatch."""
+        with pytest.raises(ValueError, match="'path_glob' must be a string"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n    path_glob: 1\n")
+
+    def test_a_unix_entry_naming_no_path_is_rejected(self, tmp_path: Path) -> None:
+        """It used to expand to "*", which permits every Unix socket there is."""
+        with pytest.raises(ValueError, match="needs 'path_glob' or 'path_prefix'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n")
+
+    def test_a_non_utf8_file_is_a_value_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "netaudit.yaml"
+        path.write_bytes(b"version: 1\nallowlist: []\n\xff\xfe")
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(path)
+
+    def test_a_directory_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(tmp_path)

@@ -188,6 +188,25 @@ def _cidr_from(entry: dict[str, Any], host_bits: str) -> str:
     return f"{addr}{host_bits}"
 
 
+def _glob_from(entry: dict[str, Any]) -> str:
+    """The pattern an AF_UNIX entry declares, from ``path_glob`` or ``path_prefix``.
+
+    Both are type-checked here: a non-string ``path_prefix`` would otherwise
+    raise ``TypeError`` out of the concatenation, and a non-string
+    ``path_glob`` would build a rule that only failed later, inside
+    ``fnmatch``, on an event that happened to reach it.
+    """
+    for key, suffix in (("path_glob", ""), ("path_prefix", "*")):
+        value = entry.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"Allowlist entry '{key}' must be a string, not {value!r}")
+        return value + suffix
+    # Neither given: an AF_UNIX entry that names no path at all permits none.
+    raise ValueError(f"Allowlist entry needs 'path_glob' or 'path_prefix': {entry!r}")
+
+
 def _rule_from_dict(entry: dict[str, Any]) -> Rule:
     name = entry.get("name", "")
     family = entry.get("family", "")
@@ -197,8 +216,7 @@ def _rule_from_dict(entry: dict[str, Any]) -> Rule:
     if family == "AF_INET6":
         return IPv6Rule(_cidr_from(entry, "/128"), name=name, port=port)
     if family == "AF_UNIX":
-        glob = entry.get("path_glob") or entry.get("path_prefix", "") + "*"
-        return UnixSocketRule(glob, name=name)
+        return UnixSocketRule(_glob_from(entry), name=name)
     if family == "AF_NETLINK":
         return NetlinkRule(name=name)
     raise ValueError(f"Unknown family in allowlist entry: {family!r}")
@@ -229,7 +247,10 @@ class AllowList:
         """
         try:
             raw = yaml.safe_load(path.read_text()) or {}
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+            # RecursionError: a deeply nested document. Read together with the
+            # rest, these are every way a file on disk can refuse to become a
+            # mapping — which is the promise this method's docstring makes.
             raise ValueError(f"Could not read allowlist {path}: {exc}") from None
         if not isinstance(raw, dict):
             raise ValueError(f"Allowlist {path} is not a mapping")
@@ -249,7 +270,12 @@ class AllowList:
                 f"not {includes_builtins!r}"
             )
 
-        entries = raw.get("allowlist") or []
+        # Only an absent key means "no entries": a falsy one — {}, "", false —
+        # is a malformed file, and reading it as an empty rule list would leave
+        # the built-ins standing in for whatever the file meant to say.
+        entries = raw.get("allowlist")
+        if entries is None:
+            entries = []
         if not isinstance(entries, list):
             raise ValueError(f"Allowlist {path}: 'allowlist' must be a list, not {entries!r}")
         rules: list[Rule] = []
