@@ -466,6 +466,7 @@ class TestOwnDirectory:
         yield
         _tempfiles.remove_tracked()
 
+    @pytest.mark.skipif(os.name != "posix", reason="Windows has no POSIX mode bits")
     def test_is_private_to_this_user(self) -> None:
         assert stat.S_IMODE(_tempfiles.own_directory().stat().st_mode) == 0o700
 
@@ -506,6 +507,7 @@ class TestOwnDirectory:
         finally:
             first.unlink()
 
+    @pytest.mark.skipif(os.name != "posix", reason="Windows has no POSIX mode bits")
     def test_a_directory_belonging_to_someone_else_is_not_removed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -574,6 +576,7 @@ class TestSweepRemovesRunDirectories:
         assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
         assert directory.exists()
 
+    @pytest.mark.skipif(os.name != "posix", reason="Windows has no POSIX mode bits")
     def test_a_world_readable_directory_is_kept(self, tmp_path: Path) -> None:
         """own_directory makes its own 0700; anything else was made by someone else."""
         directory = self._run_dir(tmp_path, f"{_tempfiles.PREFIX}999999-abc.strace")

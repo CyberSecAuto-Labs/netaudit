@@ -6,6 +6,7 @@ coverage lives in ``tests/integration/test_end_to_end.py``.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 from contextlib import contextmanager
@@ -211,8 +212,10 @@ class TestStraceIsResolvedOnce:
             "netaudit.runner.shutil.which", lambda name: calls.append(name) or _STRACE
         )
         try:
-            assert _resolve_strace() == _STRACE
-            assert _resolve_strace() == _STRACE
+            # abspath, because a relative PATH entry is what it guards against —
+            # and on Windows that turns a POSIX-looking path into a drive path.
+            assert _resolve_strace() == os.path.abspath(_STRACE)
+            assert _resolve_strace() == os.path.abspath(_STRACE)
         finally:
             _forget_strace()
         assert calls == ["strace"]
@@ -234,7 +237,7 @@ class TestStraceIsResolvedOnce:
         monkeypatch.setattr("netaudit.runner.shutil.which", lambda _: next(answers))
         try:
             assert _resolve_strace() is None
-            assert _resolve_strace() == _STRACE
+            assert _resolve_strace() == os.path.abspath(_STRACE)
         finally:
             _forget_strace()
 

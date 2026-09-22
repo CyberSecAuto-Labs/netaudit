@@ -980,6 +980,7 @@ class TestPathsFromTheEnvironment:
 
         assert len(closed) == 1
 
+    @pytest.mark.skipif(os.name != "posix", reason="O_NOFOLLOW does not exist on Windows")
     def test_the_markers_file_is_not_written_through_a_symlink(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
