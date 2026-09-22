@@ -134,6 +134,7 @@ def _run_state(trace: Path, markers: Path | None = None, **policy: object) -> _T
         "verbose": False,
         "report": None,
         "suggest_rules": False,
+        "invocation": [],
     }
     settled.update(policy)
     return _TracedRun(trace=trace, markers=markers, canary=_CANARY, **settled)  # type: ignore[arg-type]
@@ -640,6 +641,42 @@ class TestPytestConfigure:
         assert "pytest" in args
         assert _ENV_STRACE_OUT in env
         assert _ENV_MARKERS_OUT in env
+
+    def test_traces_the_arguments_pytest_was_given_not_the_processs_own(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under `pytest.main([...])` sys.argv belongs to the calling program.
+
+        Tracing it would run a different set of tests than the one requested —
+        and then certify the run that never happened.
+        """
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
+        monkeypatch.setattr(sys, "argv", ["run_tests.py", "--profile", "ci"])
+        captured: list[list[str]] = []
+        monkeypatch.setattr(os, "execve", lambda _n, a, _e: captured.append(a))
+        config = self._make_config(enabled=True)
+        config.invocation_params = MagicMock(args=("tests/unit", "-q"))
+
+        pytest_configure(config)
+
+        assert captured[0][-3:] == ["pytest", "tests/unit", "-q"]
+        assert "--profile" not in captured[0]
+
+    def test_falls_back_to_argv_when_pytest_records_no_invocation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
+        monkeypatch.setattr(sys, "argv", ["pytest", "-q"])
+        captured: list[list[str]] = []
+        monkeypatch.setattr(os, "execve", lambda _n, a, _e: captured.append(a))
+        config = self._make_config(enabled=True)
+        config.invocation_params = None
+
+        pytest_configure(config)
+
+        assert captured[0][-2:] == ["pytest", "-q"]
 
     def test_sweeps_leftovers_from_a_run_that_could_not_clean_up(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2089,7 +2126,7 @@ class TestWriteReport:
 
     def test_report_has_version_and_run_block(self, tmp_path: Path) -> None:
         out = tmp_path / "r.json"
-        _write_report({"test_a": [self._v()]}, out)
+        _write_report({"test_a": [self._v()]}, out, [])
         data = json.loads(out.read_text())
         assert data["version"] == 1
         assert data["run"]["netaudit_version"]
@@ -2098,24 +2135,24 @@ class TestWriteReport:
     def test_tests_attribution_survives_into_the_artifact(self, tmp_path: Path) -> None:
         """The pytest path is the only source of per-test attribution."""
         out = tmp_path / "r.json"
-        _write_report({"test_a": [self._v()], "test_b": [self._v()]}, out)
+        _write_report({"test_a": [self._v()], "test_b": [self._v()]}, out, [])
         dest = json.loads(out.read_text())["summary"]["by_destination"][0]
         assert dest["tests"] == ["test_a", "test_b"]
         assert dest["count"] == 2
 
     def test_distinct_destinations_kept_separate(self, tmp_path: Path) -> None:
         out = tmp_path / "r.json"
-        _write_report({"test_a": [self._v("1.2.3.4"), self._v("5.6.7.8")]}, out)
+        _write_report({"test_a": [self._v("1.2.3.4"), self._v("5.6.7.8")]}, out, [])
         assert len(json.loads(out.read_text())["summary"]["by_destination"]) == 2
 
     def test_creates_parent_directories(self, tmp_path: Path) -> None:
         out = tmp_path / "nested" / "dir" / "r.json"
-        _write_report({"test_a": [self._v()]}, out)
+        _write_report({"test_a": [self._v()]}, out, [])
         assert out.exists()
 
     def test_clean_session_still_writes_a_report(self, tmp_path: Path) -> None:
         out = tmp_path / "r.json"
-        _write_report({}, out)
+        _write_report({}, out, [])
         assert json.loads(out.read_text())["summary"]["total"] == 0
 
 

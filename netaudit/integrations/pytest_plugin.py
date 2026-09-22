@@ -87,6 +87,8 @@ class _TracedRun:
     verbose: bool
     report: Path | None
     suggest_rules: bool
+    invocation: list[str]
+    """The arguments pytest was handed — see :func:`_invocation`."""
 
 
 _RUN: _TracedRun | None = None
@@ -299,6 +301,19 @@ def _is_xdist_worker(config: pytest.Config) -> bool:
     return hasattr(config, "workerinput")
 
 
+def _invocation(config: pytest.Config) -> list[str]:
+    """The arguments this session was asked to run, as pytest recorded them.
+
+    ``config.invocation_params.args`` is what pytest was handed, whether that
+    came from the command line or from a ``pytest.main([...])`` call. Falls
+    back to ``sys.argv[1:]`` only if pytest does not record it, which no
+    supported version omits.
+    """
+    params = getattr(config, "invocation_params", None)
+    args = getattr(params, "args", None)
+    return list(args) if args is not None else sys.argv[1:]
+
+
 def _rootdir(config: pytest.Config) -> Path:
     """pytest's rootdir — the directory the run's configuration belongs to."""
     return Path(config.rootpath)
@@ -404,7 +419,9 @@ def _resolve_report_path(config: pytest.Config) -> Path | None:
     return _anchored(value, root) if isinstance(value, str) else None
 
 
-def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) -> None:
+def _write_report(
+    violations_by_test: dict[str, list[Violation]], path: Path, invocation: list[str]
+) -> None:
     """Save a JSON report carrying per-test attribution.
 
     This is the only place test attribution survives into a durable artifact —
@@ -415,7 +432,7 @@ def _write_report(violations_by_test: dict[str, list[Violation]], path: Path) ->
     body = Reporter.format_json(
         merged,
         tests_by_key=tests_by_key,
-        run=build_run_metadata(command=["pytest", *sys.argv[1:]]),
+        run=build_run_metadata(command=["pytest", *invocation]),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -544,6 +561,7 @@ def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:
         verbose=_resolve_verbose(config),
         report=_resolve_report_path(config),
         suggest_rules=_resolve_suggest_rules(config),
+        invocation=_invocation(config),
     )
 
 
@@ -748,10 +766,18 @@ def pytest_configure(config: pytest.Config) -> None:
     # of whether pytest was invoked via its entry-point script or `python -m pytest`
     # (in the latter case sys.argv[0] is the non-executable __main__.py path).
     #
+    # The arguments come from pytest, not from sys.argv, which is only pytest's
+    # when pytest owns the process. Under `pytest.main([...])` called from a
+    # wrapper — `python run_tests.py --profile ci` invoking
+    # `pytest.main(["tests/unit", "-q"])` — sys.argv holds the wrapper's flags
+    # and the list actually passed is nowhere in it. The re-exec would then
+    # trace a different set of tests than the one requested, and certify a run
+    # that never happened.
+    #
     # The strace flags come from the runner rather than being spelled out again:
     # a second copy would drift, and the copy that lost --kill-on-exit would go
     # back to orphaning its tracees without anything failing to say so.
-    cmd = _strace_cmd(Path(strace_path)) + [sys.executable, "-m", "pytest"] + sys.argv[1:]
+    cmd = _strace_cmd(Path(strace_path)) + [sys.executable, "-m", "pytest"] + _invocation(config)
     # execve, not execvpe: the path was resolved once, and searching PATH again
     # here would let a different binary run than the one that was checked.
     os.execve(strace, cmd, env)
@@ -808,7 +834,7 @@ def pytest_sessionfinish(
             if run.report:
                 # Written regardless of verbosity or whether anything violated —
                 # a clean report is still evidence of what the run observed.
-                _write_report(violations_by_test, run.report)
+                _write_report(violations_by_test, run.report, run.invocation)
             if verbose:
                 _emit_attributed_verbose(events, allowlist, test_ranges, session)
             else:
