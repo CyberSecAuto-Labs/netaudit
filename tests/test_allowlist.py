@@ -89,6 +89,19 @@ class TestUnixSocketRule:
         rule = UnixSocketRule("/run/gvmd/*")
         assert rule.matches(_event("AF_UNIX", "/run/gvmd/sub/../gvmd.sock"))
 
+    def test_an_abstract_name_is_matched_literally(self) -> None:
+        """Its bytes are opaque: `/` and `..` inside one are not path syntax."""
+        rule = UnixSocketRule("@/run/gvmd/../x")
+        assert rule.matches(_event("AF_UNIX", "@/run/gvmd/../x"))
+
+    def test_an_address_with_nothing_identifying_left_matches_nothing(self) -> None:
+        """`fnmatch("", "*")` is true, so the empty case has to be refused outright."""
+        assert not UnixSocketRule("*").matches(_event("AF_UNIX", "\x01\x02"))
+
+    def test_a_doubled_leading_slash_still_matches_the_prefix(self) -> None:
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert rule.matches(_event("AF_UNIX", "//run/gvmd/gvmd.sock"))
+
     def test_redundant_segments_do_not_defeat_an_exact_rule(self) -> None:
         rule = UnixSocketRule("/run/foo.sock")
         assert rule.matches(_event("AF_UNIX", "/run/./foo.sock"))

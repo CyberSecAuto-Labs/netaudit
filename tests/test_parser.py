@@ -336,6 +336,16 @@ class TestStraceParser:
         assert event is not None
         assert event.addr == "/tmp/attacker.sock"
 
+    def test_a_doubled_leading_slash_is_collapsed(self, parser: StraceParser) -> None:
+        """Linux resolves `//run` as `/run`; normpath alone would keep both slashes."""
+        line = (
+            "9 12:00:00.000001 connect(5, {sa_family=AF_UNIX,"
+            ' sun_path="//run/gvmd/gvmd.sock"}, 20) = 0'
+        )
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.addr == "/run/gvmd/gvmd.sock"
+
     def test_a_path_of_only_control_chars_stays_empty(self, parser: StraceParser) -> None:
         """normpath("") is ".", which would name the cwd rather than nothing."""
         line = '9 12:00:00.000001 connect(5, {sa_family=AF_UNIX, sun_path="\x01"}, 20) = 0'

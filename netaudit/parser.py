@@ -123,6 +123,12 @@ def _normalise_result(result: int, raw_line: str) -> int:
     return result
 
 
+# An AF_UNIX name in the abstract namespace, which strace renders with a
+# leading "@" (or, raw, a leading NUL). Those bytes are opaque — "/", "." and
+# ".." mean nothing in them — so they are never treated as a path.
+_ABSTRACT_MARKERS = ("@", "\0")
+
+
 def _canonical_path(path: str) -> str:
     """Strip control characters from an AF_UNIX path and collapse ``.`` and ``..``.
 
@@ -138,10 +144,22 @@ def _canonical_path(path: str) -> str:
     ``os.path``: the trace describes Linux paths whatever host reads it.
 
     Symlinks are left alone — the trace does not record what the filesystem
-    held at the time, so there is nothing to resolve them against.
+    held at the time, so there is nothing to resolve them against. A rule
+    scoped to a directory therefore still permits a socket reached through a
+    symlink out of it.
+
+    Abstract-namespace names are returned untouched: they are opaque bytes
+    rather than paths, and collapsing a ``..`` inside one would rename it.
     """
+    if path[:1] in _ABSTRACT_MARKERS:
+        return path
     cleaned = "".join(ch for ch in path if not unicodedata.category(ch).startswith("C"))
-    return posixpath.normpath(cleaned) if cleaned else cleaned
+    if not cleaned:
+        return cleaned
+    collapsed = posixpath.normpath(cleaned)
+    # POSIX leaves a leading "//" implementation-defined and normpath keeps it;
+    # Linux resolves it as "/", so a rule scoped to /run/ must still apply.
+    return "/" + collapsed.lstrip("/") if collapsed.startswith("//") else collapsed
 
 
 def _parse_ts(ts: str) -> float:

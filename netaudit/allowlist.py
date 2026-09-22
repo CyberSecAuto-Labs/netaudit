@@ -111,7 +111,12 @@ class UnixSocketRule:
         """
         if event.family != "AF_UNIX" or event.addr is None:
             return False
-        return fnmatch.fnmatch(_canonical_path(event.addr), self._glob)
+        addr = _canonical_path(event.addr)
+        if not addr:
+            # Nothing identifying survived the strip: there is no path to permit,
+            # and ``fnmatch("", "*")`` would otherwise say every rule covers it.
+            return False
+        return fnmatch.fnmatch(addr, self._glob)
 
 
 class NetlinkRule:

@@ -595,6 +595,30 @@ class TestLoadReport:
         assert rpt.destinations[0].addr == "1.2.3.4"
         assert rpt.destinations[0].count == 3
 
+    def test_a_unix_path_is_canonicalised_on_the_way_in(self, tmp_path: Path) -> None:
+        """A report written before the parser canonicalised holds the raw sun_path.
+
+        `triage` turns it straight into a `path_glob`, and the rule that glob
+        becomes canonicalises what it matches — so an uncanonical one never fires.
+        """
+        rpt = load_report(
+            self._write(
+                tmp_path / "r.json",
+                summary={
+                    "total": 1,
+                    "by_destination": [
+                        {
+                            "family": "AF_UNIX",
+                            "addr": "/run/gvmd/../x.sock",
+                            "port": None,
+                            "count": 1,
+                        }
+                    ],
+                },
+            )
+        )
+        assert rpt.destinations[0].addr == "/run/x.sock"
+
     def test_label_is_the_file_name(self, tmp_path: Path) -> None:
         assert load_report(self._write(tmp_path / "ci-42.json")).label == "ci-42.json"
 

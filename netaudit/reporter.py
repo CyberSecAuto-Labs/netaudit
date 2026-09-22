@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from netaudit.allowlist import AllowList
-from netaudit.parser import ConnectEvent
+from netaudit.parser import ConnectEvent, _canonical_path
 
 __all__ = [
     "Destination",
@@ -210,6 +210,27 @@ class MergedDestination:
         return Violation(family=self.family, addr=self.addr, port=self.port, count=self.count)
 
 
+def _destination_from(entry: dict[str, Any]) -> Destination:
+    """Build one :class:`Destination` from a saved report's ``by_destination`` row.
+
+    AF_UNIX paths are canonicalised on the way in. A report written before the
+    parser did so holds the literal ``sun_path``, and ``triage`` turns that
+    straight into a ``path_glob`` — which would never match, because the rule
+    canonicalises what it is given.
+    """
+    family = str(entry.get("family", ""))
+    addr = entry.get("addr")
+    if family == "AF_UNIX" and isinstance(addr, str):
+        addr = _canonical_path(addr)
+    return Destination(
+        family=family,
+        addr=addr,
+        port=entry.get("port"),
+        count=int(entry.get("count", 0)),
+        tests=set(entry.get("tests") or []),
+    )
+
+
 def load_report(path: Path) -> LoadedReport:
     """Read a saved JSON report, rejecting anything this version cannot parse.
 
@@ -232,17 +253,7 @@ def load_report(path: Path) -> LoadedReport:
 
     summary = data.get("summary") or {}
     raw = summary.get("by_destination") or [] if isinstance(summary, dict) else []
-    destinations = [
-        Destination(
-            family=str(d.get("family", "")),
-            addr=d.get("addr"),
-            port=d.get("port"),
-            count=int(d.get("count", 0)),
-            tests=set(d.get("tests") or []),
-        )
-        for d in raw
-        if isinstance(d, dict)
-    ]
+    destinations = [_destination_from(d) for d in raw if isinstance(d, dict)]
     run = data.get("run") or {}
     return LoadedReport(
         label=path.name,
