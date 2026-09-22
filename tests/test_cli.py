@@ -956,6 +956,56 @@ class TestRunTracingFailure:
         assert result.exit_code == 0  # type: ignore[attr-defined]
 
 
+class TestTheReportNamesTheAllowlistThatJudgedIt:
+    """A clean report and a suppressed one must not read alike."""
+
+    _PERMISSIVE = "version: 1\nallowlist:\n  - family: AF_INET\n    cidr: 0.0.0.0/0\n"
+
+    def test_an_auto_discovered_allowlist_is_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+        (tmp_path / "netaudit.yaml").write_text(self._PERMISSIVE)
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "netaudit.yaml").write_text(self._PERMISSIVE)
+        monkeypatch.chdir(project)
+
+        result = CliRunner().invoke(main, ["analyze", "--format", "json", str(log)])
+
+        report = json.loads(result.output)
+        assert report["summary"]["total"] == 0
+        assert report["run"]["allowlist"] == "netaudit.yaml"
+
+    def test_no_allowlist_at_all_records_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        result = CliRunner().invoke(main, ["analyze", "--format", "json", str(log)])
+
+        assert "allowlist" not in json.loads(result.output)["run"]
+
+    def test_an_explicit_allowlist_is_recorded_as_given(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        custom = tmp_path / "custom.yaml"
+        custom.write_text("version: 1\nallowlist: []\n")
+
+        result = CliRunner().invoke(
+            main, ["analyze", "--allowlist", str(custom), "--format", "json", str(log)]
+        )
+
+        assert json.loads(result.output)["run"]["allowlist"] == str(custom)
+
+
 class TestMissingAllowlist:
     """A named allowlist that is not there is the motivating failure, not malformed YAML."""
 

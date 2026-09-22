@@ -99,8 +99,16 @@ def _parse_trace(lines: list[str], unreadable_code: int) -> list[ConnectEvent]:
     return events
 
 
-def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
+def _load_allowlist(
+    allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT
+) -> tuple[AllowList, str | None]:
     """Load the allowlist, or exit *bad_input_code* if it cannot be used.
+
+    Returns the rule set together with the path it actually came from, which is
+    not the same as the argument: with ``--allowlist`` omitted a repo-local
+    ``netaudit.yaml`` is picked up, and a report that recorded only the option
+    would name no allowlist at all. A run whose violations were suppressed by
+    an undeclared config would then be indistinguishable from a clean one.
 
     Callers pass the code appropriate to their exit-code space: `run` reserves
     one clear of the traced command's range, the others use plain bad input.
@@ -110,11 +118,11 @@ def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT
     """
     try:
         if allowlist is not None:
-            return AllowList.from_yaml(Path(allowlist))
+            return AllowList.from_yaml(Path(allowlist)), allowlist
         default = Path(_DEFAULT_ALLOWLIST)
         if default.exists():
-            return AllowList.from_yaml(default)
-        return AllowList.empty()
+            return AllowList.from_yaml(default), str(default)
+        return AllowList.empty(), None
     except ValueError as exc:
         # Report it the way click reports a usage error, not as a traceback.
         click.echo(f"netaudit: {exc}", err=True)
@@ -276,7 +284,7 @@ def run_cmd(
         click.echo(f"netaudit: {exc}", err=True)
         sys.exit(_EXIT_STRACE_MISSING)
 
-    al = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
+    al, allowlist_used = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
 
     # Recover the traces of earlier runs that were killed outright, then take a
     # name the same sweep will recognise if this run is the one that is killed.
@@ -327,7 +335,7 @@ def run_cmd(
             suggest_rules=suggest_rules,
             run=build_run_metadata(
                 command=list(command),
-                allowlist=allowlist,
+                allowlist=allowlist_used,
                 command_exit_code=command_code,
             ),
             output=output,
@@ -395,7 +403,7 @@ def analyze_cmd(
     strace_log: str,
 ) -> None:
     """Analyze an existing strace log file for network violations."""
-    al = _load_allowlist(allowlist)
+    al, allowlist_used = _load_allowlist(allowlist)
     events = _parse_trace(Path(strace_log).read_text().splitlines(), _EXIT_BAD_INPUT)
     violations = Reporter.check(events, al)
     _emit(
@@ -406,7 +414,7 @@ def analyze_cmd(
         allowlist=al,
         color=_resolve_color(no_color),
         suggest_rules=suggest_rules,
-        run=build_run_metadata(source=strace_log, allowlist=allowlist),
+        run=build_run_metadata(source=strace_log, allowlist=allowlist_used),
         output=output,
     )
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
@@ -473,7 +481,7 @@ def triage_cmd(
     merged = merge_reports(loaded)
 
     if allowlist is not None:
-        al = _load_allowlist(allowlist)
+        al, _ = _load_allowlist(allowlist)
         merged = [d for d in merged if not al.is_allowed(_as_event(d))]
 
     if not merged:
