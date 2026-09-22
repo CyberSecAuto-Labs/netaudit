@@ -956,6 +956,44 @@ class TestRunTracingFailure:
         assert result.exit_code == 0  # type: ignore[attr-defined]
 
 
+class TestUnreadableTrace:
+    """A connect() netaudit cannot parse must not be reported as a clean run."""
+
+    _LOG = "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0\n"
+
+    def test_analyze_rejects_the_log(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(self._LOG)
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert result.exit_code == 2
+        assert "could not be parsed" in result.output
+
+    def test_run_exits_87(self, tmp_path: Path) -> None:
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+            patch("pathlib.Path.unlink"),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert "could not be parsed" in result.output
+
+    def test_the_count_is_reported(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(self._LOG * 3)
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert "3 connect() lines" in result.output
+
+
 class TestRunReservedCodesAreDistinct:
     """netaudit's own codes must not be reachable by the traced command."""
 

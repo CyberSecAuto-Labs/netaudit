@@ -806,6 +806,25 @@ class TestPytestSessionfinish:
         assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
         assert "198.51.100.1" not in capsys.readouterr().out
 
+    def test_an_unreadable_connect_fails_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A destination netaudit cannot read is not a destination it can clear."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0\n"
+        )
+        _traced_run(monkeypatch, strace_file)
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+        assert "not audited" in out
+        assert "1 connect() line" in out
+
     def test_a_trace_that_vanished_fails_the_session(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

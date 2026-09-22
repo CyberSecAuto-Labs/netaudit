@@ -339,3 +339,49 @@ class TestStraceParser:
         assert event is not None
         expected = 1 * 3600 + 2 * 60 + 3.456789
         assert abs(event.timestamp - expected) < 1e-4
+
+
+class TestUnparsedConnectLines:
+    """A connect() the matchers cannot read must be counted, not dropped.
+
+    Silently skipping it turns a trace full of egress into "no violations":
+    the destination is unknown, but the fact that one was reached is not.
+    """
+
+    def test_a_clean_stream_counts_nothing(self, parser: StraceParser) -> None:
+        line = (
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("93.184.216.34"), sin_port=htons(443)}, 16) = 0'
+        )
+        parser.parse_stream([line])
+        assert parser.unparsed == 0
+
+    def test_an_unknown_sockaddr_shape_is_counted(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0"
+        events = parser.parse_stream([line])
+        assert events == []
+        assert parser.unparsed == 1
+
+    def test_an_unreadable_address_is_counted(self, parser: StraceParser) -> None:
+        """The family is known; the address rendering is not."""
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, sin_addr=0x7f000001}, 16) = 0"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_an_over_long_line_is_counted(self, parser: StraceParser) -> None:
+        line = (
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("93.184.216.34"), sin_port=htons(443)' + " " * 4096 + "}, 16) = 0"
+        )
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_lines_that_are_not_connect_calls_are_not_counted(self, parser: StraceParser) -> None:
+        assert parser.parse_stream(["1234 12:00:00.000001 +++ exited with 0 +++", ""]) == []
+        assert parser.unparsed == 0
+
+    def test_the_count_is_reset_per_stream(self, parser: StraceParser) -> None:
+        bad = "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0"
+        parser.parse_stream([bad])
+        parser.parse_stream([])
+        assert parser.unparsed == 0

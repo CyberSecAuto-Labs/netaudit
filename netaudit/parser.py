@@ -64,6 +64,10 @@ _RE_NETLINK = re.compile(
     _HEADER + r"connect\(\d+,\s*\{sa_family=(?P<family>AF_NETLINK)" + r".*?" + _RESULT,
 )
 
+# A line that opens a traced connect() call, whatever it goes on to say. Used
+# to notice the ones no matcher below could read, rather than dropping them.
+_RE_CONNECT_LINE = re.compile(_HEADER + r"connect\(")
+
 # Resumed lines: "12345 12:34:56.789 <... connect resumed>) = 0"
 _RE_RESUMED = re.compile(
     r"(?P<pid>\d+)\s+(?P<ts>\d+:\d+:\d+\.\d+)\s+<\.\.\.\s+connect\s+resumed>" + r".*?" + _RESULT,
@@ -145,6 +149,16 @@ class ConnectEvent:
 
 class StraceParser:
     """Parse strace -e trace=connect -tt -f output into ConnectEvents."""
+
+    def __init__(self) -> None:
+        self.unparsed = 0
+        """connect() lines the last :meth:`parse_stream` could not read.
+
+        A destination netaudit cannot read is not a destination it can judge,
+        and a trace it reads as empty is indistinguishable from a clean run.
+        Callers must treat a non-zero count as a failed audit rather than
+        reporting on what did parse.
+        """
 
     def parse_line(self, line: str) -> ConnectEvent | None:
         """Return a ConnectEvent for *line*, or None if unrecognised.
@@ -256,14 +270,20 @@ class StraceParser:
 
         Halves without a counterpart are kept rather than dropped — a truncated
         trace is still evidence that the connect was attempted.
+
+        Lines that open a ``connect(`` no matcher understood are counted in
+        :attr:`unparsed`, which is reset on every call.
         """
         events: list[ConnectEvent] = []
         # pid -> index in *events* of a connect awaiting its result.
         pending: dict[int, int] = {}
+        self.unparsed = 0
 
         for line in lines:
             event = self.parse_line(line)
             if event is None:
+                if _RE_CONNECT_LINE.match(line):
+                    self.unparsed += 1
                 continue
 
             if event.family == "AF_UNKNOWN":

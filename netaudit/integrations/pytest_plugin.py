@@ -433,18 +433,37 @@ def _adopt_the_traced_run(strace_out: str, config: pytest.Config) -> _TracedRun:
     )
 
 
-def _emit_untraced(session: pytest.Session) -> None:
-    """Fail the session that produced no trace of its own canary connect()."""
+def _emit_not_audited(session: pytest.Session, detail: str) -> None:
+    """Fail the session, with *detail* saying why its trace is not evidence."""
     border = "=" * 60
     color = _resolve_color(session)
     print(f"\n{border}")
     print(_paint("  netaudit: the session was not audited", _BOLD + _RED, color))
     print(border)
-    print("\n  No trace was produced. strace may lack ptrace permission here, or")
-    print("  the trace was removed while the session ran; either way nothing")
-    print("  observed this run, so it cannot be reported as clean.")
+    print(f"\n{detail}")
     print(f"{border}\n")
     _fail_session(session)
+
+
+def _emit_untraced(session: pytest.Session) -> None:
+    """Fail the session that produced no trace of its own canary connect()."""
+    _emit_not_audited(
+        session,
+        "  No trace was produced. strace may lack ptrace permission here, or\n"
+        "  the trace was removed while the session ran; either way nothing\n"
+        "  observed this run, so it cannot be reported as clean.",
+    )
+
+
+def _emit_unreadable(session: pytest.Session, unparsed: int) -> None:
+    """Fail the session whose trace holds connect() calls netaudit cannot read."""
+    noun = "line" if unparsed == 1 else "lines"
+    _emit_not_audited(
+        session,
+        f"  {unparsed} connect() {noun} in the trace could not be parsed, so the\n"
+        "  destinations they reached are unknown. Part of a run cannot be\n"
+        "  reported as the whole of it.",
+    )
 
 
 def _emit_attributed_verbose(
@@ -647,7 +666,11 @@ def pytest_sessionfinish(
 
     try:
         trace = strace_file.read_text() if strace_file.exists() else ""
-        events = StraceParser().parse_stream(trace.splitlines())
+        parser = StraceParser()
+        events = parser.parse_stream(trace.splitlines())
+        if parser.unparsed:
+            _emit_unreadable(session, parser.unparsed)
+            return
         if not any(e.addr == run.canary for e in events):
             _emit_untraced(session)
             return

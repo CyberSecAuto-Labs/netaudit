@@ -75,6 +75,26 @@ def _echo_strace_error(stderr: bytes | None) -> None:
         click.echo(message, err=True)
 
 
+def _parse_trace(lines: list[str], unreadable_code: int) -> list[ConnectEvent]:
+    """Parse *lines* into events, or exit *unreadable_code* if any was unreadable.
+
+    A ``connect()`` netaudit cannot read is a destination it cannot judge. The
+    rest of the trace is still parsed, but reporting on it would present part
+    of a run as the whole of it — and an empty result as a clean one.
+    """
+    parser = StraceParser()
+    events = parser.parse_stream(lines)
+    if parser.unparsed:
+        noun = "line" if parser.unparsed == 1 else "lines"
+        click.echo(
+            f"netaudit: {parser.unparsed} connect() {noun} could not be parsed; "
+            "the trace cannot be judged",
+            err=True,
+        )
+        sys.exit(unreadable_code)
+    return events
+
+
 def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
     """Load the allowlist, or exit *bad_input_code* if it cannot be used.
 
@@ -273,7 +293,7 @@ def run_cmd(
             click.echo(f"netaudit: strace wrote no trace and exited {command_code}", err=True)
             _echo_strace_error(completed.stderr)
             sys.exit(_EXIT_TRACE_FAILED)
-        events = StraceParser().parse_stream(trace.splitlines())
+        events = _parse_trace(trace.splitlines(), _EXIT_TRACE_FAILED)
         violations = Reporter.check(events, al)
         _emit(
             violations,
@@ -353,7 +373,7 @@ def analyze_cmd(
 ) -> None:
     """Analyze an existing strace log file for network violations."""
     al = _load_allowlist(allowlist)
-    events = StraceParser().parse_stream(Path(strace_log).read_text().splitlines())
+    events = _parse_trace(Path(strace_log).read_text().splitlines(), _EXIT_BAD_INPUT)
     violations = Reporter.check(events, al)
     _emit(
         violations,
