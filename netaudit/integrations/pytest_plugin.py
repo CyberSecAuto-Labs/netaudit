@@ -13,6 +13,8 @@ tests, and fails the session if any are found.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import secrets
 import socket
@@ -147,12 +149,47 @@ def _item_location(item: pytest.Item) -> str:
     return f"{path}:{lineno + 1}"
 
 
+_SECONDS_IN_A_DAY = 86400.0
+
+
+def _marker_timestamp(text: str) -> float | None:
+    """The timestamp of a marker record, or None when *text* is not one.
+
+    ``float`` accepts ``inf`` and ``nan``, and a range ending at infinity
+    contains every event in the run. Attribution is first-match-wins, so one
+    such record would report the whole run under a single benign nodeid — and
+    nodeids come from the repository under audit.
+    """
+    try:
+        ts = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(ts) or not 0.0 <= ts < _SECONDS_IN_A_DAY:
+        return None
+    return ts
+
+
+def _marker_field(text: str) -> str | None:
+    """Decode one quoted marker field, or None when it is not one."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, str) else None
+
+
 def _parse_markers(path: Path) -> list[_TestRange]:
     """Parse a markers sidecar file into test time-ranges.
 
-    Records are tab-separated ``kind, timestamp, location, nodeid``. Tabs rather
-    than spaces because parametrized nodeids contain spaces — ``test_p[a b c]``
-    — which a space-delimited fourth field could not survive.
+    Records are tab-separated ``kind, timestamp, location, nodeid``. Tabs
+    rather than spaces because parametrized nodeids contain spaces —
+    ``test_p[a b c]`` — which a space-delimited fourth field could not survive.
+
+    The two text fields are JSON-quoted by :func:`_append_marker`. A nodeid is
+    repository-controlled, and written raw it could carry a tab (dropping the
+    record) or one of the separators ``splitlines`` honours beyond ``\n`` —
+    ``\x0b``, ``\x1c``, ``\x85``, ``\u2028`` — manufacturing a forged one.
+    JSON escapes every one of them.
     """
     ranges: list[_TestRange] = []
     pending: dict[str, tuple[float, str | None]] = {}
@@ -160,16 +197,20 @@ def _parse_markers(path: Path) -> list[_TestRange]:
         parts = line.split("\t")
         if len(parts) != 4:
             continue
-        kind, ts_str, location, nodeid = parts
-        try:
-            ts = float(ts_str)
-        except ValueError:
+        kind, ts_str, raw_location, raw_nodeid = parts
+        ts = _marker_timestamp(ts_str)
+        location = _marker_field(raw_location)
+        nodeid = _marker_field(raw_nodeid)
+        if ts is None or location is None or nodeid is None:
             continue
         if kind == "START":
             pending[nodeid] = (ts, location or None)
         elif kind == "END" and nodeid in pending:
             start, loc = pending.pop(nodeid)
-            ranges.append(_TestRange(nodeid=nodeid, start=start, end=ts, location=loc))
+            # A range that ends before it starts matches nothing; keeping it
+            # would only add a row the reader cannot make sense of.
+            if ts >= start:
+                ranges.append(_TestRange(nodeid=nodeid, start=start, end=ts, location=loc))
     return ranges
 
 
@@ -187,7 +228,12 @@ def _markers_target(config: pytest.Config) -> Path | None:
 
 
 def _append_marker(path: Path, kind: str, location: str, nodeid: str) -> None:
-    """Append one tab-separated marker record to *path*, never through a symlink."""
+    """Append one tab-separated marker record to *path*, never through a symlink.
+
+    The text fields are JSON-quoted — see :func:`_parse_markers` for why a raw
+    nodeid can forge or destroy a record.
+    """
+    record = f"{kind}\t{_now_ts():.6f}\t{json.dumps(location)}\t{json.dumps(nodeid)}\n"
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | _NO_SYMLINK)
     try:
         handle = os.fdopen(fd, "a")
@@ -195,7 +241,7 @@ def _append_marker(path: Path, kind: str, location: str, nodeid: str) -> None:
         os.close(fd)
         raise
     with handle as f:
-        f.write(f"{kind}\t{_now_ts():.6f}\t{location}\t{nodeid}\n")
+        f.write(record)
 
 
 def _group_events(events: list[ConnectEvent]) -> list[Violation]:
