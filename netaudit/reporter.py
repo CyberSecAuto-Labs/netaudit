@@ -110,13 +110,13 @@ _ALWAYS_TAKES_A_VALUE = frozenset(
 )
 _SECRET_WORDS = _ALWAYS_TAKES_A_VALUE | {"auth", "bearer", "cookie", "key"}
 
-# Names that only read as a secret with their separators removed, so that
-# ``--api-key`` and ``--apikey`` are treated alike. Kept disjoint from the
-# single words above: joining against those too would make ``--to-ken`` read
-# as ``token``. All of these take a value, so they count for both forms.
-_JOINED_SECRET_NAMES = frozenset(
-    {"accesstoken", "apikey", "apisecret", "apitoken", "bearertoken", "privatekey"}
-)
+# Compound names that read as a secret only with their separators removed, and
+# whose parts are not enough on their own: ``--api-key`` splits to {"api",
+# "key"}, and ``key`` alone is too often a switch to mask the argument after.
+# Disjoint from the sets above — joining against those too would make
+# ``--to-ken`` read as ``token`` — and every name here takes a value, so it
+# counts for both the ``=value`` and the separate-argument form.
+_JOINED_SECRET_NAMES = frozenset({"apikey", "privatekey"})
 _NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 # scheme://user:password@host — the password half is what is masked.
@@ -155,7 +155,10 @@ def _redact_command(command: list[str]) -> list[str]:
     for argument in command:
         # `--token VALUE`: the value is the next element — unless what follows
         # is plainly another option, which would otherwise be masked away and
-        # lost from the record of what ran.
+        # lost from the record of what ran. The cost of that choice is that a
+        # secret which itself begins with `-` is left in; there is no way to
+        # tell one from a flag without knowing the command's own grammar, and
+        # rewriting the record is the worse of the two errors.
         if mask_next:
             mask_next = False
             if not argument.startswith("-"):
@@ -482,7 +485,8 @@ def load_report(path: Path) -> LoadedReport:
         raise ValueError(f"Report {path.name} is not a JSON object")
 
     version = data.get("version")
-    if version != REPORT_VERSION:
+    # bool is a subclass of int, so `"version": true` would otherwise pass.
+    if isinstance(version, bool) or version != REPORT_VERSION:
         raise ValueError(
             f"Report {path.name} has unsupported schema version {version!r} "
             f"(this netaudit reads version {REPORT_VERSION})"
@@ -504,12 +508,14 @@ def load_report(path: Path) -> LoadedReport:
         if not isinstance(entry, dict):
             raise ValueError(f"Report {path.name}: each destination must be an object")
     destinations = [_destination_from(d) for d in raw]
-    run = data.get("run") or {}
-    return LoadedReport(
-        label=path.name,
-        run=run if isinstance(run, dict) else {},
-        destinations=destinations,
-    )
+    run = data.get("run")
+    if run is None:
+        run = {}
+    if not isinstance(run, dict):
+        # Replacing it with {} would present a report that says nothing about
+        # where it came from as one that simply did not record it.
+        raise ValueError(f"Report {path.name}: 'run' must be an object")
+    return LoadedReport(label=path.name, run=run, destinations=destinations)
 
 
 def merge_reports(reports: list[LoadedReport]) -> list[MergedDestination]:

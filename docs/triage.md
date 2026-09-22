@@ -161,7 +161,9 @@ That is a filter over the shapes secrets usually take, not a guarantee: a secret
 a bare positional argument, or under a name netaudit does not recognise, still reaches the
 report. It is conservative in the other direction too — for names that are often boolean
 switches (`--auth`, `--key`, `--cookie`) only the `--name=value` form is masked, because
-masking the argument *after* a flag would silently rewrite the record of what ran.
+masking the argument *after* a flag would silently rewrite the record of what ran. For the
+same reason a value that itself begins with `-` is left in: nothing short of knowing the
+command's own grammar tells it apart from another flag.
 
 Reports are meant to be published as CI artifacts — treat them as such before uploading one
 from a job that handles credentials.
