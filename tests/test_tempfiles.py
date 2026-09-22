@@ -413,6 +413,50 @@ class TestIsOwnName:
             path.rmdir()
 
 
+class TestKeep:
+    """A trace that could not be judged is evidence; nothing may take it away."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """One directory per process is shared by the whole session otherwise."""
+        monkeypatch.setattr(_tempfiles, "_TRACKED", set())
+        monkeypatch.setattr(_tempfiles, "_OWN_DIRECTORY", None)
+        yield
+        _tempfiles.remove_tracked()
+
+    def test_a_kept_file_survives_cleanup(self) -> None:
+        path = _tempfiles.create(".strace")
+        path.write_text("evidence")
+
+        _tempfiles.keep(path)
+        _tempfiles.remove_tracked()
+
+        try:
+            assert path.read_text() == "evidence"
+        finally:
+            path.unlink()
+            path.parent.rmdir()
+
+    def test_the_directory_holding_it_survives_too(self) -> None:
+        """Removing the directory would take the file with it."""
+        trace = _tempfiles.create(".strace")
+        markers = _tempfiles.create(".markers")
+        trace.write_text("evidence")
+
+        _tempfiles.keep(trace)
+        _tempfiles.remove_tracked()
+
+        try:
+            assert trace.exists() and not markers.exists()
+            assert trace.parent.is_dir()
+        finally:
+            trace.unlink()
+            trace.parent.rmdir()
+
+    def test_keeping_a_path_that_was_never_tracked_is_not_an_error(self, tmp_path: Path) -> None:
+        _tempfiles.keep(tmp_path / "nothing")
+
+
 class TestIsOwnDirectory:
     def test_a_file_wearing_a_run_directory_name_is_not_one(self) -> None:
         path = Path(tempfile.gettempdir()) / f"{_tempfiles.PREFIX}{os.getpid()}-notadir"
