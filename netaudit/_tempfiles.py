@@ -61,7 +61,8 @@ _ABANDONED_AGE_SECONDS = 7 * 24 * 60 * 60
 
 # ``os.kill(pid, 0)`` is a liveness probe on POSIX and a *termination* on
 # Windows, which has no strace and therefore none of these files either.
-_CAN_PROBE_PIDS = os.name == "posix"
+_POSIX = os.name == "posix"
+_CAN_PROBE_PIDS = _POSIX
 
 # Signals that end the process without unwinding. SIGHUP is absent on Windows,
 # which has no strace either. Shared with the CLI, which installs its own
@@ -213,11 +214,13 @@ def _has_run_directory_shape(path: Path) -> bool:
         info = path.lstat()
     except OSError:
         return False
-    return (
-        stat.S_ISDIR(info.st_mode)
-        and stat.S_IMODE(info.st_mode) == 0o700
-        and info.st_uid == os.getuid()
-    )
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    # Mode and owner are a POSIX statement. Windows reports neither usefully
+    # and has no strace, so nothing there ever writes one of these files.
+    if not _POSIX:
+        return True
+    return stat.S_IMODE(info.st_mode) == 0o700 and info.st_uid == os.getuid()
 
 
 def is_own_name(path: Path) -> bool:
@@ -241,7 +244,9 @@ def is_own_name(path: Path) -> bool:
         return False
     # lstat rather than stat: a symlink is not a file this module created, and
     # a link count above one means the name is shared with something else.
-    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.getuid()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+        return False
+    return not _POSIX or info.st_uid == os.getuid()
 
 
 def _owner_still_running(path: Path) -> bool:

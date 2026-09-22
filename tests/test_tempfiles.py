@@ -413,6 +413,48 @@ class TestIsOwnName:
             path.rmdir()
 
 
+class TestIsOwnDirectory:
+    def test_a_file_wearing_a_run_directory_name_is_not_one(self) -> None:
+        path = Path(tempfile.gettempdir()) / f"{_tempfiles.PREFIX}{os.getpid()}-notadir"
+        path.write_text("")
+        try:
+            assert not _tempfiles.is_own_directory(path)
+        finally:
+            path.unlink()
+
+
+class TestOffPosix:
+    """Windows reports neither mode nor owner usefully, and has no strace.
+
+    Nothing there ever writes one of these files, so the checks that are a
+    POSIX statement are skipped rather than failed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _not_posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(_tempfiles, "_POSIX", False)
+
+    def test_a_directory_is_accepted_without_a_mode_or_owner_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        directory = tmp_path / f"{_tempfiles.PREFIX}1-abc"
+        directory.mkdir(mode=0o755)
+
+        assert _tempfiles.is_own_directory(directory)
+
+    def test_a_file_is_accepted_without_an_owner_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        directory = tmp_path / f"{_tempfiles.PREFIX}1-abc"
+        directory.mkdir(mode=0o755)
+        path = directory / f"{_tempfiles.PREFIX}1-abc.strace"
+        path.write_text("")
+
+        assert _tempfiles.is_own_name(path)
+
+
 class TestOwnDirectory:
     """strace reopens the trace by name; the directory is what makes that safe."""
 

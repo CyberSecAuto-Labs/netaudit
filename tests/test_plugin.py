@@ -156,12 +156,17 @@ def _traced_run(
 # ---------------------------------------------------------------------------
 
 
+def _marker(kind: str, ts: str, location: str, nodeid: str) -> str:
+    """One marker record in the on-disk form :func:`_append_marker` writes."""
+    return f"{kind}\t{ts}\t{json.dumps(location)}\t{json.dumps(nodeid)}\n"
+
+
 class TestParseMarkers:
     def test_single_test(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text(
-            "START\t10.000000\t\ttests/test_foo.py::test_a\n"
-            "END\t10.500000\t\ttests/test_foo.py::test_a\n"
+            _marker("START", "10.000000", "", "tests/test_foo.py::test_a")
+            + _marker("END", "10.500000", "", "tests/test_foo.py::test_a")
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
@@ -172,8 +177,10 @@ class TestParseMarkers:
     def test_multiple_tests(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text(
-            "START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
-            "START\t10.6\t\ttest_b\nEND\t11.0\t\ttest_b\n"
+            _marker("START", "10.0", "", "test_a")
+            + _marker("END", "10.5", "", "test_a")
+            + _marker("START", "10.6", "", "test_b")
+            + _marker("END", "11.0", "", "test_b")
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 2
@@ -183,33 +190,109 @@ class TestParseMarkers:
     def test_ignores_malformed_lines(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text(
-            "garbage\nSTART\tbad_ts\t\ttest_a\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n"
+            "garbage\n"
+            + _marker("START", "bad_ts", "", "test_a")
+            + _marker("START", "10.0", "", "test_a")
+            + _marker("END", "10.5", "", "test_a")
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
 
     def test_unmatched_start_is_dropped(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("START\t10.0\t\ttest_a\n")  # no END
+        f.write_text(_marker("START", "10.0", "", "test_a"))  # no END
         ranges = _parse_markers(f)
         assert ranges == []
 
     def test_unmatched_end_is_ignored_and_parsing_continues(self, tmp_path: Path) -> None:
         """A truncated run can leave an END whose START was never written."""
         f = tmp_path / "markers"
-        f.write_text("END\t9.0\t\ttest_ghost\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        f.write_text(
+            _marker("END", "9.0", "", "test_ghost")
+            + _marker("START", "10.0", "", "test_a")
+            + _marker("END", "10.5", "", "test_a")
+        )
         ranges = _parse_markers(f)
         assert [r.nodeid for r in ranges] == ["test_a"]
 
     def test_unknown_marker_kind_is_ignored(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
-        f.write_text("SETUP\t9.0\t\ttest_a\nSTART\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        f.write_text(
+            _marker("SETUP", "9.0", "", "test_a")
+            + _marker("START", "10.0", "", "test_a")
+            + _marker("END", "10.5", "", "test_a")
+        )
         assert [r.nodeid for r in _parse_markers(f)] == ["test_a"]
 
     def test_empty_file(self, tmp_path: Path) -> None:
         f = tmp_path / "markers"
         f.write_text("")
         assert _parse_markers(f) == []
+
+
+class TestMarkersCannotBeForged:
+    """Nodeids come from the repository under audit, and so do the markers."""
+
+    @pytest.mark.parametrize("ts", ["inf", "-inf", "nan", "-1.0", "86400.0", "1e400"])
+    def test_a_range_that_is_not_a_time_of_day_is_dropped(self, tmp_path: Path, ts: str) -> None:
+        """Attribution is first-match-wins: one range ending at infinity takes the run."""
+        f = tmp_path / "markers"
+        f.write_text(_marker("START", "10.0", "", "test_a") + _marker("END", ts, "", "test_a"))
+        assert _parse_markers(f) == []
+
+    def test_a_range_that_ends_before_it_starts_is_dropped(self, tmp_path: Path) -> None:
+        f = tmp_path / "markers"
+        f.write_text(_marker("START", "20.0", "", "test_a") + _marker("END", "10.0", "", "test_a"))
+        assert _parse_markers(f) == []
+
+    @pytest.mark.parametrize(
+        "separator", ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028"]
+    )
+    def test_a_nodeid_cannot_manufacture_a_second_record(
+        self, tmp_path: Path, separator: str
+    ) -> None:
+        """splitlines honours more separators than the writer's "\n"."""
+        nodeid = f"test_a{separator}END\t99999.0\t\ttest_forged"
+        f = tmp_path / "markers"
+        f.write_text(_marker("START", "10.0", "", nodeid) + _marker("END", "10.5", "", nodeid))
+
+        ranges = _parse_markers(f)
+
+        assert [r.nodeid for r in ranges] == [nodeid]
+
+    def test_a_nodeid_containing_a_tab_survives(self, tmp_path: Path) -> None:
+        """Written raw it would split the record into five fields and be dropped."""
+        nodeid = "test_a\tEND"
+        f = tmp_path / "markers"
+        f.write_text(_marker("START", "10.0", "", nodeid) + _marker("END", "10.5", "", nodeid))
+        assert [r.nodeid for r in _parse_markers(f)] == [nodeid]
+
+    def test_an_unquoted_field_is_dropped(self, tmp_path: Path) -> None:
+        f = tmp_path / "markers"
+        f.write_text("START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        assert _parse_markers(f) == []
+
+    def test_a_field_that_is_not_a_string_is_dropped(self, tmp_path: Path) -> None:
+        f = tmp_path / "markers"
+        f.write_text("START\t10.0\t[]\t12\nEND\t10.5\t[]\t12\n")
+        assert _parse_markers(f) == []
+
+    def test_the_writer_and_the_reader_agree_on_a_hostile_nodeid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        nodeid = "tests/t.py::test[\x1b\t\n\u2028 a b]"
+        markers = tmp_path / "markers"
+        markers.touch()
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers))
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = nodeid
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            gen.send(None)
+
+        assert [r.nodeid for r in _parse_markers(markers)] == [nodeid]
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +505,10 @@ class TestResolveAllowlist:
         monkeypatch.chdir(tmp_path)
         yaml = tmp_path / "custom.yaml"
         yaml.write_text("version: 1\nallowlist: []\n")
-        (tmp_path / "pyproject.toml").write_text(f'[tool.netaudit]\nallowlist = "{yaml}"\n')
+        # A TOML basic string, so the path must not carry unescaped backslashes.
+        (tmp_path / "pyproject.toml").write_text(
+            f'[tool.netaudit]\nallowlist = "{yaml.as_posix()}"\n'
+        )
         config = _mock_config()
         al = _resolve_allowlist(config)  # type: ignore[arg-type]
         assert isinstance(al, AllowList)
@@ -1122,7 +1208,9 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)  # no netaudit.yaml → builtin-only allowlist
@@ -1149,7 +1237,9 @@ class TestPytestSessionfinish:
             'sin_port=htons(80), sin_addr=inet_addr("127.0.0.1")}, 16) = 0\n'
         )
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
@@ -1171,7 +1261,9 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
@@ -1398,7 +1490,9 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file, verbose=True)
         monkeypatch.chdir(tmp_path)
@@ -1440,7 +1534,9 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_LOOPBACK)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file, verbose=True)
         monkeypatch.chdir(tmp_path)
@@ -1462,7 +1558,9 @@ class TestPytestSessionfinishVerbose:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
 
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
@@ -1784,8 +1882,8 @@ class TestMarkerLocations:
     def test_location_is_parsed(self, tmp_path: Path) -> None:
         f = tmp_path / "m"
         f.write_text(
-            "START\t10.0\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
-            "END\t10.5\ttests/test_api.py:42\ttests/test_api.py::test_a\n"
+            _marker("START", "10.0", "tests/test_api.py:42", "tests/test_api.py::test_a")
+            + _marker("END", "10.5", "tests/test_api.py:42", "tests/test_api.py::test_a")
         )
         ranges = _parse_markers(f)
         assert len(ranges) == 1
@@ -1793,14 +1891,16 @@ class TestMarkerLocations:
 
     def test_empty_location_becomes_none(self, tmp_path: Path) -> None:
         f = tmp_path / "m"
-        f.write_text("START\t10.0\t\ttest_a\nEND\t10.5\t\ttest_a\n")
+        f.write_text(_marker("START", "10.0", "", "test_a") + _marker("END", "10.5", "", "test_a"))
         assert _parse_markers(f)[0].location is None
 
     def test_nodeid_with_spaces_survives(self, tmp_path: Path) -> None:
         """Parametrized nodeids contain spaces — tabs keep the field intact."""
         nodeid = "tests/test_api.py::test_p[a b c]"
         f = tmp_path / "m"
-        f.write_text(f"START\t10.0\tf.py:1\t{nodeid}\nEND\t10.5\tf.py:1\t{nodeid}\n")
+        f.write_text(
+            _marker("START", "10.0", "f.py:1", nodeid) + _marker("END", "10.5", "f.py:1", nodeid)
+        )
         assert _parse_markers(f)[0].nodeid == nodeid
 
     def test_wrong_field_count_ignored(self, tmp_path: Path) -> None:
@@ -1850,7 +1950,7 @@ class TestRuntestProtocolLocation:
             next(gen)
 
         lines = markers.read_text().splitlines()
-        assert lines[0].split("\t")[2] == "tests/test_api.py:42"  # 0-based -> 1-based
+        assert json.loads(lines[0].split("\t")[2]) == "tests/test_api.py:42"  # 0-based -> 1-based
 
     def test_missing_lineno_writes_empty_location(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1867,7 +1967,7 @@ class TestRuntestProtocolLocation:
         with contextlib.suppress(StopIteration):
             next(gen)
 
-        assert markers.read_text().splitlines()[0].split("\t")[2] == ""
+        assert json.loads(markers.read_text().splitlines()[0].split("\t")[2]) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2043,7 +2143,9 @@ class TestSessionfinishWritesReport:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         markers_file = tmp_path / "markers"
-        markers_file.write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        markers_file.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
         _traced_run(monkeypatch, strace_file, markers_file, report=report)
         monkeypatch.chdir(tmp_path)
 
@@ -2226,7 +2328,9 @@ class TestPolicyIsSettledBeforeTestsRun:
     ) -> None:
         root, elsewhere = self._project(tmp_path)
         self._configure(root, monkeypatch, report="report.json")
-        (root / "markers").write_text("START\t43199.0\t\ttest_a\nEND\t43201.0\t\ttest_a\n")
+        (root / "markers").write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
         assert pytest_plugin._RUN is not None
         pytest_plugin._RUN.markers = root / "markers"
 
