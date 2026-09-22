@@ -394,24 +394,43 @@ def _resolve_verbose(config: pytest.Config) -> bool:
     return verbose if isinstance(verbose, bool) else False
 
 
+def _load_allowlist(path: Path) -> AllowList:
+    """Load the allowlist at *path*, or abort the session saying why.
+
+    Every failure is caught and re-raised as a usage error rather than left to
+    surface as a traceback out of ``pytest_configure``: the causes are all
+    things a user wrote — a path that moved, a version bump, a malformed
+    entry — and each needs naming, not a stack.
+    """
+    try:
+        return AllowList.from_yaml(path)
+    except Exception as exc:
+        raise pytest.UsageError(f"netaudit: allowlist {path}: {exc}") from None
+
+
 def _resolve_allowlist(config: pytest.Config) -> AllowList:
-    """Resolve allowlist: CLI flag > pyproject.toml > netaudit.yaml > builtins."""
+    """Resolve allowlist: CLI flag > pyproject.toml > netaudit.yaml > builtins.
+
+    An allowlist that is named but cannot be loaded ends the session. Falling
+    back to the built-ins would not be falling back to nothing: they permit
+    every AF_UNIX path, all of ``127.0.0.0/8``, ``::1`` and all of AF_NETLINK,
+    so a policy that turned them off with ``includes_builtins: false`` would be
+    replaced by a *more* permissive one the moment its file was renamed or
+    mis-edited — silently, and on every run after. ``netaudit run`` treats the
+    same condition as a hard error; this is that verdict in pytest's idiom.
+    """
     root = _rootdir(config)
     cli_path: str | None = config.getoption("--netaudit-allowlist")
     if cli_path is not None:
-        return AllowList.from_yaml(_anchored(cli_path, Path.cwd()))
+        return _load_allowlist(_anchored(cli_path, Path.cwd()))
 
     al_path = _pyproject_netaudit(root).get("allowlist")
     if isinstance(al_path, str):
-        try:
-            return AllowList.from_yaml(_anchored(al_path, root))
-        except Exception:
-            # Unreadable/malformed allowlist — fall through to the defaults below.
-            pass
+        return _load_allowlist(_anchored(al_path, root))
 
     default = _anchored(_DEFAULT_ALLOWLIST, root)
     if default.exists():
-        return AllowList.from_yaml(default)
+        return _load_allowlist(default)
 
     return AllowList.empty()
 

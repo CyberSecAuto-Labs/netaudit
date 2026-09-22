@@ -306,15 +306,45 @@ class TestResolveAllowlist:
         al = _resolve_allowlist(config)  # type: ignore[arg-type]
         assert isinstance(al, AllowList)
 
-    def test_malformed_pyproject_allowlist_falls_back_to_builtins(
+    def test_a_missing_pyproject_allowlist_ends_the_session(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A broken allowlist path in pyproject.toml must not break collection."""
+        """The built-ins are more permissive than any policy that names a file."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nallowlist = "missing.yaml"\n')
         config = _mock_config()
-        al = _resolve_allowlist(config)  # type: ignore[arg-type]
-        assert isinstance(al, AllowList)
+
+        with pytest.raises(pytest.UsageError, match="missing.yaml"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_a_malformed_pyproject_allowlist_ends_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "custom.yaml").write_text("version: 99\nallowlist: []\n")
+        (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nallowlist = "custom.yaml"\n')
+        config = _mock_config()
+
+        with pytest.raises(pytest.UsageError, match="Unsupported allowlist version"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_a_malformed_cli_allowlist_ends_the_session(self, tmp_path: Path) -> None:
+        yaml = tmp_path / "custom.yaml"
+        yaml.write_text("version: 1\nallowlist:\n  - family: AF_NOPE\n")
+        config = _mock_config(allowlist_opt=str(yaml))
+
+        with pytest.raises(pytest.UsageError, match="Unknown family"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_a_malformed_netaudit_yaml_ends_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "netaudit.yaml").write_text("version: 1\nallowlist: [[[\n")
+        config = _mock_config()
+
+        with pytest.raises(pytest.UsageError, match="netaudit.yaml"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
 
     def test_reads_allowlist_from_pyproject_toml(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

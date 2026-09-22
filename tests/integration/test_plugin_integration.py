@@ -222,6 +222,18 @@ class TestPluginAutoEnable:
         assert result.ret != 0
         result.stdout.fnmatch_lines(["*netaudit*violation*"])
 
+    def test_a_named_allowlist_that_cannot_be_loaded_ends_the_session(
+        self, pytester: pytest.Pytester
+    ) -> None:
+        """Falling back to the built-ins would widen the policy, not preserve it."""
+        pytester.makepyfile("def test_nothing(): pass")
+        pytester.makepyprojecttoml('[tool.netaudit]\nenabled = true\nallowlist = "gone.yaml"\n')
+
+        result = pytester.runpytest_subprocess()
+
+        assert result.ret != 0
+        result.stderr.fnmatch_lines(["*netaudit: allowlist*gone.yaml*"])
+
     def test_pyproject_enabled_false_does_not_trace(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(
             """
