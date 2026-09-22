@@ -67,7 +67,30 @@ _RE_NETLINK = re.compile(
 
 # A line that opens a traced connect() call, whatever it goes on to say. Used
 # to notice the ones no matcher below could read, rather than dropping them.
-_RE_CONNECT_LINE = re.compile(_HEADER + r"connect\(")
+#
+# The pid and timestamp are optional here even though every matcher above
+# requires them: a log captured without ``-f`` or ``-tt`` yields no events at
+# all, and the whole point of this regex is that such a log must not read as a
+# clean run. The anchor at the start is what keeps a ``connect(`` inside a
+# traced write payload from being mistaken for a syscall.
+_RE_CONNECT_LINE = re.compile(
+    r"\s*(?:\[pid\s+\d+\]\s+)?(?:\d+\s+)?(?:\d+:\d+:\d+\.\d+\s+)?connect\("
+)
+
+# The first argument of a connect() that reached no destination: AF_UNSPEC is
+# how a socket is *dis*connected, and a NULL or unreadable sockaddr pointer
+# never made it into the kernel. Neither is egress, so neither is a connect
+# netaudit failed to read.
+_RE_NO_DESTINATION = re.compile(r"\d+,\s*(?:NULL|0x[0-9a-fA-F]+|\{sa_family=AF_UNSPEC\b)")
+
+
+def _is_unreadable_connect(line: str) -> bool:
+    """Whether *line* is a connect() call whose destination went unread."""
+    opening = _RE_CONNECT_LINE.match(line)
+    if opening is None:
+        return False
+    return _RE_NO_DESTINATION.match(line, opening.end()) is None
+
 
 # Resumed lines: "12345 12:34:56.789 <... connect resumed>) = 0"
 _RE_RESUMED = re.compile(
@@ -163,12 +186,15 @@ class StraceParser:
 
     def __init__(self) -> None:
         self.unparsed = 0
-        """connect() lines the last :meth:`parse_stream` could not read.
+        """connect() lines this parser could not read.
 
         A destination netaudit cannot read is not a destination it can judge,
         and a trace it reads as empty is indistinguishable from a clean run.
         Callers must treat a non-zero count as a failed audit rather than
         reporting on what did parse.
+
+        :meth:`parse_line` adds to it; :meth:`parse_stream` resets it first, so
+        each stream is judged on its own.
         """
 
     def parse_line(self, line: str) -> ConnectEvent | None:
@@ -178,21 +204,27 @@ class StraceParser:
         describes: the destination is on that half, and discarding it would lose
         the egress entirely. Use :meth:`parse_stream` to pair it with the
         ``resumed`` half and pick up the real result.
+
+        A line that opens a ``connect(`` but yields nothing adds to
+        :attr:`unparsed` — returning None alone would let a caller read it as
+        "not a connect at all".
         """
         line = line.rstrip()
 
         # Guard against extremely long lines (e.g. from corrupted output files)
         # before running regexes that could backtrack catastrophically.
         if len(line) > _MAX_LINE_LEN:
-            return None
-
-        if _UNFINISHED_MARKER in line:
+            event = None
+        elif _UNFINISHED_MARKER in line:
             event = self._parse_call(_as_complete_call(line))
             if event is not None:
                 event.raw_line = line
-            return event
+        else:
+            event = self._parse_call(line)
 
-        return self._parse_call(line)
+        if event is None and _is_unreadable_connect(line):
+            self.unparsed += 1
+        return event
 
     def _parse_call(self, line: str) -> ConnectEvent | None:
         """Match *line* against every known connect() shape."""
@@ -293,8 +325,6 @@ class StraceParser:
         for line in lines:
             event = self.parse_line(line)
             if event is None:
-                if _RE_CONNECT_LINE.match(line):
-                    self.unparsed += 1
                 continue
 
             if event.family == "AF_UNKNOWN":

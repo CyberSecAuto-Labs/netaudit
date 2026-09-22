@@ -985,6 +985,35 @@ class TestUnreadableTrace:
         assert result.exit_code == 87
         assert "could not be parsed" in result.output
 
+    def test_a_headerless_log_is_refused_rather_than_read_as_clean(self, tmp_path: Path) -> None:
+        """A log captured without -f -tt parses to nothing at all."""
+        log = tmp_path / "trace.log"
+        log.write_text(
+            'connect(3, {sa_family=AF_INET, sin_addr=inet_addr("8.8.8.8"), '
+            "sin_port=htons(53)}, 16) = 0\n"
+        )
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert result.exit_code == 2
+        assert "could not be parsed" in result.output
+
+    def test_a_failing_command_is_still_reported(self, tmp_path: Path) -> None:
+        """The exit code is netaudit's, so the command's status must be said out loud."""
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=7, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+            patch("pathlib.Path.unlink"),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert "traced command exited 7" in result.output
+
     def test_the_count_is_reported(self, tmp_path: Path) -> None:
         log = tmp_path / "trace.log"
         log.write_text(self._LOG * 3)

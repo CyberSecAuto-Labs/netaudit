@@ -393,6 +393,74 @@ class TestUnparsedConnectLines:
         assert parser.parse_stream([line]) == []
         assert parser.unparsed == 1
 
+    def test_a_disconnect_is_not_counted(self, parser: StraceParser) -> None:
+        """AF_UNSPEC is how a socket is *dis*connected; it reaches nothing."""
+        line = (
+            '1234 12:00:00.000001 connect(3, {sa_family=AF_UNSPEC, sa_data="\\0\\0\\0\\0"}, 16) = 0'
+        )
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 0
+
+    def test_a_null_sockaddr_is_not_counted(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, NULL, 16) = -1 EFAULT (Bad address)"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 0
+
+    def test_an_unreadable_sockaddr_pointer_is_not_counted(self, parser: StraceParser) -> None:
+        """strace prints the pointer when the kernel refused to read it."""
+        line = "1234 12:00:00.000001 connect(3, 0x7ffd0a1b2c3d, 16) = -1 EFAULT (Bad address)"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 0
+
+    def test_a_log_without_pid_or_timestamp_is_counted(self, parser: StraceParser) -> None:
+        """No header means no event either — which must not read as a clean run."""
+        line = (
+            "connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("8.8.8.8"), sin_port=htons(53)}, 16) = 0'
+        )
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_the_bracketed_pid_form_is_counted(self, parser: StraceParser) -> None:
+        line = '[pid  1234] connect(3, {sa_family=AF_INET, sin_addr=inet_addr("8.8.8.8")}, 16) = 0'
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_a_connect_inside_a_traced_payload_is_not_counted(self, parser: StraceParser) -> None:
+        """Only a line that *opens* with the call is a syscall record."""
+        line = '1234 12:00:00.000001 write(2, "connect(3, {sa_family=AF_VSOCK})", 32) = 32'
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 0
+
+    def test_an_orphan_resumed_half_is_not_counted(self, parser: StraceParser) -> None:
+        line = "8888 14:00:00.000002 <... connect resumed>) = 0"
+        assert len(parser.parse_stream([line])) == 1
+        assert parser.unparsed == 0
+
+    def test_a_readable_unfinished_half_is_not_counted(self, parser: StraceParser) -> None:
+        assert len(parser.parse_stream([_UNFINISHED])) == 1
+        assert parser.unparsed == 0
+
+    def test_an_unreadable_unfinished_half_is_counted(self, parser: StraceParser) -> None:
+        line = "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2 <unfinished ...>"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_the_readable_part_of_a_mixed_trace_still_parses(self, parser: StraceParser) -> None:
+        good = (
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("8.8.8.8"), sin_port=htons(53)}, 16) = 0'
+        )
+        bad = "1234 12:00:00.000002 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0"
+        events = parser.parse_stream([good, bad])
+        assert [e.addr for e in events] == ["8.8.8.8"]
+        assert parser.unparsed == 1
+
+    def test_parse_line_counts_what_it_could_not_read(self, parser: StraceParser) -> None:
+        """Returning None alone would read as "not a connect at all"."""
+        parser.parse_line("1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK}, 16) = 0")
+        assert parser.unparsed == 1
+
     def test_lines_that_are_not_connect_calls_are_not_counted(self, parser: StraceParser) -> None:
         assert parser.parse_stream(["1234 12:00:00.000001 +++ exited with 0 +++", ""]) == []
         assert parser.unparsed == 0
