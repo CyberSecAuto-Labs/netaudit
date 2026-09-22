@@ -6,12 +6,15 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
+
+import yaml
 
 from netaudit.allowlist import AllowList
 from netaudit.parser import ConnectEvent, _canonical_path
@@ -108,6 +111,50 @@ def build_run_metadata(
     return meta
 
 
+# Every C0 and C1 control character, plus DEL. \t and \n are in the range on
+# purpose: both break a fixed-width table, and neither belongs in an address,
+# a nodeid or a filename.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable(text: str) -> str:
+    """*text* with control characters shown rather than acted on.
+
+    Addresses, test nodeids and report names all reach a terminal and all come
+    from outside netaudit: a trace line the audited process can append to, a
+    repo's own test ids, a filename given on the command line. An address
+    containing ``\x1b[2K\r`` erases and rewrites the line it is printed on, so
+    a violation can be made to render as a clean one — and the violation block
+    is the last thing on stdout, where a reader's eye lands.
+
+    Escaped rather than stripped: removing the bytes could turn an address that
+    is not one into something that reads like a real destination.
+    """
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+def _rule_yaml(rule: dict[str, Any]) -> str:
+    """*rule* as an indented YAML list item, quoted however its values require.
+
+    Built by a dumper rather than by formatting, because the values are not
+    netaudit's: they come out of a saved JSON report, and the docs recommend
+    collecting those as CI artifacts from elsewhere. A newline in an address
+    would otherwise inject whatever the writer chose into the very file the
+    tool tells the user to paste into their allowlist — including broader
+    rules than the ones it is showing them.
+    """
+    body = yaml.safe_dump([rule], sort_keys=False, default_flow_style=False, width=10**6)
+    return "".join(f"  {line}\n" for line in body.splitlines())
+
+
+def _comment(text: str) -> str:
+    """*text* as a single YAML comment line, whatever whitespace it holds.
+
+    A newline would end the comment and let the rest be read as YAML.
+    """
+    return "# " + " ".join(_printable(text).split())
+
+
 def _paint(text: str, code: str, color: bool) -> str:
     """Wrap *text* in an ANSI *code* when *color* is on, else return it plain."""
     return f"{code}{text}{_RESET}" if color else text
@@ -142,11 +189,13 @@ class Violation:
         return (self.family, self.addr, self.port)
 
     def _addr_str(self) -> str:
+        """The destination as it is rendered — never with live control characters."""
         if self.addr is None:
             return "<unknown>"
+        addr = _printable(self.addr)
         if self.port is not None:
-            return f"{self.addr}:{self.port}"
-        return self.addr
+            return f"{addr}:{self.port}"
+        return addr
 
     def __str__(self) -> str:
         pids_str = ", ".join(str(p) for p in sorted(self.pids))
@@ -361,9 +410,10 @@ class Reporter:
         def _addr_str(event: ConnectEvent) -> str:
             if event.addr is None:
                 return "-"
+            addr = _printable(event.addr)
             if event.port is not None:
-                return f"{event.addr}:{event.port}"
-            return event.addr
+                return f"{addr}:{event.port}"
+            return addr
 
         header = f"{'FAMILY':<{col_family}} {'ADDR:PORT':<{col_addr}} {'STATUS':<{col_status}} RULE"
         sep = f"{'-' * col_family} {'-' * col_addr} {'-' * col_status} {'-' * 24}"
@@ -374,7 +424,7 @@ class Reporter:
         for event in events:
             rule = allowlist.match(event)
             status = "OK" if rule is not None else "VIOLATION"
-            rule_name = rule.name if rule is not None else "-"
+            rule_name = _printable(rule.name) if rule is not None else "-"
             addr = _addr_str(event)
             # Pad first, then paint — ANSI codes must not count toward the width.
             status_cell = _paint(
@@ -417,7 +467,9 @@ class Reporter:
         # Loudest destination first; ties broken by address for stable output.
         for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
             if tests_by_key is not None:
-                third = ", ".join(sorted(tests_by_key.get(v.key, set()))) or "-"
+                third = (
+                    ", ".join(_printable(t) for t in sorted(tests_by_key.get(v.key, set()))) or "-"
+                )
             else:
                 third = ", ".join(str(pid) for pid in sorted(v.pids))
             addr = _paint(f"{v._addr_str():<{col_addr}}", _RED, color)
@@ -446,18 +498,14 @@ class Reporter:
         buf = io.StringIO()
         buf.write(_paint("# Suggested rules to allow these connections:", _BOLD, color) + "\n")
         for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
+            rule: dict[str, Any] = {"name": f"allow {v._addr_str()}", "family": v.family}
             if v.family == "AF_UNIX":
-                buf.write(f'  - name: "allow {v.addr}"\n')
-                buf.write("    family: AF_UNIX\n")
-                buf.write(f"    path_glob: {v.addr}\n")
-                continue
-            # Quote IPv6 literals — bare colons are not valid YAML scalars here.
-            addr = f'"{v.addr}"' if v.family == "AF_INET6" else str(v.addr)
-            buf.write(f'  - name: "allow {v._addr_str()}"\n')
-            buf.write(f"    family: {v.family}\n")
-            buf.write(f"    addr: {addr}\n")
-            if v.port is not None:
-                buf.write(f"    port: {v.port}\n")
+                rule["path_glob"] = v.addr
+            else:
+                rule["addr"] = v.addr
+                if v.port is not None:
+                    rule["port"] = v.port
+            buf.write(_rule_yaml(rule))
 
         result = buf.getvalue()
         if stream is not None:
@@ -527,17 +575,18 @@ class Reporter:
             if d.tests:
                 evidence += " · tests: " + ", ".join(sorted(d.tests))
 
-            addr_str = f"{d.addr}:{d.port}" if d.port is not None else str(d.addr)
-            addr = f'"{d.addr}"' if d.family == "AF_INET6" else str(d.addr)
-            buf.write(f'  - name: "allow {addr_str}"\n')
-            buf.write(f"    # {evidence}\n")
-            buf.write(f"    family: {d.family}\n")
+            rule: dict[str, Any] = {
+                "name": f"allow {d.as_violation()._addr_str()}",
+                "family": d.family,
+            }
             if d.family == "AF_UNIX":
-                buf.write(f"    path_glob: {d.addr}\n")
-                continue
-            buf.write(f"    addr: {addr}\n")
-            if d.port is not None:
-                buf.write(f"    port: {d.port}\n")
+                rule["path_glob"] = d.addr
+            else:
+                rule["addr"] = d.addr
+                if d.port is not None:
+                    rule["port"] = d.port
+            buf.write("  " + _comment(evidence) + "\n")
+            buf.write(_rule_yaml(rule))
 
         result = buf.getvalue()
         if stream is not None:

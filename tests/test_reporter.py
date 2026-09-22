@@ -4,10 +4,12 @@ import io
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
-from netaudit.allowlist import AllowList
+from netaudit.allowlist import AllowList, IPv4Rule
 from netaudit.parser import ConnectEvent
 from netaudit.reporter import (
     Destination,
@@ -21,6 +23,17 @@ from netaudit.reporter import (
     merge_reports,
     supports_color,
 )
+
+
+def _rules_from(body: str) -> list[dict[str, Any]]:
+    """Parse the rule list out of suggestion output, as a user pasting it would.
+
+    The evidence lives in comments, so this is exactly what an allowlist file
+    holds once those lines are copied under its ``allowlist:`` key.
+    """
+    parsed = yaml.safe_load("version: 1\nallowlist:\n" + body)
+    rules: list[dict[str, Any]] = parsed["allowlist"] or []
+    return rules
 
 
 def _event(
@@ -430,11 +443,18 @@ class TestFormatSuggestions:
         assert "addr: 198.51.100.1" in out
         assert "port: 443" in out
 
-    def test_ipv6_suggestion_quotes_the_address(self) -> None:
+    def test_ipv6_suggestion_round_trips_into_a_working_rule(self) -> None:
+        """What matters is that the rule parses back and matches, not how it is quoted."""
         out = Reporter.format_suggestions(self._violations(_event("AF_INET6", "2001:db8::1", 8080)))
         assert "family: AF_INET6" in out
-        assert 'addr: "2001:db8::1"' in out
-        assert "port: 8080" in out
+        assert _rules_from(out) == [
+            {
+                "name": "allow 2001:db8::1:8080",
+                "family": "AF_INET6",
+                "addr": "2001:db8::1",
+                "port": 8080,
+            }
+        ]
 
     def test_unix_socket_suggestion_uses_path_glob(self) -> None:
         # Built-ins allow every AF_UNIX socket, so this path is only reachable
@@ -1063,3 +1083,84 @@ class TestFormatSuggestionsWithEvidenceMultiple:
         )
         assert "path_glob: /run/foo.sock" in out
         assert "addr: 1.2.3.4" in out
+
+
+class TestSuggestionsSurviveHostileInput:
+    """The values come out of saved reports, which the docs say to collect from CI."""
+
+    _INJECTION = "1.2.3.4\n  - name: everything\n    family: AF_INET\n    cidr: 0.0.0.0/0"
+
+    def test_a_newline_in_an_address_injects_no_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_INET", addr=self._INJECTION, port=80, count=1)]
+        )
+        rules = _rules_from(out)
+        assert len(rules) == 1
+        assert rules[0]["family"] == "AF_INET"
+        assert "0.0.0.0/0" not in str(rules[0].get("cidr", ""))
+
+    def test_a_newline_in_a_unix_path_injects_no_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_UNIX", addr="/run/x\n  - family: AF_NETLINK", port=None, count=1)]
+        )
+        assert len(_rules_from(out)) == 1
+
+    def test_a_newline_in_triage_evidence_injects_no_rule(self) -> None:
+        """The evidence is a comment; a newline would end it and open YAML."""
+        dest = MergedDestination(
+            family="AF_INET",
+            addr="1.2.3.4",
+            port=80,
+            count=1,
+            reports=["r.json"],
+            total_reports=1,
+            tests={"t.py::a\n  - name: everything\n    family: AF_NETLINK"},
+        )
+        out = Reporter.format_suggestions_with_evidence([dest])
+        rules = _rules_from("\n".join(line for line in out.splitlines() if line.startswith("  ")))
+        assert len(rules) == 1
+        assert rules[0]["family"] == "AF_INET"
+
+    def test_a_newline_in_a_triage_address_injects_no_rule(self) -> None:
+        dest = MergedDestination(
+            family="AF_INET",
+            addr=self._INJECTION,
+            port=80,
+            count=1,
+            reports=["r.json"],
+            total_reports=1,
+        )
+        out = Reporter.format_suggestions_with_evidence([dest])
+        rules = _rules_from("\n".join(line for line in out.splitlines() if line.startswith("  ")))
+        assert len(rules) == 1
+
+
+class TestControlCharactersAreShownNotActed:
+    """An address that erases the line it is printed on can hide a violation."""
+
+    _ERASER = "8.8.8.8\x1b[2K\rnetaudit: no violations"
+
+    def test_the_violation_block_escapes_them(self) -> None:
+        out = Reporter.format([Violation(family="AF_INET", addr=self._ERASER, port=53, count=1)])
+        assert "\x1b" not in out
+        assert "\\x1b" in out
+
+    def test_the_verbose_table_escapes_them(self) -> None:
+        out = Reporter.format_verbose([_event("AF_INET", self._ERASER, 53)], AllowList.empty())
+        assert "\x1b" not in out
+
+    def test_the_summary_escapes_a_test_nodeid(self) -> None:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80, count=1)
+        out = Reporter.format_summary([v], tests_by_key={v.key: {"t.py::a\x1b[2K\r"}})
+        assert "\x1b" not in out
+
+    def test_a_rule_name_is_escaped_in_the_verbose_table(self) -> None:
+        allowlist = AllowList([IPv4Rule("1.2.3.4/32", name="ok\x1b[2K\r")], includes_builtins=False)
+        out = Reporter.format_verbose([_event("AF_INET", "1.2.3.4", 80)], allowlist)
+        assert "\x1b" not in out
+
+    def test_suggestions_escape_them(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_INET", addr=self._ERASER, port=53, count=1)]
+        )
+        assert "\x1b" not in out

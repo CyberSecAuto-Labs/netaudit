@@ -34,6 +34,7 @@ from netaudit.reporter import (
     Reporter,
     Violation,
     _paint,
+    _printable,
     _ViolationKey,
     build_run_metadata,
     supports_color,
@@ -580,7 +581,7 @@ def _emit_attributed_verbose(
     print("  netaudit: verbose network event report")
     print(border)
     for nodeid, test_events in sorted(by_test.items()):
-        print(f"\n  [{nodeid}]")
+        print(f"\n  [{_printable(nodeid)}]")
         Reporter.format_verbose(test_events, allowlist, stream=sys.stdout, color=color)
     print(f"{border}\n")
 
@@ -604,8 +605,9 @@ def _emit_attributed(
     for nodeid, violations in sorted(violations_by_test.items()):
         loc = (locations or {}).get(nodeid)
         # The nodeid is the pytest address; file:line is what editors can jump to.
-        suffix = f"  ({loc})" if loc else ""
-        print(f"\n  [{nodeid}]{suffix}")
+        # Both are repo-controlled text on its way to a terminal.
+        suffix = f"  ({_printable(loc)})" if loc else ""
+        print(f"\n  [{_printable(nodeid)}]{suffix}")
         for v in violations:
             print("    " + _paint(str(v), _RED, color))
 
