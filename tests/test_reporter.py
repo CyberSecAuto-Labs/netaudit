@@ -1164,3 +1164,93 @@ class TestControlCharactersAreShownNotActed:
             [Violation(family="AF_INET", addr=self._ERASER, port=53, count=1)]
         )
         assert "\x1b" not in out
+
+
+class TestSavedReportFieldsAreTyped:
+    """A report is untrusted JSON, and a wrong type does not fail — it stops matching."""
+
+    def _load(self, tmp_path: Path, **destination: object) -> LoadedReport:
+        path = tmp_path / "r.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "summary": {"total": 1, "by_destination": [destination]},
+                }
+            )
+        )
+        return load_report(path)
+
+    def test_a_string_port_is_rejected(self, tmp_path: Path) -> None:
+        """`'443' != 443`, so an allowlist rule that permits it would not fire."""
+        with pytest.raises(ValueError, match="'port' must be a number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port="443", count=1)
+
+    def test_a_boolean_port_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'port' must be a number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=True, count=1)
+
+    def test_a_whole_float_port_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=443.0, count=1)
+        assert report.destinations[0].port == 443
+
+    def test_a_fractional_port_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'port' must be a number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80.5, count=1)
+
+    def test_an_integer_address_is_rejected(self, tmp_path: Path) -> None:
+        """`IPv4Address(12345)` is valid and means a different address entirely."""
+        with pytest.raises(ValueError, match="'addr' must be a string"):
+            self._load(tmp_path, family="AF_INET", addr=12345, port=80, count=1)
+
+    def test_a_null_address_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_NETLINK", addr=None, port=None, count=1)
+        assert report.destinations[0].addr is None
+
+    def test_a_non_numeric_count_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'count' must be a number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count="many")
+
+    def test_a_tests_field_that_is_not_strings_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'tests' must be a list of strings"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=1, tests=[1])
+
+
+class TestSecretsAreMaskedInTheRecordedCommand:
+    """Reports are meant to be published as CI artifacts; argv often is not."""
+
+    def _command(self, *args: str) -> list[str]:
+        meta = build_run_metadata(command=list(args))
+        recorded: list[str] = meta["command"]
+        return recorded
+
+    def test_an_attached_value_is_masked(self) -> None:
+        assert self._command("curl", "--token=s3cr3t") == ["curl", "--token=***"]
+
+    def test_a_separate_value_is_masked(self) -> None:
+        assert self._command("curl", "--api-key", "s3cr3t") == ["curl", "--api-key", "***"]
+
+    def test_the_option_name_itself_survives(self) -> None:
+        """What the run did is still legible; only the value goes."""
+        assert "--password" in " ".join(self._command("app", "--password", "hunter2"))
+
+    def test_credentials_in_a_url_are_masked(self) -> None:
+        assert self._command("psql", "postgres://alice:hunter2@db:5432/x") == [
+            "psql",
+            "postgres://alice:***@db:5432/x",
+        ]
+
+    def test_an_ordinary_argument_is_untouched(self) -> None:
+        assert self._command("pytest", "-q", "tests/unit") == ["pytest", "-q", "tests/unit"]
+
+    def test_an_option_following_a_secret_option_is_not_eaten(self) -> None:
+        """`--token --verbose` would otherwise mask a flag and lose it."""
+        assert self._command("app", "--token", "--verbose") == ["app", "--token", "***"]
+
+    def test_a_positional_secret_is_not_caught(self) -> None:
+        """Documented limit: this filters shapes, it does not understand the command."""
+        assert self._command("app", "hunter2") == ["app", "hunter2"]
+
+    def test_the_hostname_is_still_recorded(self) -> None:
+        """It ties a report to the machine that made it, and is not a credential."""
+        assert build_run_metadata(command=["pytest"])["hostname"]
