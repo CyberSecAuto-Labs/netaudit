@@ -57,6 +57,13 @@ Every one of these is resolved when the session starts, before the first test ru
 that changes the working directory cannot move the allowlist the run is judged against, nor
 the destination of `--netaudit-report`.
 
+An allowlist that is *named* but cannot be loaded — missing, malformed, or written to a
+schema version this release does not read — ends the session with a usage error. It does
+not fall back to level 4: the built-in defaults permit every Unix socket path, all of
+`127.0.0.0/8`, `::1` and all of AF_NETLINK, so a policy with `includes_builtins: false`
+would be replaced by a broader one the moment its file moved. Level 4 applies only when no
+allowlist was named at all.
+
 ## Trace integrity
 
 The audited session plants a `connect()` of its own before collection and expects to find it
