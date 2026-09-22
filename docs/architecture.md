@@ -65,6 +65,12 @@ Spawns a command wrapped in `strace -e trace=connect -f -tt -o <file>`. Supports
 
 Raises `StraceNotFoundError` if `strace` is not on PATH.
 
+`connect` is the whole of the traced syscall set, which bounds what any part of netaudit
+can report on. Egress that never issues one — `sendto()`/`sendmsg()` to an explicit
+destination on an unconnected UDP socket, or a connection submitted through `io_uring` —
+produces no event, and therefore no violation. Widening the set is a parser change as much
+as a runner one: each syscall renders its destination in a different shape.
+
 ### `parser.py` — `StraceParser`, `ConnectEvent`
 
 Line-by-line regex parser. Handles:

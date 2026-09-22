@@ -84,6 +84,14 @@ Fields:
 | `path_glob` | one of `path_glob`/`path_prefix` | Full glob pattern |
 | `path_prefix` | one of `path_glob`/`path_prefix` | Prefix; expands to `prefix*` |
 
+Socket paths are canonicalised before they are matched: `.` and `..` are collapsed the way
+the kernel collapses them, so `/run/gvmd/../../tmp/attacker.sock` is judged as
+`/tmp/attacker.sock` and a rule scoped to `/run/gvmd/` does not permit it. Write rules in
+canonical form — a `..` inside a pattern is matched literally and will never fire.
+
+`path_prefix` is a string prefix, not a directory boundary: `path_prefix: /run/gvm` also
+permits `/run/gvmd-other/x.sock`. Include the trailing slash when you mean the directory.
+
 ### `AF_NETLINK` — Netlink
 
 Allow all AF_NETLINK connections (used by glibc resolver internals).

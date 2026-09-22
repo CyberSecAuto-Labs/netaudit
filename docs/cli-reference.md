@@ -21,6 +21,11 @@ Trace a command under strace and report network violations.
 netaudit run [OPTIONS] -- COMMAND [ARGS]...
 ```
 
+!!! note "`connect()` is the whole of what is traced"
+    UDP sent with `sendto()`/`sendmsg()` on an unconnected socket, and connections issued
+    through `io_uring`, make no `connect()` call and are therefore never reported. See
+    [what netaudit sees](index.md#what-it-sees-and-what-it-does-not).
+
 ### Options
 
 | Option | Default | Description |
