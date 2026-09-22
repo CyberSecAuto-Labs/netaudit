@@ -117,9 +117,17 @@ netaudit analyze [OPTIONS] STRACE_LOG
 
 !!! warning "An unreadable `connect()` fails the run"
     A `connect()` line netaudit cannot parse is a destination it cannot judge, so both
-    commands refuse the trace rather than report on the part of it they did read. Reaching
-    this usually means the log came from an strace whose sockaddr rendering this version
-    does not cover — please open an issue with the line.
+    commands refuse the trace rather than report on the part of it they did read. This
+    settles *before* the traced command's own status, so `run` exits `87` even when the
+    command failed — it names the command's exit code on stderr rather than passing it
+    through, because netaudit cannot stand behind a verdict it could not reach.
+
+    A log captured without `-f -tt` is refused for the same reason: without the pid and
+    timestamp prefix nothing parses, and "nothing parsed" must not read as "nothing
+    connected". A call that reached no destination — `AF_UNSPEC`, which *dis*connects a
+    socket, or a sockaddr the kernel refused to read — is not counted. Reaching this any
+    other way usually means an strace whose sockaddr rendering this version does not
+    cover; please open an issue with the line.
 
 ### Examples
 
