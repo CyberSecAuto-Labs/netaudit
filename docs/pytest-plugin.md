@@ -82,6 +82,16 @@ interpreter that runs the audit, so code that sets out to defeat the check can r
 internals. Where the code under audit is not trusted, run it as a separate process under
 `netaudit run -- pytest`.
 
+## When the report cannot be written
+
+`--netaudit-report` is written **after** the violations are printed and the session is
+failed, so a destination that cannot be written — a read-only filesystem, a full disk, a
+path component that is an existing file — costs the artifact and nothing else. The failure
+is reported and fails the session in its own right; the violations above it stand.
+
+If the audit ends without reporting at all, the trace is kept instead of removed and its
+path is printed, so `netaudit analyze` can be pointed at it.
+
 ## CLI options
 
 | Option | Description |

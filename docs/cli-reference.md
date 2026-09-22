@@ -122,6 +122,10 @@ netaudit analyze [OPTIONS] STRACE_LOG
     command failed — it names the command's exit code on stderr rather than passing it
     through, because netaudit cannot stand behind a verdict it could not reach.
 
+    Under `run` the trace is kept rather than removed when this happens, and its path is
+    printed — it is the only record of what the run did, and `netaudit analyze` can be
+    pointed at it once the cause is understood.
+
     A log captured without `-f -tt` is refused for the same reason: without the pid and
     timestamp prefix nothing parses, and "nothing parsed" must not read as "nothing
     connected". A call that reached no destination — `AF_UNSPEC`, which *dis*connects a
