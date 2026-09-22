@@ -73,15 +73,25 @@ _RE_NETLINK = re.compile(
 # all, and the whole point of this regex is that such a log must not read as a
 # clean run. The anchor at the start is what keeps a ``connect(`` inside a
 # traced write payload from being mistaken for a syscall.
+# The descriptor ``-y`` decorates with the socket it names, which netaudit does
+# not ask for but an offline log may carry.
+_FD = r"\d+(?:<[^>]*>)?"
 _RE_CONNECT_LINE = re.compile(
-    r"\s*(?:\[pid\s+\d+\]\s+)?(?:\d+\s+)?(?:\d+:\d+:\d+\.\d+\s+)?connect\("
+    # The pid forms are alternatives, not independent options: no strace line
+    # carries both a bracketed pid and a bare one.
+    r"\s*(?:\[pid\s+\d+\]\s+|\d+\s+)?(?:\d+:\d+:\d+\.\d+\s+)?connect\(" + _FD + r","
 )
 
-# The first argument of a connect() that reached no destination: AF_UNSPEC is
-# how a socket is *dis*connected, and a NULL or unreadable sockaddr pointer
-# never made it into the kernel. Neither is egress, so neither is a connect
-# netaudit failed to read.
-_RE_NO_DESTINATION = re.compile(r"\d+,\s*(?:NULL|0x[0-9a-fA-F]+|\{sa_family=AF_UNSPEC\b)")
+# A first argument that reached no destination. AF_UNSPEC is how a socket is
+# *dis*connected, and a NULL sockaddr never made it into the kernel; neither is
+# egress, so neither is a connect netaudit failed to read.
+_RE_NO_DESTINATION = re.compile(r"\s*(?:NULL|\{sa_family=AF_UNSPEC\b)")
+
+# strace prints the bare pointer when it could not read the sockaddr, which
+# only happens for a call the kernel refused for the same reason. Paired with
+# the failure so that a readable-but-unrecognised struct is never let through.
+_RE_UNREAD_POINTER = re.compile(r"\s*0x[0-9a-fA-F]+\b")
+_RE_FAILED = re.compile(r"\)\s*=\s*-\d")
 
 
 def _is_unreadable_connect(line: str) -> bool:
@@ -89,7 +99,11 @@ def _is_unreadable_connect(line: str) -> bool:
     opening = _RE_CONNECT_LINE.match(line)
     if opening is None:
         return False
-    return _RE_NO_DESTINATION.match(line, opening.end()) is None
+    if _RE_NO_DESTINATION.match(line, opening.end()) is not None:
+        return False
+    if _RE_UNREAD_POINTER.match(line, opening.end()) is not None:
+        return _RE_FAILED.search(line) is None
+    return True
 
 
 # Resumed lines: "12345 12:34:56.789 <... connect resumed>) = 0"
@@ -123,10 +137,15 @@ def _normalise_result(result: int, raw_line: str) -> int:
     return result
 
 
-# An AF_UNIX name in the abstract namespace, which strace renders with a
-# leading "@" (or, raw, a leading NUL). Those bytes are opaque — "/", "." and
-# ".." mean nothing in them — so they are never treated as a path.
-_ABSTRACT_MARKERS = ("@", "\0")
+# How an abstract-namespace AF_UNIX name opens *inside* the quoted sun_path:
+# a NUL, which strace escapes as the two characters "\0". The "@" strace also
+# uses sits outside the quotes, so it never appears here — and a pathname
+# socket may legitimately be called "@name", which must still be canonicalised
+# as the relative path it is.
+#
+# Abstract names are opaque bytes: "/", "." and ".." mean nothing in them, so
+# collapsing one would rename it.
+_ABSTRACT_MARKERS = ("\\0", "\0")
 
 
 def _canonical_path(path: str) -> str:
@@ -149,9 +168,11 @@ def _canonical_path(path: str) -> str:
     symlink out of it.
 
     Abstract-namespace names are returned untouched: they are opaque bytes
-    rather than paths, and collapsing a ``..`` inside one would rename it.
+    rather than paths, and collapsing a ``..`` inside one would rename it. A
+    pathname socket called ``@name`` is *not* one of those — the ``@`` strace
+    prints for an abstract socket is outside the quotes.
     """
-    if path[:1] in _ABSTRACT_MARKERS:
+    if path.startswith(_ABSTRACT_MARKERS):
         return path
     cleaned = "".join(ch for ch in path if not unicodedata.category(ch).startswith("C"))
     if not cleaned:

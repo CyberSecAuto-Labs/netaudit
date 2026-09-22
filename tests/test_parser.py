@@ -336,6 +336,25 @@ class TestStraceParser:
         assert event is not None
         assert event.addr == "/tmp/attacker.sock"
 
+    def test_an_escaped_abstract_name_is_left_alone(self, parser: StraceParser) -> None:
+        """Its bytes are opaque: collapsing a `..` inside one would rename it."""
+        line = (
+            '9 12:00:00.000001 connect(5, {sa_family=AF_UNIX, sun_path="\\0run/gvmd/../x"}, 20) = 0'
+        )
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.addr == "\\0run/gvmd/../x"
+
+    def test_a_pathname_socket_starting_with_at_is_still_a_path(self, parser: StraceParser) -> None:
+        """The `@` strace prints for an abstract socket sits outside the quotes."""
+        line = (
+            "9 12:00:00.000001 connect(5, {sa_family=AF_UNIX,"
+            ' sun_path="@trusted/../../outside.sock"}, 20) = 0'
+        )
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.addr == "../outside.sock"
+
     def test_a_doubled_leading_slash_is_collapsed(self, parser: StraceParser) -> None:
         """Linux resolves `//run` as `/run`; normpath alone would keep both slashes."""
         line = (
@@ -421,6 +440,30 @@ class TestUnparsedConnectLines:
         line = "1234 12:00:00.000001 connect(3, 0x7ffd0a1b2c3d, 16) = -1 EFAULT (Bad address)"
         assert parser.parse_stream([line]) == []
         assert parser.unparsed == 0
+
+    def test_a_successful_call_with_an_unread_pointer_is_counted(
+        self, parser: StraceParser
+    ) -> None:
+        """Only a failure explains a pointer strace could not read."""
+        line = "1234 12:00:00.000001 connect(3, 0x7ffd0a1b2c3d, 16) = 0"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_a_line_that_is_not_a_syscall_is_not_counted(self, parser: StraceParser) -> None:
+        """No file descriptor, so no call — whatever the text starts with."""
+        assert parser.parse_stream(["connect(this is diagnostic text"]) == []
+        assert parser.unparsed == 0
+
+    def test_two_pid_forms_at_once_is_not_a_syscall(self, parser: StraceParser) -> None:
+        """No strace line carries a bracketed pid and a bare one."""
+        assert parser.parse_stream(["[pid 1] 2 connect(3, {sa_family=AF_VSOCK}, 16) = 0"]) == []
+        assert parser.unparsed == 0
+
+    def test_a_decorated_descriptor_is_still_a_connect(self, parser: StraceParser) -> None:
+        """`strace -y` names the socket beside the fd; the call is still unread."""
+        line = "1234 12:00:00.000001 connect(3<socket:[42]>, {sa_family=AF_VSOCK}, 16) = 0"
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
 
     def test_a_log_without_pid_or_timestamp_is_counted(self, parser: StraceParser) -> None:
         """No header means no event either — which must not read as a clean run."""
