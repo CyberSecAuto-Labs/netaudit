@@ -91,7 +91,10 @@ _RE_NO_DESTINATION = re.compile(r"\s*(?:NULL|\{sa_family=AF_UNSPEC\b)")
 # only happens for a call the kernel refused for the same reason. Paired with
 # the failure so that a readable-but-unrecognised struct is never let through.
 _RE_UNREAD_POINTER = re.compile(r"\s*0x[0-9a-fA-F]+\b")
-_RE_FAILED = re.compile(r"\)\s*=\s*-\d")
+# Anchored at the end of the line, where strace writes the syscall's result.
+# Searching the whole line would let a descriptor decorated by ``-y`` — whose
+# text is the socket's name, and so arbitrary — claim the call failed.
+_RE_FAILED = re.compile(r"\)\s*=\s*-\d+(?:\s+[A-Z][A-Z0-9_]*(?:\s+\([^)]*\))?)?\s*$")
 
 
 def _is_unreadable_connect(line: str) -> bool:
@@ -102,7 +105,7 @@ def _is_unreadable_connect(line: str) -> bool:
     if _RE_NO_DESTINATION.match(line, opening.end()) is not None:
         return False
     if _RE_UNREAD_POINTER.match(line, opening.end()) is not None:
-        return _RE_FAILED.search(line) is None
+        return _RE_FAILED.search(line) is None  # only a failure explains an unread pointer
     return True
 
 
