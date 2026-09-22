@@ -27,8 +27,36 @@ _KILL_ON_EXIT = "--kill-on-exit"
 _PROBE_TIMEOUT = 5
 
 
+# strace reads an output path beginning with either of these as a shell
+# command to pipe the trace through — verified against strace 6.x, where
+# ``-o "|cat > /tmp/x"`` runs it. A leading ``-`` is *not* a hazard: ``-o``
+# consumes the next argument whatever it starts with.
+_PIPE_PREFIXES = ("|", "!")
+
+
 class StraceNotFoundError(RuntimeError):
     """Raised when strace is not available on PATH."""
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_strace() -> str | None:
+    """The absolute path of the strace on PATH, or None if there is none.
+
+    Resolved once and reused, so the binary that was checked is the binary that
+    runs. netaudit's own target scenario is auditing a repository in CI, where
+    the repo commonly contributes entries to PATH: re-resolving the bare name
+    at exec time would let a repo-supplied ``./strace`` run instead, and
+    netaudit trusts whatever reaches ``-o`` as ground truth.
+    """
+    return shutil.which("strace")
+
+
+def _require_strace() -> str:
+    """The resolved strace path, or raise :class:`StraceNotFoundError`."""
+    path = _resolve_strace()
+    if path is None:
+        raise StraceNotFoundError("strace not found on PATH; install it (e.g. apt install strace)")
+    return path
 
 
 @functools.lru_cache(maxsize=1)
@@ -41,15 +69,31 @@ def _supports_kill_on_exit() -> bool:
     version, so the probe traces nothing and starts nothing; it is cached
     because the answer cannot change while the process runs.
     """
+    strace = _resolve_strace()
+    if strace is None:
+        return False
     try:
         probe = subprocess.run(
-            ["strace", _KILL_ON_EXIT, "-V"],
+            [strace, _KILL_ON_EXIT, "-V"],
             capture_output=True,
             timeout=_PROBE_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return probe.returncode == 0
+
+
+def _checked_output(output_path: Path) -> str:
+    """The ``-o`` argument, refused when strace would read it as anything else.
+
+    :meth:`StraceRunner.run` and :meth:`~StraceRunner.start` are public API
+    taking an arbitrary path, so an embedder deriving one from configuration
+    would otherwise be handing attacker-chosen text to ``/bin/sh``.
+    """
+    text = str(output_path)
+    if text.startswith(_PIPE_PREFIXES):
+        raise ValueError(f"refusing to write the trace to {text!r}")
+    return text
 
 
 def _strace_cmd(output_path: Path) -> list[str]:
@@ -60,7 +104,15 @@ def _strace_cmd(output_path: Path) -> list[str]:
     away from the file netaudit parses, and ``-p`` retargets it at another
     process — either way the audit passes on an empty trace.
     """
-    cmd = ["strace", "-e", "trace=connect", "-f", "-tt", "-o", str(output_path)]
+    cmd = [
+        _require_strace(),
+        "-e",
+        "trace=connect",
+        "-f",
+        "-tt",
+        "-o",
+        _checked_output(output_path),
+    ]
     if _supports_kill_on_exit():
         cmd.insert(1, _KILL_ON_EXIT)
     cmd.append("--")
@@ -132,10 +184,7 @@ class StraceRunner:
     """Spawns commands under strace, writing connect() events to a file."""
 
     def __init__(self) -> None:
-        if shutil.which("strace") is None:
-            raise StraceNotFoundError(
-                "strace not found on PATH; install it (e.g. apt install strace)"
-            )
+        _require_strace()
 
     def run(self, command: list[str], output_path: Path) -> subprocess.CompletedProcess[bytes]:
         """Run *command* under strace, blocking until it exits.

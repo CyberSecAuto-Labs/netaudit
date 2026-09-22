@@ -22,12 +22,24 @@ from netaudit.runner import (
     StraceNotFoundError,
     StraceProcess,
     StraceRunner,
+    _resolve_strace,
     _strace_cmd,
     _supports_kill_on_exit,
 )
 
 _OUT = Path("/tmp/netaudit-test.log")
 _GROUP_ID = 4242
+_STRACE = "/usr/bin/strace"
+
+
+@pytest.fixture(autouse=True)
+def resolved_strace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the strace path, which is resolved once and cached.
+
+    Without this every test here would depend on the host having strace, and
+    on which one ``$PATH`` happened to name.
+    """
+    monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
 
 
 @contextmanager
@@ -71,9 +83,8 @@ def unprobed_strace(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _runner() -> StraceRunner:
-    """Build a StraceRunner without requiring strace on PATH."""
-    with patch("netaudit.runner.shutil.which", return_value="/usr/bin/strace"):
-        return StraceRunner()
+    """Build a StraceRunner; the resolved path is pinned by the autouse fixture."""
+    return StraceRunner()
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +95,7 @@ def _runner() -> StraceRunner:
 class TestStraceCmd:
     def test_traces_connect_and_follows_forks(self) -> None:
         cmd = _strace_cmd(_OUT)
-        assert cmd[0] == "strace"
+        assert cmd[0] == _STRACE
         assert "-e" in cmd and "trace=connect" in cmd
         assert "-f" in cmd, "must follow forks to catch child processes"
         assert "-tt" in cmd, "timestamps are needed to correlate with markers"
@@ -151,7 +162,7 @@ class TestKillOnExit:
     def test_the_probe_traces_nothing_and_starts_nothing(self) -> None:
         with _probe(returncode=0) as run:
             _strace_cmd(_OUT)
-        assert run.call_args.args[0] == ["strace", _KILL_ON_EXIT, "-V"]
+        assert run.call_args.args[0] == [_STRACE, _KILL_ON_EXIT, "-V"]
 
     def test_the_probe_runs_once_however_many_commands_are_built(self) -> None:
         with _probe(returncode=0) as run:
@@ -167,15 +178,70 @@ class TestKillOnExit:
 
 
 class TestStraceRunnerInit:
-    def test_raises_when_strace_is_missing(self) -> None:
-        with patch("netaudit.runner.shutil.which", return_value=None):
-            with pytest.raises(StraceNotFoundError, match="strace not found on PATH"):
-                StraceRunner()
+    def test_raises_when_strace_is_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: None)
+        with pytest.raises(StraceNotFoundError, match="strace not found on PATH"):
+            StraceRunner()
 
     def test_succeeds_when_strace_is_present(self) -> None:
-        with patch("netaudit.runner.shutil.which", return_value="/usr/bin/strace") as which:
-            StraceRunner()
-        which.assert_called_once_with("strace")
+        assert isinstance(StraceRunner(), StraceRunner)
+
+
+class TestStraceIsResolvedOnce:
+    """The binary that was checked has to be the binary that runs.
+
+    netaudit's own target scenario is auditing a repository in CI, where the
+    repo commonly contributes entries to PATH — and netaudit trusts whatever
+    reaches ``-o`` as ground truth.
+    """
+
+    def test_the_command_names_an_absolute_path(self) -> None:
+        assert _strace_cmd(_OUT)[0] == _STRACE
+
+    def test_the_probe_runs_the_same_binary(self) -> None:
+        with _probe(returncode=0) as run:
+            _strace_cmd(_OUT)
+        assert run.call_args.args[0][0] == _STRACE
+
+    def test_the_path_is_resolved_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _resolve_strace.cache_clear()
+        calls: list[str] = []
+        monkeypatch.setattr("netaudit.runner._resolve_strace.__wrapped__", None, raising=False)
+        monkeypatch.setattr(
+            "netaudit.runner.shutil.which", lambda name: calls.append(name) or _STRACE
+        )
+        try:
+            _resolve_strace()
+            _resolve_strace()
+        finally:
+            _resolve_strace.cache_clear()
+        assert calls == ["strace"]
+
+    def test_the_probe_answers_no_without_a_strace_to_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: None)
+        with _probe(returncode=0) as run:
+            assert _supports_kill_on_exit() is False
+        assert run.call_count == 0
+
+    def test_a_missing_strace_makes_no_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: None)
+        with pytest.raises(StraceNotFoundError):
+            _strace_cmd(_OUT)
+
+
+class TestOutputPathIsChecked:
+    """strace reads an output path starting with ``|`` or ``!`` as a shell command."""
+
+    @pytest.mark.parametrize("bad", ["|cat > /tmp/pwned", "!cat > /tmp/pwned"])
+    def test_a_piped_path_is_refused(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="refusing to write the trace"):
+            _strace_cmd(Path(bad))
+
+    def test_a_leading_dash_is_an_ordinary_filename(self) -> None:
+        """``-o`` consumes the next argument whatever it starts with."""
+        assert _strace_cmd(Path("-weird"))[-2] == "-weird"
 
 
 # ---------------------------------------------------------------------------

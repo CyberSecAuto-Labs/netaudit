@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import shutil
 import socket
 import sys
 import tomllib
@@ -39,7 +38,7 @@ from netaudit.reporter import (
     build_run_metadata,
     supports_color,
 )
-from netaudit.runner import _strace_cmd
+from netaudit.runner import StraceNotFoundError, _require_strace, _strace_cmd
 
 _ENV_STRACE_OUT = "NETAUDIT_STRACE_OUT"
 _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
@@ -687,10 +686,10 @@ def pytest_configure(config: pytest.Config) -> None:
     if not _resolve_enabled(config):
         return
 
-    if shutil.which("strace") is None:
-        raise pytest.UsageError(
-            "netaudit: strace is not available on PATH — install it (e.g. apt install strace)."
-        )
+    try:
+        strace = _require_strace()
+    except StraceNotFoundError as exc:
+        raise pytest.UsageError(f"netaudit: {exc}") from None
 
     # A SIGKILLed run cannot clean up after itself; the next one does it for it.
     _tempfiles.sweep_stale()
@@ -714,7 +713,9 @@ def pytest_configure(config: pytest.Config) -> None:
     # a second copy would drift, and the copy that lost --kill-on-exit would go
     # back to orphaning its tracees without anything failing to say so.
     cmd = _strace_cmd(Path(strace_path)) + [sys.executable, "-m", "pytest"] + sys.argv[1:]
-    os.execvpe("strace", cmd, env)
+    # execve, not execvpe: the path was resolved once, and searching PATH again
+    # here would let a different binary run than the one that was checked.
+    os.execve(strace, cmd, env)
     # unreachable — execvpe replaces the current process image
 
 

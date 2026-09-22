@@ -98,6 +98,8 @@ def _clean_up_tracked() -> Iterator[None]:
             path.parent.rmdir()
 
 
+_STRACE = "/usr/bin/strace"
+
 _CANARY = "/nonexistent/netaudit-canary-0123456789abcdef"
 
 
@@ -506,44 +508,44 @@ class TestPytestConfigure:
         return config
 
     def test_does_nothing_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        execvpe_calls: list[object] = []
-        monkeypatch.setattr(os, "execvpe", lambda *a: execvpe_calls.append(a))
+        execve_calls: list[object] = []
+        monkeypatch.setattr(os, "execve", lambda *a: execve_calls.append(a))
         config = self._make_config(enabled=False)
         pytest_configure(config)
-        assert execvpe_calls == []
+        assert execve_calls == []
 
     def test_does_nothing_when_already_under_strace(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        execvpe_calls: list[object] = []
-        monkeypatch.setattr(os, "execvpe", lambda *a: execvpe_calls.append(a))
+        execve_calls: list[object] = []
+        monkeypatch.setattr(os, "execve", lambda *a: execve_calls.append(a))
         monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/fake.strace")
         config = self._make_config(enabled=True)
         pytest_configure(config)
-        assert execvpe_calls == []
+        assert execve_calls == []
 
     def test_raises_usage_error_when_strace_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: None)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: None)
         config = self._make_config(enabled=True)
         with pytest.raises(pytest.UsageError, match="strace"):
             pytest_configure(config)
 
     def test_reexecs_under_strace_when_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/strace" if x == "strace" else None)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
 
-        execvpe_args: list[tuple[str, list[str], dict[str, str]]] = []
+        execve_args: list[tuple[str, list[str], dict[str, str]]] = []
 
-        def fake_execvpe(name: str, args: list[str], env: dict[str, str]) -> None:
-            execvpe_args.append((name, args, env))
+        def fake_execve(name: str, args: list[str], env: dict[str, str]) -> None:
+            execve_args.append((name, args, env))
 
-        monkeypatch.setattr(os, "execvpe", fake_execvpe)
+        monkeypatch.setattr(os, "execve", fake_execve)
         config = self._make_config(enabled=True)
         pytest_configure(config)
 
-        assert len(execvpe_args) == 1
-        name, args, env = execvpe_args[0]
-        assert name == "strace"
-        assert args[0] == "strace"
+        assert len(execve_args) == 1
+        name, args, env = execve_args[0]
+        assert name == _STRACE
+        assert args[0] == _STRACE, "the exec must not leave PATH to pick the binary"
         assert "-e" in args
         assert "trace=connect" in args
         # Command must invoke python -m pytest (not sys.argv[0] directly)
@@ -558,8 +560,8 @@ class TestPytestConfigure:
     ) -> None:
         """A SIGKILLed run leaves both files behind; only the next run can recover them."""
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
-        monkeypatch.setattr(os, "execvpe", lambda *a: None)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
+        monkeypatch.setattr(os, "execve", lambda *a: None)
         swept: list[object] = []
         monkeypatch.setattr(_tempfiles, "sweep_stale", lambda: swept.append(True) or [])
 
@@ -571,9 +573,9 @@ class TestPytestConfigure:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
         env: dict[str, str] = {}
-        monkeypatch.setattr(os, "execvpe", lambda _n, _a, e: env.update(e))
+        monkeypatch.setattr(os, "execve", lambda _n, _a, e: env.update(e))
 
         pytest_configure(self._make_config(enabled=True))
 
@@ -588,9 +590,9 @@ class TestPytestConfigure:
     ) -> None:
         """execvpe keeps the pid, so this is the pid the traced pytest sees as its parent."""
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
         env: dict[str, str] = {}
-        monkeypatch.setattr(os, "execvpe", lambda _n, _a, e: env.update(e))
+        monkeypatch.setattr(os, "execve", lambda _n, _a, e: env.update(e))
 
         pytest_configure(self._make_config(enabled=True))
         _tempfiles.remove_tracked()
@@ -696,7 +698,7 @@ class TestPytestConfigure:
         """It inherits the tracer pid but not the trace path, which was popped."""
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getpid()))
-        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd inside a traced run"))
+        monkeypatch.setattr(os, "execve", lambda *a: pytest.fail("re-exec'd inside a traced run"))
 
         pytest_configure(self._make_config(enabled=True))
 
@@ -722,9 +724,9 @@ class TestPytestConfigure:
         """One place decides the strace flags. Two would drift — and one of them
         would silently stop killing its tracees."""
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/strace")
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
         captured: list[tuple[list[str], dict[str, str]]] = []
-        monkeypatch.setattr(os, "execvpe", lambda _n, a, e: captured.append((a, e)))
+        monkeypatch.setattr(os, "execve", lambda _n, a, e: captured.append((a, e)))
 
         # Force the feature probe to say yes, so the assertion is about sharing
         # the builder rather than about whichever strace this machine has.
@@ -768,7 +770,7 @@ class TestPathsFromTheEnvironment:
         victim.write_text("payload")
         monkeypatch.setenv(_ENV_STRACE_OUT, str(victim))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
-        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd"))
+        monkeypatch.setattr(os, "execve", lambda *a: pytest.fail("re-exec'd"))
 
         pytest_configure(_spec_config())
 
@@ -830,7 +832,7 @@ class TestPathsFromTheEnvironment:
         monkeypatch.setenv(_ENV_STRACE_OUT, str(link))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         monkeypatch.delenv(_ENV_TRACER_PID, raising=False)
-        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd"))
+        monkeypatch.setattr(os, "execve", lambda *a: pytest.fail("re-exec'd"))
 
         pytest_configure(_spec_config())
 
@@ -1541,8 +1543,8 @@ class TestPytestConfigureAutoEnable:
     ) -> list[tuple[str, list[str], dict[str, str]]]:
         calls: list[tuple[str, list[str], dict[str, str]]] = []
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/strace" if x == "strace" else None)
-        monkeypatch.setattr(os, "execvpe", lambda n, a, e: calls.append((n, a, e)))
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: _STRACE)
+        monkeypatch.setattr(os, "execve", lambda n, a, e: calls.append((n, a, e)))
         return calls
 
     def test_reexecs_when_pyproject_enabled_without_cli_flag(
@@ -1555,7 +1557,7 @@ class TestPytestConfigureAutoEnable:
         pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
 
         assert len(calls) == 1
-        assert calls[0][0] == "strace"
+        assert calls[0][0] == _STRACE
 
     def test_does_not_reexec_when_pyproject_enabled_false(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1606,7 +1608,7 @@ class TestPytestConfigureAutoEnable:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nenabled = true\n")
         monkeypatch.delenv(_ENV_STRACE_OUT, raising=False)
-        monkeypatch.setattr("shutil.which", lambda _: None)
+        monkeypatch.setattr("netaudit.runner._resolve_strace", lambda: None)
 
         with pytest.raises(pytest.UsageError, match="strace"):
             pytest_configure(_mock_config_enabled(cli_flag=False))  # type: ignore[arg-type]
