@@ -80,6 +80,57 @@ def is_external(addr: str | None) -> bool:
         return False
 
 
+# Option names whose value is a secret often enough to be worth masking. Not a
+# guarantee — see :func:`_redact_command`.
+_SECRET_OPTION = re.compile(
+    r"(?i)(token|secret|password|passwd|pwd|api[-_]?key|apikey|auth|credential|cookie|dsn)"
+)
+
+# scheme://user:password@host — the password half is what is masked.
+_URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@")
+
+_REDACTED = "***"
+"""What :func:`_redact_command` puts in place of a value it masked."""
+
+
+def _mask_url_credentials(argument: str) -> str:
+    """Mask the password in any ``scheme://user:password@host`` inside *argument*."""
+    return _URL_CREDENTIALS.sub(rf"\1\2:{_REDACTED}@", argument)
+
+
+def _redact_command(command: list[str]) -> list[str]:
+    """*command* with the values of secret-looking options masked.
+
+    A saved report records the traced command's whole argument vector, and the
+    docs recommend publishing those reports as CI artifacts. A ``--token=`` or
+    a DSN with embedded credentials would otherwise be copied verbatim into a
+    file meant to be shared.
+
+    This is a filter over the shapes secrets usually take — ``--password=x``,
+    ``--token x``, ``postgres://user:pw@host`` — not a guarantee. A secret
+    passed as a bare positional argument, or under a name this does not
+    recognise, still reaches the report. The only thing that rules that out is
+    not putting secrets on a command line.
+    """
+    redacted: list[str] = []
+    mask_next = False
+    for argument in command:
+        if mask_next:
+            mask_next = False
+            redacted.append(_REDACTED)
+            continue
+        if argument.startswith("-"):
+            name, separator, value = argument.partition("=")
+            if separator and _SECRET_OPTION.search(name):
+                redacted.append(f"{name}={_REDACTED}")
+                continue
+            # `--token VALUE`: the secret is the next element, unless what
+            # follows is plainly another option rather than this one's value.
+            mask_next = not separator and bool(_SECRET_OPTION.search(name))
+        redacted.append(_mask_url_credentials(argument))
+    return redacted
+
+
 def build_run_metadata(
     command: list[str] | None = None,
     allowlist: str | None = None,
@@ -92,6 +143,10 @@ def build_run_metadata(
     which command, against which allowlist, on which host, when, and with what
     version of netaudit. Callers supply what they know — ``command`` for a live
     trace, ``source`` for offline analysis of an existing log.
+
+    ``command`` goes through :func:`_redact_command` first. The hostname is
+    recorded as it is: it is what ties a report to the machine that produced
+    it, and it is not a credential.
     """
     from netaudit import __version__
 
@@ -101,7 +156,7 @@ def build_run_metadata(
         "netaudit_version": __version__,
     }
     if command is not None:
-        meta["command"] = list(command)
+        meta["command"] = _redact_command(command)
     if allowlist is not None:
         meta["allowlist"] = allowlist
     if source is not None:
@@ -259,24 +314,76 @@ class MergedDestination:
         return Violation(family=self.family, addr=self.addr, port=self.port, count=self.count)
 
 
+def _report_addr(value: Any) -> str | None:
+    """Validate a saved report's ``addr`` field.
+
+    An integer here is worse than a wrong string: ``IPv4Address(12345)`` is
+    valid and silently means a different address, and AF_UNIX with an int
+    raises out of ``fnmatch`` at the point of matching.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"Report destination 'addr' must be a string or null, not {value!r}")
+
+
+def _report_port(value: Any) -> int | None:
+    """Validate a saved report's ``port`` field.
+
+    A string here does not raise — it quietly fails to match. ``'443' != 443``
+    is True, so a rule the allowlist explicitly declares does not fire, and
+    ``triage`` reports a destination that is in fact permitted.
+    """
+    if value is None:
+        return None
+    # bool is a subclass of int, so `"port": true` would otherwise become 1.
+    if isinstance(value, bool):
+        raise ValueError(f"Report destination 'port' must be a number or null, not {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise ValueError(f"Report destination 'port' must be a number or null, not {value!r}")
+
+
+def _report_count(value: Any) -> int:
+    """Validate a saved report's ``count`` field, which drives the ordering."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Report destination 'count' must be a number, not {value!r}")
+    return int(value)
+
+
+def _report_tests(value: Any) -> set[str]:
+    """Validate a saved report's ``tests`` field."""
+    if value is None:
+        return set()
+    if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+        raise ValueError(f"Report destination 'tests' must be a list of strings, not {value!r}")
+    return set(value)
+
+
 def _destination_from(entry: dict[str, Any]) -> Destination:
     """Build one :class:`Destination` from a saved report's ``by_destination`` row.
 
-    AF_UNIX paths are canonicalised on the way in. A report written before the
+    Every field is typed on the way in. A report is untrusted JSON — the docs
+    recommend collecting them as CI artifacts from elsewhere — and downstream
+    they are turned back into events and matched against an allowlist, where a
+    value of the wrong type does not fail loudly but simply stops matching.
+
+    AF_UNIX paths are canonicalised here too. A report written before the
     parser did so holds the literal ``sun_path``, and ``triage`` turns that
     straight into a ``path_glob`` — which would never match, because the rule
     canonicalises what it is given.
     """
     family = str(entry.get("family", ""))
-    addr = entry.get("addr")
-    if family == "AF_UNIX" and isinstance(addr, str):
+    addr = _report_addr(entry.get("addr"))
+    if family == "AF_UNIX" and addr is not None:
         addr = _canonical_path(addr)
     return Destination(
         family=family,
         addr=addr,
-        port=entry.get("port"),
-        count=int(entry.get("count", 0)),
-        tests=set(entry.get("tests") or []),
+        port=_report_port(entry.get("port")),
+        count=_report_count(entry.get("count", 0)),
+        tests=_report_tests(entry.get("tests")),
     )
 
 
