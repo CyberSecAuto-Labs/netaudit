@@ -1393,3 +1393,10 @@ class TestRedactionEdges:
     @pytest.mark.parametrize("option", ["--api-key", "--apikey", "--access-token"])
     def test_a_compound_name_is_masked_either_way_it_is_written(self, option: str) -> None:
         assert self._command("app", option, "s3cr3t") == ["app", option, "***"]
+
+
+def test_the_secret_name_sets_are_disjoint() -> None:
+    """The joined names exist because their parts are not enough on their own."""
+    from netaudit.reporter import _JOINED_SECRET_NAMES, _SECRET_WORDS
+
+    assert not (_JOINED_SECRET_NAMES & _SECRET_WORDS)

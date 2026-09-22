@@ -93,7 +93,6 @@ def is_external(addr: str | None) -> bool:
 # takes a value — is masked.
 _ALWAYS_TAKES_A_VALUE = frozenset(
     {
-        "apikey",
         "apisecret",
         "apitoken",
         "authorization",
