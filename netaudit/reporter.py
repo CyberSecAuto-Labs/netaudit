@@ -85,16 +85,22 @@ def is_external(addr: str | None) -> bool:
 # guarantee — see :func:`_redact_command`. Matched against whole segments of a
 # name — ``--api-key`` splits to {"api", "key"} — rather than as a substring,
 # so ``--tokenize`` and ``--authors`` are left alone.
-_SECRET_WORDS = frozenset(
+#
+# Some of these are just as often boolean flags: ``--auth`` and ``--key`` turn
+# up as switches, and ``--cookie`` as a structural option. For those, masking
+# the *next* argument would destroy a filename or a path that is no secret at
+# all, so only the ``--name=value`` form — where the ``=`` proves the option
+# takes a value — is masked.
+_ALWAYS_TAKES_A_VALUE = frozenset(
     {
         "apikey",
+        "apisecret",
         "apitoken",
-        "auth",
-        "cookie",
+        "authorization",
         "credential",
         "credentials",
         "dsn",
-        "key",
+        "passphrase",
         "passwd",
         "password",
         "pwd",
@@ -102,6 +108,7 @@ _SECRET_WORDS = frozenset(
         "token",
     }
 )
+_SECRET_WORDS = _ALWAYS_TAKES_A_VALUE | {"auth", "bearer", "cookie", "key"}
 _NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 # scheme://user:password@host — the password half is what is masked.
@@ -129,6 +136,11 @@ def _redact_command(command: list[str]) -> list[str]:
     passed as a bare positional argument, or under a name this does not
     recognise, still reaches the report. The only thing that rules that out is
     not putting secrets on a command line.
+
+    It is also deliberately conservative in the other direction: masking the
+    argument after a boolean flag would silently rewrite the record of what
+    ran, so the separate-argument form is only masked for names that are
+    practically never switches.
     """
     redacted: list[str] = []
     mask_next = False
@@ -143,19 +155,23 @@ def _redact_command(command: list[str]) -> list[str]:
                 continue
         if argument.startswith("-"):
             name, separator, _value = argument.partition("=")
-            if _names_a_secret(name):
-                if separator:
-                    redacted.append(f"{name}={_REDACTED}")
-                    continue
-                mask_next = True
+            if separator and _names_a_secret(name, _SECRET_WORDS):
+                redacted.append(f"{name}={_REDACTED}")
+                continue
+            mask_next = not separator and _names_a_secret(name, _ALWAYS_TAKES_A_VALUE)
         redacted.append(_mask_url_credentials(argument))
     return redacted
 
 
-def _names_a_secret(option: str) -> bool:
-    """Whether *option* is an option name whose value is likely a secret."""
+def _names_a_secret(option: str, words: frozenset[str] | set[str]) -> bool:
+    """Whether the option name *option* names one of *words*.
+
+    Both the individual segments and the whole name with its separators
+    removed, so ``--api-key`` and ``--apikey`` are read the same way. Whole
+    segments rather than substrings, so ``--tokenize`` is not one of these.
+    """
     segments = _NAME_SEPARATORS.split(option.lstrip("-").lower())
-    return any(segment in _SECRET_WORDS for segment in segments)
+    return "".join(segments) in words or any(segment in words for segment in segments)
 
 
 def build_run_metadata(
@@ -358,18 +374,20 @@ def _report_port(value: Any) -> int | None:
 
     A string here does not raise — it quietly fails to match. ``'443' != 443``
     is True, so a rule the allowlist explicitly declares does not fire, and
-    ``triage`` reports a destination that is in fact permitted.
+    ``triage`` reports a destination that is in fact permitted. The range is
+    checked too: a number no socket can carry would otherwise become a
+    suggested rule the allowlist parser then rejects.
     """
     if value is None:
         return None
     # bool is a subclass of int, so `"port": true` would otherwise become 1.
     if isinstance(value, bool):
-        raise ValueError(f"Report destination 'port' must be a number or null, not {value!r}")
-    if isinstance(value, int):
-        return value
+        raise ValueError(f"Report destination 'port' must be a port number, not {value!r}")
     if isinstance(value, float) and value.is_integer():
-        return int(value)
-    raise ValueError(f"Report destination 'port' must be a number or null, not {value!r}")
+        value = int(value)
+    if not isinstance(value, int) or not 0 <= value <= 65535:
+        raise ValueError(f"Report destination 'port' must be a port number, not {value!r}")
+    return value
 
 
 def _report_family(value: Any) -> str:
@@ -457,8 +475,19 @@ def load_report(path: Path) -> LoadedReport:
         )
 
     summary = data.get("summary") or {}
-    raw = summary.get("by_destination") or [] if isinstance(summary, dict) else []
-    destinations = [_destination_from(d) for d in raw if isinstance(d, dict)]
+    if not isinstance(summary, dict):
+        raise ValueError(f"Report {path.name}: 'summary' must be an object")
+    raw = summary.get("by_destination")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        # Iterating a string or a mapping would quietly yield nothing; a number
+        # would raise TypeError past the caller's ``except ValueError``.
+        raise ValueError(f"Report {path.name}: 'summary.by_destination' must be a list")
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Report {path.name}: each destination must be an object")
+    destinations = [_destination_from(d) for d in raw]
     run = data.get("run") or {}
     return LoadedReport(
         label=path.name,

@@ -1184,11 +1184,11 @@ class TestSavedReportFieldsAreTyped:
 
     def test_a_string_port_is_rejected(self, tmp_path: Path) -> None:
         """`'443' != 443`, so an allowlist rule that permits it would not fire."""
-        with pytest.raises(ValueError, match="'port' must be a number"):
+        with pytest.raises(ValueError, match="'port' must be a port number"):
             self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port="443", count=1)
 
     def test_a_boolean_port_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="'port' must be a number"):
+        with pytest.raises(ValueError, match="'port' must be a port number"):
             self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=True, count=1)
 
     def test_a_whole_float_port_is_accepted(self, tmp_path: Path) -> None:
@@ -1196,8 +1196,13 @@ class TestSavedReportFieldsAreTyped:
         assert report.destinations[0].port == 443
 
     def test_a_fractional_port_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="'port' must be a number"):
+        with pytest.raises(ValueError, match="'port' must be a port number"):
             self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80.5, count=1)
+
+    @pytest.mark.parametrize("port", [-1, 65536])
+    def test_a_port_no_socket_could_carry_is_rejected(self, tmp_path: Path, port: int) -> None:
+        with pytest.raises(ValueError, match="'port' must be a port number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=port, count=1)
 
     def test_an_integer_address_is_rejected(self, tmp_path: Path) -> None:
         """`IPv4Address(12345)` is valid and means a different address entirely."""
@@ -1234,6 +1239,32 @@ class TestSavedReportFieldsAreTyped:
         report = self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=3.0)
         assert report.destinations[0].count == 3
 
+    def test_a_destination_list_that_is_not_a_list_is_rejected(self, tmp_path: Path) -> None:
+        """Iterating a number raises TypeError, past the caller's except ValueError."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"by_destination": 1}}))
+        with pytest.raises(ValueError, match="'summary.by_destination' must be a list"):
+            load_report(path)
+
+    def test_a_destination_that_is_not_an_object_is_rejected(self, tmp_path: Path) -> None:
+        """Skipping it silently would drop evidence the report claims to carry."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"by_destination": ["nope"]}}))
+        with pytest.raises(ValueError, match="each destination must be an object"):
+            load_report(path)
+
+    def test_an_absent_destination_list_is_an_empty_one(self, tmp_path: Path) -> None:
+        """A report that observed nothing is still a report."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"total": 0}}))
+        assert load_report(path).destinations == []
+
+    def test_a_summary_that_is_not_an_object_is_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": [1, 2]}))
+        with pytest.raises(ValueError, match="'summary' must be an object"):
+            load_report(path)
+
     def test_a_tests_field_that_is_not_strings_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="'tests' must be a list of strings"):
             self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=1, tests=[1])
@@ -1251,7 +1282,7 @@ class TestSecretsAreMaskedInTheRecordedCommand:
         assert self._command("curl", "--token=s3cr3t") == ["curl", "--token=***"]
 
     def test_a_separate_value_is_masked(self) -> None:
-        assert self._command("curl", "--api-key", "s3cr3t") == ["curl", "--api-key", "***"]
+        assert self._command("curl", "--token", "s3cr3t") == ["curl", "--token", "***"]
 
     def test_the_option_name_itself_survives(self) -> None:
         """What the run did is still legible; only the value goes."""
@@ -1281,10 +1312,21 @@ class TestSecretsAreMaskedInTheRecordedCommand:
         assert self._command("app", option, "value") == ["app", option, "value"]
 
     @pytest.mark.parametrize(
-        "option", ["--token", "--api-key", "--db_password", "--auth", "--dsn", "--API-KEY"]
+        "option",
+        ["--token", "--api-key", "--apikey", "--db_password", "--authorization", "--dsn"],
     )
-    def test_the_names_that_do_count_are_masked(self, option: str) -> None:
+    def test_a_separate_value_is_masked_for_names_that_always_take_one(self, option: str) -> None:
         assert self._command("app", option, "s3cr3t") == ["app", option, "***"]
+
+    @pytest.mark.parametrize("option", ["--auth", "--key", "--cookie"])
+    def test_a_separate_value_is_left_for_names_that_are_often_switches(self, option: str) -> None:
+        """Masking the next argument after a boolean flag would rewrite the record."""
+        assert self._command("app", option, "report.txt") == ["app", option, "report.txt"]
+
+    @pytest.mark.parametrize("option", ["--auth", "--key", "--cookie"])
+    def test_an_attached_value_is_masked_even_for_those(self, option: str) -> None:
+        """The `=` proves the option takes a value."""
+        assert self._command("app", f"{option}=s3cr3t") == ["app", f"{option}=***"]
 
     def test_a_positional_secret_is_not_caught(self) -> None:
         """Documented limit: this filters shapes, it does not understand the command."""
