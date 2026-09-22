@@ -67,8 +67,9 @@ Raises `StraceNotFoundError` if `strace` is not on PATH.
 
 `connect` is the whole of the traced syscall set, which bounds what any part of netaudit
 can report on. Egress that never issues one — `sendto()`/`sendmsg()` to an explicit
-destination on an unconnected UDP socket, or a connection submitted through `io_uring` —
-produces no event, and therefore no violation. Widening the set is a parser change as much
+destination on an unconnected UDP socket, the same pair with `MSG_FASTOPEN` opening a TCP
+connection, or a connection submitted through `io_uring` — produces no event, and
+therefore no violation. Widening the set is a parser change as much
 as a runner one: each syscall renders its destination in a different shape.
 
 ### `parser.py` — `StraceParser`, `ConnectEvent`

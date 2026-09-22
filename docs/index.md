@@ -97,17 +97,22 @@ Built-in rules always permit loopback (`127.0.0.0/8`, `::1`), Unix sockets, and 
 
 ### What it sees, and what it does not
 
-netaudit traces `connect()` and nothing else. That is every TCP connection and every
-socket a process associates with a destination before using it — the overwhelming majority
-of egress — but it is not all of it:
+netaudit traces `connect()` and nothing else. That covers the ordinary way a process
+reaches a destination — and so the overwhelming majority of egress — but it is not all of
+it:
 
 - **UDP sent without `connect()`.** `sendto()` and `sendmsg()` carry the destination in the
-  call itself, so a datagram sent on an unconnected socket never appears. (DNS through the
-  glibc resolver *does* appear: it connects first.)
+  call itself, so a datagram sent on an unconnected socket never appears.
+- **TCP Fast Open.** `sendto()`/`sendmsg()` with `MSG_FASTOPEN` opens a TCP connection
+  without ever calling `connect()`.
 - **io_uring.** Connections submitted through an `io_uring` ring are issued by the kernel
   on the process's behalf and are not `connect()` syscalls.
 - **A process netaudit never wrapped.** Only the traced command and its descendants are
   observed.
+
+DNS usually *is* visible, because the glibc resolver connects its socket before sending —
+but that depends on the resolver configuration and on which retry path it takes, so treat
+it as the common case rather than a guarantee.
 
 Nothing in these categories is reported, so a run that reaches the internet only by one of
 them exits 0. If your threat model includes code that is trying not to be seen, netaudit is

@@ -89,6 +89,14 @@ the kernel collapses them, so `/run/gvmd/../../tmp/attacker.sock` is judged as
 `/tmp/attacker.sock` and a rule scoped to `/run/gvmd/` does not permit it. Write rules in
 canonical form — a `..` inside a pattern is matched literally and will never fire.
 
+Canonicalisation is lexical, so it does not follow symlinks: if `/run/gvmd/out` is a
+symlink to `/tmp`, a rule scoped to `/run/gvmd/` still permits `/run/gvmd/out/x.sock`,
+which the kernel resolves to `/tmp/x.sock`. A trace records the path a process asked for,
+not what the filesystem held at the time, so there is nothing to resolve it against.
+
+Abstract-namespace sockets (`@name`) are matched literally: their bytes are opaque, and a
+`/` or `..` inside one is part of the name rather than path syntax.
+
 `path_prefix` is a string prefix, not a directory boundary: `path_prefix: /run/gvm` also
 permits `/run/gvmd-other/x.sock`. Include the trailing slash when you mean the directory.
 
