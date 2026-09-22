@@ -75,32 +75,26 @@ def _echo_strace_error(stderr: bytes | None) -> None:
         click.echo(message, err=True)
 
 
-def _parse_trace(
-    lines: list[str],
-    unreadable_code: int,
-    command_exit_code: int | None = None,
-) -> list[ConnectEvent]:
+def _echo_unreadable(unparsed: int) -> None:
+    """Say that the trace holds connect() calls netaudit could not read."""
+    noun = "line" if unparsed == 1 else "lines"
+    click.echo(
+        f"netaudit: {unparsed} connect() {noun} could not be parsed; the trace cannot be judged",
+        err=True,
+    )
+
+
+def _parse_trace(lines: list[str], unreadable_code: int) -> list[ConnectEvent]:
     """Parse *lines* into events, or exit *unreadable_code* if any was unreadable.
 
     A ``connect()`` netaudit cannot read is a destination it cannot judge. The
     rest of the trace is still parsed, but reporting on it would present part
     of a run as the whole of it — and an empty result as a clean one.
-
-    Whether the audit happened at all is settled before the traced command's
-    own status, so *command_exit_code* is reported here rather than lost: the
-    exit code this takes is netaudit's.
     """
     parser = StraceParser()
     events = parser.parse_stream(lines)
     if parser.unparsed:
-        noun = "line" if parser.unparsed == 1 else "lines"
-        click.echo(
-            f"netaudit: {parser.unparsed} connect() {noun} could not be parsed; "
-            "the trace cannot be judged",
-            err=True,
-        )
-        if command_exit_code is not None:
-            click.echo(f"netaudit: the traced command exited {command_exit_code}", err=True)
+        _echo_unreadable(parser.unparsed)
         sys.exit(unreadable_code)
     return events
 
@@ -290,6 +284,7 @@ def run_cmd(
     _tempfiles.sweep_stale()
     strace_out = _tempfiles.create(".strace")
 
+    keep_trace = False
     try:
         try:
             completed = runner.run(list(command), strace_out)
@@ -306,7 +301,21 @@ def run_cmd(
             click.echo(f"netaudit: strace wrote no trace and exited {command_code}", err=True)
             _echo_strace_error(completed.stderr)
             sys.exit(_EXIT_TRACE_FAILED)
-        events = _parse_trace(trace.splitlines(), _EXIT_TRACE_FAILED, command_code)
+        parser = StraceParser()
+        events = parser.parse_stream(trace.splitlines())
+        if parser.unparsed:
+            # Whether the audit happened at all is settled before the traced
+            # command's own status, so that status is said out loud rather than
+            # lost: the exit code this takes is netaudit's.
+            _echo_unreadable(parser.unparsed)
+            if command_code != 0:
+                click.echo(f"netaudit: the traced command exited {command_code}", err=True)
+            # The trace is the only evidence of what the run did. Naming it and
+            # then deleting it on the way out would leave nothing to act on.
+            keep_trace = True
+            _tempfiles.keep(strace_out)
+            click.echo(f"netaudit: the trace is kept at {strace_out}", err=True)
+            sys.exit(_EXIT_TRACE_FAILED)
         violations = Reporter.check(events, al)
         _emit(
             violations,
@@ -335,7 +344,8 @@ def run_cmd(
             sys.exit(command_code)
         sys.exit(_EXIT_TRACED_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
-        strace_out.unlink(missing_ok=True)
+        if not keep_trace:
+            strace_out.unlink(missing_ok=True)
 
 
 @main.command("analyze")

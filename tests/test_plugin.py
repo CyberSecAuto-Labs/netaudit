@@ -296,6 +296,85 @@ class TestMarkersCannotBeForged:
         assert [r.nodeid for r in _parse_markers(markers)] == [nodeid]
 
 
+class TestAReportFailureDoesNotSwallowTheVerdict:
+    """The report is an artifact; the violations are the result."""
+
+    def _session(self) -> MagicMock:
+        session = MagicMock()
+        session.exitstatus = pytest.ExitCode.OK
+        session.config = _mock_config()
+        return session
+
+    def _traced(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: Path) -> Path:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        markers = tmp_path / "markers"
+        markers.write_text(
+            _marker("START", "43199.0", "", "test_a") + _marker("END", "43201.0", "", "test_a")
+        )
+        _traced_run(monkeypatch, strace_file, markers, report=report)
+        return strace_file
+
+    def test_the_violations_are_still_printed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A path whose parent is an existing file: mkdir cannot make it.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        self._traced(tmp_path, monkeypatch, blocker / "report.json")
+        session = self._session()
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        out = capsys.readouterr().out
+        assert "198.51.100.1" in out, "the verdict was suppressed by the report write"
+        assert "could not write the report" in out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_a_clean_run_still_fails_when_the_report_cannot_be_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text("")
+        markers = tmp_path / "markers"
+        markers.write_text("")
+        _traced_run(monkeypatch, strace_file, markers, report=blocker / "report.json")
+        session = self._session()
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert "could not write the report" in capsys.readouterr().out
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_an_audit_that_did_not_finish_keeps_its_trace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Destroying the evidence is the one thing worse than failing loudly."""
+        strace_file = self._traced(tmp_path, monkeypatch, tmp_path / "report.json")
+        monkeypatch.setattr(
+            pytest_plugin, "_attribute_violations", MagicMock(side_effect=RuntimeError("boom"))
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            pytest_sessionfinish(session=self._session(), exitstatus=0)
+
+        assert strace_file.exists()
+        assert "trace is kept at" in capsys.readouterr().out
+
+    def test_a_cleanup_failure_does_not_mask_the_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._traced(tmp_path, monkeypatch, tmp_path / "report.json")
+        monkeypatch.setattr(Path, "unlink", MagicMock(side_effect=OSError("read-only filesystem")))
+        session = self._session()
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert "198.51.100.1" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # _group_events
 # ---------------------------------------------------------------------------

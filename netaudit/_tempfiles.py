@@ -170,6 +170,16 @@ def _is_directory(path: Path) -> bool:
         return False
 
 
+def keep(path: Path) -> None:
+    """Stop tracking *path*, so nothing here removes it on the way out.
+
+    The trace of a run that could not be judged is the only evidence of what
+    happened; naming it for the user and then deleting it at exit would be
+    worse than not naming it at all.
+    """
+    _TRACKED.discard(path)
+
+
 def create(suffix: str, directory: Path | None = None) -> Path:
     """Create an empty temp file whose lifetime this module owns.
 

@@ -565,6 +565,31 @@ def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:
     )
 
 
+def _discard(path: Path | None) -> None:
+    """Remove a temp file, best-effort.
+
+    Unguarded, a cleanup failure here would replace whatever the session was
+    about to report with a traceback about a file nobody asked after.
+    """
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _emit_report_failure(session: pytest.Session, path: Path, exc: OSError) -> None:
+    """Say the report could not be written, and fail the session for it.
+
+    The violations, if any, have already been printed. What is lost is the
+    artifact the user asked for, which is its own failure.
+    """
+    print(f"\n  netaudit: could not write the report to {path}: {exc}")
+    print("  The block above is the whole of the result; nothing was saved.\n")
+    _fail_session(session)
+
+
 def _emit_not_audited(session: pytest.Session, detail: str) -> None:
     """Fail the session, with *detail* saying why its trace is not evidence."""
     border = "=" * 60
@@ -811,6 +836,7 @@ def pytest_sessionfinish(
         return
 
     strace_file = run.trace
+    keep_trace = False
 
     try:
         trace = strace_file.read_text() if strace_file.exists() else ""
@@ -831,10 +857,6 @@ def pytest_sessionfinish(
         if markers_file and markers_file.exists():
             test_ranges = _parse_markers(markers_file)
             violations_by_test = _attribute_violations(events, allowlist, test_ranges)
-            if run.report:
-                # Written regardless of verbosity or whether anything violated —
-                # a clean report is still evidence of what the run observed.
-                _write_report(violations_by_test, run.report, run.invocation)
             if verbose:
                 _emit_attributed_verbose(events, allowlist, test_ranges, session)
             else:
@@ -848,6 +870,17 @@ def pytest_sessionfinish(
                         locations=locations,
                         suggest_rules=run.suggest_rules,
                     )
+            if run.report:
+                # Written last, and after the verdict: a path that cannot be
+                # written — a read-only filesystem, a full disk, a component
+                # that is a file — must not be able to jump past the violations
+                # and take the trace with it on the way out. Written regardless
+                # of verbosity or of whether anything violated, because a clean
+                # report is still evidence of what the run observed.
+                try:
+                    _write_report(violations_by_test, run.report, run.invocation)
+                except OSError as exc:
+                    _emit_report_failure(session, run.report, exc)
         else:
             violations = Reporter.check(events, allowlist)
             if verbose:
@@ -856,7 +889,15 @@ def pytest_sessionfinish(
                 Reporter.format(violations, stream=sys.stdout)
             if violations:
                 _fail_session(session)
+    except Exception:
+        # The audit did not finish. Whatever the trace holds is the only record
+        # of what the run did, and the block above never reported it.
+        keep_trace = True
+        _tempfiles.keep(strace_file)
+        print(f"\n  netaudit: the audit did not finish; its trace is kept at {strace_file}")
+        print(f"  Re-run the analysis with: netaudit analyze {strace_file}\n")
+        raise
     finally:
-        strace_file.unlink(missing_ok=True)
-        if run.markers:
-            run.markers.unlink(missing_ok=True)
+        if not keep_trace:
+            _discard(strace_file)
+        _discard(run.markers)

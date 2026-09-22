@@ -1038,6 +1038,22 @@ class TestUnreadableTrace:
         assert result.exit_code == 87
         assert "traced command exited 7" in result.output
 
+    def test_run_keeps_the_trace_it_could_not_judge(self, tmp_path: Path) -> None:
+        """Naming the trace and then deleting it would leave nothing to act on."""
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert strace_log.exists(), "the trace the message points at was deleted"
+        assert str(strace_log) in result.output
+
     def test_the_count_is_reported(self, tmp_path: Path) -> None:
         log = tmp_path / "trace.log"
         log.write_text(self._LOG * 3)
