@@ -1259,6 +1259,21 @@ class TestSavedReportFieldsAreTyped:
         path.write_text(json.dumps({"version": 1, "summary": {"total": 0}}))
         assert load_report(path).destinations == []
 
+    def test_an_absent_summary_is_an_empty_one(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1}))
+        assert load_report(path).destinations == []
+
+    @pytest.mark.parametrize("summary", [[], "", 0, False])
+    def test_a_falsy_summary_that_is_not_an_object_is_still_rejected(
+        self, tmp_path: Path, summary: object
+    ) -> None:
+        """`or {}` would have read all of these as "no summary"."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": summary}))
+        with pytest.raises(ValueError, match="'summary' must be an object"):
+            load_report(path)
+
     def test_a_summary_that_is_not_an_object_is_rejected(self, tmp_path: Path) -> None:
         path = tmp_path / "r.json"
         path.write_text(json.dumps({"version": 1, "summary": [1, 2]}))
@@ -1335,3 +1350,17 @@ class TestSecretsAreMaskedInTheRecordedCommand:
     def test_the_hostname_is_still_recorded(self) -> None:
         """It ties a report to the machine that made it, and is not a credential."""
         assert build_run_metadata(command=["pytest"])["hostname"]
+
+
+class TestRedactionEdges:
+    def _command(self, *args: str) -> list[str]:
+        recorded: list[str] = build_run_metadata(command=list(args))["command"]
+        return recorded
+
+    def test_a_name_that_only_joins_into_a_secret_word_is_left_alone(self) -> None:
+        """`--to-ken` is not `--token`; joining is only for the compound names."""
+        assert self._command("app", "--to-ken", "report.txt") == ["app", "--to-ken", "report.txt"]
+
+    @pytest.mark.parametrize("option", ["--api-key", "--apikey", "--access-token"])
+    def test_a_compound_name_is_masked_either_way_it_is_written(self, option: str) -> None:
+        assert self._command("app", option, "s3cr3t") == ["app", option, "***"]

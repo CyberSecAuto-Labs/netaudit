@@ -109,6 +109,14 @@ _ALWAYS_TAKES_A_VALUE = frozenset(
     }
 )
 _SECRET_WORDS = _ALWAYS_TAKES_A_VALUE | {"auth", "bearer", "cookie", "key"}
+
+# Names that only read as a secret with their separators removed, so that
+# ``--api-key`` and ``--apikey`` are treated alike. Kept disjoint from the
+# single words above: joining against those too would make ``--to-ken`` read
+# as ``token``. All of these take a value, so they count for both forms.
+_JOINED_SECRET_NAMES = frozenset(
+    {"accesstoken", "apikey", "apisecret", "apitoken", "bearertoken", "privatekey"}
+)
 _NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 # scheme://user:password@host — the password half is what is masked.
@@ -166,12 +174,15 @@ def _redact_command(command: list[str]) -> list[str]:
 def _names_a_secret(option: str, words: frozenset[str] | set[str]) -> bool:
     """Whether the option name *option* names one of *words*.
 
-    Both the individual segments and the whole name with its separators
-    removed, so ``--api-key`` and ``--apikey`` are read the same way. Whole
-    segments rather than substrings, so ``--tokenize`` is not one of these.
+    Whole segments rather than substrings, so ``--tokenize`` is not one of
+    these; plus the joined form for the compound names that are written both
+    ways, so ``--api-key`` and ``--apikey`` are read alike.
     """
     segments = _NAME_SEPARATORS.split(option.lstrip("-").lower())
-    return "".join(segments) in words or any(segment in words for segment in segments)
+    if any(segment in words for segment in segments):
+        return True
+    # The compound names always take a value, so they count for both callers.
+    return "".join(segments) in _JOINED_SECRET_NAMES
 
 
 def build_run_metadata(
@@ -462,7 +473,10 @@ def load_report(path: Path) -> LoadedReport:
     """
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError: a deeply nested document. Every way a file on disk
+        # can refuse to become an object is one error type, because that is
+        # what callers catch.
         raise ValueError(f"Could not read report {path.name}: {exc}") from None
     if not isinstance(data, dict):
         raise ValueError(f"Report {path.name} is not a JSON object")
@@ -474,7 +488,9 @@ def load_report(path: Path) -> LoadedReport:
             f"(this netaudit reads version {REPORT_VERSION})"
         )
 
-    summary = data.get("summary") or {}
+    summary = data.get("summary")
+    if summary is None:
+        summary = {}
     if not isinstance(summary, dict):
         raise ValueError(f"Report {path.name}: 'summary' must be an object")
     raw = summary.get("by_destination")
