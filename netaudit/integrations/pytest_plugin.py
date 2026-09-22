@@ -242,30 +242,13 @@ def _attribute_violations(
     return {nodeid: _group_events(evts) for nodeid, evts in by_test.items()}
 
 
-def _owns_the_run() -> bool:
-    """Whether this process is the traced session rather than a descendant of it.
-
-    ``execvpe`` preserves the pid, so the process that re-executed itself
-    *becomes* strace, and the pytest strace forks is its direct child. Anything
-    deeper — a test that shells out to pytest, an xdist worker — inherits the
-    same environment while pointing at a run that is still in progress. It must
-    neither report on that run's trace nor delete it.
-
-    An absent marker means the environment was set by hand rather than by the
-    re-exec; there is nothing to compare against, so ownership is assumed.
-    """
-    tracer_pid = os.environ.get(_ENV_TRACER_PID)
-    return tracer_pid is None or tracer_pid == str(os.getppid())
-
-
 def _is_xdist_worker(config: pytest.Config) -> bool:
     """True inside a pytest-xdist worker, which runs *this* session's tests.
 
-    A worker is a descendant of the traced session, so :func:`_owns_the_run`
-    disowns it, but the tests it runs are the run's own and their markers
-    belong in the run's file. (Ranges from parallel workers can overlap, and
-    attribution resolves that first-match — a limitation of ``-n`` itself, not
-    of this check.)
+    A worker is a descendant of the traced session and so claims no run of its
+    own, but the tests it runs are the run's own and their markers belong in
+    the run's file. (Ranges from parallel workers can overlap, and attribution
+    resolves that first-match — a limitation of ``-n`` itself, not of this.)
     """
     return hasattr(config, "workerinput")
 
@@ -669,18 +652,26 @@ def pytest_configure(config: pytest.Config) -> None:
     """
     global _RUN
 
-    # Popped rather than read: the path to the trace is what would let the code
-    # under audit empty its own evidence, and past this point nothing needs it
-    # in the environment. Descendants are told they are inside a traced run by
-    # _ENV_TRACER_PID alone.
+    # Popped rather than read, and the pop is what claims the run. The path to
+    # the trace is what would let the code under audit empty its own evidence,
+    # so it must not survive into the tests — and removing it here means no
+    # descendant can see it either. Whoever finds the variable set *is* the
+    # traced session: a test that shells out to pytest, or an xdist worker,
+    # inherits an environment this process has already emptied of it.
+    #
+    # Reading it this way rather than comparing pids is what makes the check
+    # hold when the strace on PATH is a wrapper script — a common CI shape for
+    # granting ptrace. There the traced pytest's parent is the inner strace and
+    # not the recorded tracer, and a parent comparison would silently disown
+    # the run, reporting no violations and leaking the trace.
     trace = _from_env(_ENV_STRACE_OUT)
     already_traced = _ENV_STRACE_OUT in os.environ or _ENV_TRACER_PID in os.environ
     os.environ.pop(_ENV_STRACE_OUT, None)
     if already_traced:
-        # Already running under strace. The process that made these files is
-        # gone — execvpe replaced it — so this one owns removing them, and its
-        # sessionfinish is only reached if the run is allowed to finish.
-        if trace is not None and _owns_the_run():
+        # The process that made these files is gone — the exec replaced it — so
+        # this one owns removing them, and its sessionfinish is only reached if
+        # the run is allowed to finish.
+        if trace is not None:
             _RUN = _adopt_the_traced_run(trace, config)
             _emit_canary(_RUN.canary)
         return

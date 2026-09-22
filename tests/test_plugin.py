@@ -809,6 +809,41 @@ class TestPathsFromTheEnvironment:
 
         assert victim.read_text() == "payload"
 
+    def test_a_wrapper_script_between_strace_and_pytest_still_owns_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Granting ptrace through a wrapper is a common CI shape.
+
+        There the traced pytest's parent is the inner strace, not the recorded
+        tracer, so a parent comparison would disown the run — silently.
+        """
+        trace = _tracked(".strace", owner=os.getppid())
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        # A tracer that is nobody's parent here: the wrapper, not the inner strace.
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
+        monkeypatch.setattr(os, "getppid", lambda: os.getpid() + 100000)
+
+        pytest_configure(_mock_config())
+
+        assert pytest_plugin._RUN is not None
+        assert pytest_plugin._RUN.trace == trace
+
+    def test_a_descendant_sees_no_trace_path_to_adopt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The traced session pops the variable, so nothing below it can claim the run."""
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(_tracked(".strace", owner=os.getppid())))
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
+        pytest_configure(_mock_config())
+        assert pytest_plugin._RUN is not None
+        monkeypatch.setattr(pytest_plugin, "_RUN", None)
+
+        # A nested pytest inherits what is left, which no longer names the trace.
+        pytest_configure(_mock_config())
+
+        assert pytest_plugin._RUN is None
+
     def test_a_trace_from_another_run_is_not_adopted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Right shape, wrong run: the directory's pid is not the tracer's."""
         stranger = _tracked(".strace", owner=os.getppid() + 100000)
