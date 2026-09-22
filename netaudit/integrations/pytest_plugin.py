@@ -275,7 +275,7 @@ def _anchored(value: str, root: Path) -> Path:
     return (root / value).resolve()
 
 
-def _pyproject_netaudit(root: Path) -> dict[str, Any]:
+def _pyproject_netaudit(root: Path, strict: bool = False) -> dict[str, Any]:
     """Read the ``[tool.netaudit]`` table from *pyproject.toml* under *root*.
 
     *root* is pytest's rootdir rather than the cwd: the cwd is whatever the
@@ -283,15 +283,23 @@ def _pyproject_netaudit(root: Path) -> dict[str, Any]:
     a directory the run under audit chose.
 
     Returns an empty mapping when the file is absent, unreadable, malformed,
-    or carries no ``[tool.netaudit]`` table — configuration is best-effort and
-    must never break collection.
+    or carries no ``[tool.netaudit]`` table. That tolerance is for the question
+    "is auditing on?", which every pytest process on the machine asks — the
+    plugin loads via the ``pytest11`` entry point — and where the safe answer
+    to "cannot tell" is no.
+
+    *strict* is for the questions asked once auditing is already on, where a
+    file that cannot be read would silently drop the policy it declares: there
+    the read failure is reported instead.
     """
     pyproject = root / "pyproject.toml"
     if not pyproject.exists():
         return {}
     try:
         data = tomllib.loads(pyproject.read_text())
-    except Exception:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        if strict:
+            raise pytest.UsageError(f"netaudit: could not read {pyproject}: {exc}") from None
         return {}
     tool_cfg = data.get("tool")
     if not isinstance(tool_cfg, dict):
@@ -421,15 +429,15 @@ def _resolve_verbose(config: pytest.Config) -> bool:
 def _load_allowlist(path: Path) -> AllowList:
     """Load the allowlist at *path*, or abort the session saying why.
 
-    Every failure is caught and re-raised as a usage error rather than left to
-    surface as a traceback out of ``pytest_configure``: the causes are all
-    things a user wrote — a path that moved, a version bump, a malformed
-    entry — and each needs naming, not a stack.
+    ``from_yaml`` reports every way a file can be unusable as ``ValueError``,
+    so this re-labels one error type rather than blanketing the call: the
+    causes are all things a user wrote — a path that moved, a version bump, a
+    malformed entry — and each needs naming, not a stack.
     """
     try:
         return AllowList.from_yaml(path)
-    except Exception as exc:
-        raise pytest.UsageError(f"netaudit: allowlist {path}: {exc}") from None
+    except ValueError as exc:
+        raise pytest.UsageError(f"netaudit: {exc}") from None
 
 
 def _resolve_allowlist(config: pytest.Config) -> AllowList:
@@ -448,8 +456,13 @@ def _resolve_allowlist(config: pytest.Config) -> AllowList:
     if cli_path is not None:
         return _load_allowlist(_anchored(cli_path, Path.cwd()))
 
-    al_path = _pyproject_netaudit(root).get("allowlist")
-    if isinstance(al_path, str):
+    al_path = _pyproject_netaudit(root, strict=True).get("allowlist")
+    if al_path is not None:
+        if not isinstance(al_path, str):
+            # Ignoring it would be the same silent widening as a file that moved.
+            raise pytest.UsageError(
+                f"netaudit: [tool.netaudit] allowlist must be a path, not {al_path!r}"
+            )
         return _load_allowlist(_anchored(al_path, root))
 
     default = _anchored(_DEFAULT_ALLOWLIST, root)

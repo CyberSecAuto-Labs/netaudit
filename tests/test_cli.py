@@ -956,6 +956,30 @@ class TestRunTracingFailure:
         assert result.exit_code == 0  # type: ignore[attr-defined]
 
 
+class TestMissingAllowlist:
+    """A named allowlist that is not there is the motivating failure, not malformed YAML."""
+
+    def test_analyze_exits_2(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        result = CliRunner().invoke(
+            main, ["analyze", "--allowlist", str(tmp_path / "gone.yaml"), str(log)]
+        )
+
+        assert result.exit_code == 2
+        assert "Could not read allowlist" in result.output
+
+    def test_run_exits_85(self, tmp_path: Path) -> None:
+        with patch("netaudit.cli.StraceRunner", return_value=MagicMock()):
+            result = CliRunner().invoke(
+                main, ["run", "--allowlist", str(tmp_path / "gone.yaml"), "--", "true"]
+            )
+
+        assert result.exit_code == 85
+        assert "Could not read allowlist" in result.output
+
+
 class TestUnreadableTrace:
     """A connect() netaudit cannot parse must not be reported as a clean run."""
 
@@ -1050,7 +1074,7 @@ class TestRunReservedCodesAreDistinct:
         bad.write_text("allowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n")
         result = CliRunner().invoke(main, ["analyze", "--allowlist", str(bad), str(log)])
         assert result.exit_code == 2
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
         assert "Traceback" not in result.output
 
     def test_triage_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
@@ -1060,7 +1084,7 @@ class TestRunReservedCodesAreDistinct:
         bad.write_text("version: 2\nallowlist: []\n")
         result = CliRunner().invoke(main, ["triage", "--allowlist", str(bad), str(report)])
         assert result.exit_code == 2
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
 
     def test_reserved_codes_do_not_overlap(self) -> None:
         from netaudit.cli import (
@@ -1103,5 +1127,5 @@ class TestRunReservedCodesAreDistinct:
         with patch("netaudit.cli.StraceRunner"):
             result = CliRunner().invoke(main, ["run", "--allowlist", str(bad), "--", "true"])
         assert result.exit_code == 85
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
         assert "Traceback" not in result.output

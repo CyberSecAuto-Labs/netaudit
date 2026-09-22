@@ -173,16 +173,29 @@ def _parse_port(value: Any) -> int | None:
     return port
 
 
+def _cidr_from(entry: dict[str, Any], host_bits: str) -> str:
+    """The CIDR an entry declares, from ``cidr`` or a bare ``addr``.
+
+    An entry with neither is a rule the file meant to write and did not: it is
+    reported rather than allowed to raise ``KeyError`` at whatever caught it.
+    """
+    cidr = entry.get("cidr")
+    if cidr:
+        return str(cidr)
+    addr = entry.get("addr")
+    if addr is None:
+        raise ValueError(f"Allowlist entry needs 'addr' or 'cidr': {entry!r}")
+    return f"{addr}{host_bits}"
+
+
 def _rule_from_dict(entry: dict[str, Any]) -> Rule:
     name = entry.get("name", "")
     family = entry.get("family", "")
     port = _parse_port(entry.get("port"))
     if family == "AF_INET":
-        cidr = entry.get("cidr") or f"{entry['addr']}/32"
-        return IPv4Rule(cidr, name=name, port=port)
+        return IPv4Rule(_cidr_from(entry, "/32"), name=name, port=port)
     if family == "AF_INET6":
-        cidr = entry.get("cidr") or f"{entry['addr']}/128"
-        return IPv6Rule(cidr, name=name, port=port)
+        return IPv6Rule(_cidr_from(entry, "/128"), name=name, port=port)
     if family == "AF_UNIX":
         glob = entry.get("path_glob") or entry.get("path_prefix", "") + "*"
         return UnixSocketRule(glob, name=name)
@@ -206,16 +219,44 @@ class AllowList:
 
     @classmethod
     def from_yaml(cls, path: Path) -> "AllowList":
-        """Load an allowlist from a YAML file at *path*."""
-        raw = yaml.safe_load(path.read_text()) or {}
+        """Load an allowlist from a YAML file at *path*.
+
+        Every way this can fail — the file missing or unreadable, the YAML
+        malformed, a version this release does not know, an entry it cannot
+        make a rule of — is raised as :class:`ValueError`. Callers treat an
+        allowlist they cannot load as a hard stop, and one error type is what
+        lets them do that without enumerating the ways a file can be wrong.
+        """
+        try:
+            raw = yaml.safe_load(path.read_text()) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"Could not read allowlist {path}: {exc}") from None
+        if not isinstance(raw, dict):
+            raise ValueError(f"Allowlist {path} is not a mapping")
+
         version = raw.get("version")
         if isinstance(version, bool) or version != _SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported allowlist version: {version!r} (expected {_SCHEMA_VERSION})"
+                f"Allowlist {path}: unsupported version {version!r} "
+                f"(expected {_SCHEMA_VERSION})"
             )
+
         includes_builtins = raw.get("includes_builtins", True)
+        # A truthy string would otherwise re-enable the built-ins, which are the
+        # permissive end of the policy — the opposite of what the file asked for.
+        if not isinstance(includes_builtins, bool):
+            raise ValueError(
+                f"Allowlist {path}: 'includes_builtins' must be true or false, "
+                f"not {includes_builtins!r}"
+            )
+
+        entries = raw.get("allowlist") or []
+        if not isinstance(entries, list):
+            raise ValueError(f"Allowlist {path}: 'allowlist' must be a list, not {entries!r}")
         rules: list[Rule] = []
-        for entry in raw.get("allowlist", []):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"Allowlist {path}: entry must be a mapping, not {entry!r}")
             rules.append(_rule_from_dict(entry))
         return cls(rules, includes_builtins=includes_builtins)
 

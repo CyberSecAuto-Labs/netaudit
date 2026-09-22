@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -229,10 +232,16 @@ class TestPluginAutoEnable:
         pytester.makepyfile("def test_nothing(): pass")
         pytester.makepyprojecttoml('[tool.netaudit]\nenabled = true\nallowlist = "gone.yaml"\n')
 
+        before = set(Path(tempfile.gettempdir()).glob("netaudit-*"))
+
         result = pytester.runpytest_subprocess()
 
-        assert result.ret != 0
-        result.stderr.fnmatch_lines(["*netaudit: allowlist*gone.yaml*"])
+        assert result.ret == pytest.ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*netaudit*gone.yaml*"])
+        # No terminal summary at all: the session ended before collection.
+        assert "passed" not in result.stdout.str()
+        leaked = set(Path(tempfile.gettempdir()).glob("netaudit-*")) - before
+        assert leaked == set(), f"the aborted run left its temp files behind: {leaked}"
 
     def test_pyproject_enabled_false_does_not_trace(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(

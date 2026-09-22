@@ -347,7 +347,7 @@ class TestResolveAllowlist:
         (tmp_path / "pyproject.toml").write_text('[tool.netaudit]\nallowlist = "custom.yaml"\n')
         config = _mock_config()
 
-        with pytest.raises(pytest.UsageError, match="Unsupported allowlist version"):
+        with pytest.raises(pytest.UsageError, match="unsupported version"):
             _resolve_allowlist(config)  # type: ignore[arg-type]
 
     def test_a_malformed_cli_allowlist_ends_the_session(self, tmp_path: Path) -> None:
@@ -367,6 +367,40 @@ class TestResolveAllowlist:
 
         with pytest.raises(pytest.UsageError, match="netaudit.yaml"):
             _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_a_non_string_allowlist_value_ends_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ignoring it would widen the policy as silently as a file that moved."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "netaudit.yaml").write_text("version: 1\nallowlist: []\n")
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit]\nallowlist = 123\n")
+        config = _mock_config()
+
+        with pytest.raises(pytest.UsageError, match="must be a path"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_an_unreadable_pyproject_ends_the_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reading it as "no allowlist declared" would drop the policy it holds."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit\n")
+        config = _mock_config()
+
+        with pytest.raises(pytest.UsageError, match="could not read"):
+            _resolve_allowlist(config)  # type: ignore[arg-type]
+
+    def test_an_unreadable_pyproject_still_leaves_auditing_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every pytest on the machine asks this one; "cannot tell" has to mean no."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[tool.netaudit\n")
+        config = _mock_config()
+        config.rootpath = tmp_path
+
+        assert _resolve_enabled(config) is False  # type: ignore[arg-type]
 
     def test_reads_allowlist_from_pyproject_toml(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

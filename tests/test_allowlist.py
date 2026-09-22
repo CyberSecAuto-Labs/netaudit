@@ -480,3 +480,48 @@ class TestMalformedAddress:
 
     def test_ipv6_rule_rejects_an_ipv4_literal(self) -> None:
         assert not IPv6Rule("::/0").matches(_event("AF_INET6", "10.1.2.3"))
+
+
+class TestFromYamlReportsOneErrorType:
+    """Callers stop on an allowlist they cannot load; one error type is what lets them."""
+
+    def _load(self, tmp_path: Path, body: str) -> AllowList:
+        path = tmp_path / "netaudit.yaml"
+        path.write_text(body)
+        return AllowList.from_yaml(path)
+
+    def test_a_missing_file_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(tmp_path / "gone.yaml")
+
+    def test_malformed_yaml_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            self._load(tmp_path, "allowlist: [[[\n")
+
+    def test_a_top_level_list_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not a mapping"):
+            self._load(tmp_path, "- version: 1\n")
+
+    def test_a_non_list_allowlist_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="must be a list"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  name: oops\n")
+
+    def test_a_non_mapping_entry_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="must be a mapping"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - just-a-string\n")
+
+    def test_an_entry_without_addr_or_cidr_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'addr' or 'cidr'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_INET\n")
+
+    def test_an_ipv6_entry_without_addr_or_cidr_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'addr' or 'cidr'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_INET6\n")
+
+    def test_a_non_boolean_includes_builtins_is_rejected(self, tmp_path: Path) -> None:
+        """A truthy string would re-enable the permissive end of the policy."""
+        with pytest.raises(ValueError, match="must be true or false"):
+            self._load(tmp_path, 'version: 1\nincludes_builtins: "false"\nallowlist: []\n')
+
+    def test_an_empty_allowlist_key_still_loads(self, tmp_path: Path) -> None:
+        assert isinstance(self._load(tmp_path, "version: 1\nallowlist:\n"), AllowList)

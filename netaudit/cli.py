@@ -110,6 +110,9 @@ def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT
 
     Callers pass the code appropriate to their exit-code space: `run` reserves
     one clear of the traced command's range, the others use plain bad input.
+
+    ``from_yaml`` reports every way a file can be unusable as ``ValueError`` —
+    a missing path included — so one clause covers them all.
     """
     try:
         if allowlist is not None:
