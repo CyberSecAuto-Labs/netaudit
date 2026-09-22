@@ -97,8 +97,12 @@ symlink to `/tmp`, a rule scoped to `/run/gvmd/` still permits `/run/gvmd/out/x.
 which the kernel resolves to `/tmp/x.sock`. A trace records the path a process asked for,
 not what the filesystem held at the time, so there is nothing to resolve it against.
 
-Abstract-namespace sockets (`@name`) are matched literally: their bytes are opaque, and a
-`/` or `..` inside one is part of the name rather than path syntax.
+Abstract-namespace sockets (`@name`) are **not observed at all** in this release — the
+parser reads only `sun_path="..."`, which is the pathname form. A connection to one produces
+no event and therefore no violation, and no rule is needed for it. Where such a name does
+reach a rule — from a saved report, or from an event a library caller built — it is matched
+literally rather than as a path: its bytes are opaque, so a `/` or `..` inside one is part
+of the name.
 
 `path_prefix` is a string prefix, not a directory boundary: `path_prefix: /run/gvm` also
 permits `/run/gvmd-other/x.sock`. Include the trailing slash when you mean the directory.
