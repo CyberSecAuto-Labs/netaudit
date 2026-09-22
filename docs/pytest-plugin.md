@@ -89,8 +89,10 @@ failed, so a destination that cannot be written — a read-only filesystem, a fu
 path component that is an existing file — costs the artifact and nothing else. The failure
 is reported and fails the session in its own right; the violations above it stand.
 
-If the audit ends without reporting at all, the trace is kept instead of removed and its
-path is printed, so `netaudit analyze` can be pointed at it.
+If the audit ends without a verdict — the trace holds a `connect()` netaudit cannot read,
+the canary is missing, or something raised — the trace is kept instead of removed and its
+path is printed, so `netaudit analyze` can be pointed at it. An empty trace holds nothing
+to act on and is removed.
 
 ## CLI options
 
