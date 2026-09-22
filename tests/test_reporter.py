@@ -1176,7 +1176,8 @@ class TestSavedReportFieldsAreTyped:
                 {
                     "version": 1,
                     "summary": {"total": 1, "by_destination": [destination]},
-                }
+                },
+                allow_nan=True,
             )
         )
         return load_report(path)
@@ -1208,8 +1209,30 @@ class TestSavedReportFieldsAreTyped:
         assert report.destinations[0].addr is None
 
     def test_a_non_numeric_count_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="'count' must be a number"):
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
             self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count="many")
+
+    def test_a_family_that_is_not_a_string_is_rejected(self, tmp_path: Path) -> None:
+        """str() would turn it into a family name nothing matches."""
+        with pytest.raises(ValueError, match="'family' must be a string"):
+            self._load(tmp_path, family=["AF_INET"], addr="1.2.3.4", port=80, count=1)
+
+    @pytest.mark.parametrize("count", [1.9, -1, float("inf"), float("nan")])
+    def test_a_count_that_is_not_a_whole_number_is_rejected(
+        self, tmp_path: Path, count: float
+    ) -> None:
+        """int(inf) raises OverflowError, past every caller's except ValueError."""
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=count)
+
+    def test_a_boolean_count_is_rejected(self, tmp_path: Path) -> None:
+        """bool is a subclass of int, so `true` would otherwise become 1."""
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=True)
+
+    def test_a_whole_float_count_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=3.0)
+        assert report.destinations[0].count == 3
 
     def test_a_tests_field_that_is_not_strings_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="'tests' must be a list of strings"):
@@ -1244,8 +1267,24 @@ class TestSecretsAreMaskedInTheRecordedCommand:
         assert self._command("pytest", "-q", "tests/unit") == ["pytest", "-q", "tests/unit"]
 
     def test_an_option_following_a_secret_option_is_not_eaten(self) -> None:
-        """`--token --verbose` would otherwise mask a flag and lose it."""
-        assert self._command("app", "--token", "--verbose") == ["app", "--token", "***"]
+        """`--token --verbose` would otherwise mask a flag and lose it from the record."""
+        assert self._command("app", "--token", "--verbose", "x") == [
+            "app",
+            "--token",
+            "--verbose",
+            "x",
+        ]
+
+    @pytest.mark.parametrize("option", ["--tokenize", "--authors", "--keyword", "-p"])
+    def test_an_option_that_only_looks_secret_is_left_alone(self, option: str) -> None:
+        """The name is matched by whole segments, not as a substring."""
+        assert self._command("app", option, "value") == ["app", option, "value"]
+
+    @pytest.mark.parametrize(
+        "option", ["--token", "--api-key", "--db_password", "--auth", "--dsn", "--API-KEY"]
+    )
+    def test_the_names_that_do_count_are_masked(self, option: str) -> None:
+        assert self._command("app", option, "s3cr3t") == ["app", option, "***"]
 
     def test_a_positional_secret_is_not_caught(self) -> None:
         """Documented limit: this filters shapes, it does not understand the command."""

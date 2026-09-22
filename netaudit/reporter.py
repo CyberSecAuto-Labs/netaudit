@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -81,10 +82,27 @@ def is_external(addr: str | None) -> bool:
 
 
 # Option names whose value is a secret often enough to be worth masking. Not a
-# guarantee — see :func:`_redact_command`.
-_SECRET_OPTION = re.compile(
-    r"(?i)(token|secret|password|passwd|pwd|api[-_]?key|apikey|auth|credential|cookie|dsn)"
+# guarantee — see :func:`_redact_command`. Matched against whole segments of a
+# name — ``--api-key`` splits to {"api", "key"} — rather than as a substring,
+# so ``--tokenize`` and ``--authors`` are left alone.
+_SECRET_WORDS = frozenset(
+    {
+        "apikey",
+        "apitoken",
+        "auth",
+        "cookie",
+        "credential",
+        "credentials",
+        "dsn",
+        "key",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "token",
+    }
 )
+_NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 # scheme://user:password@host — the password half is what is masked.
 _URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@")
@@ -115,20 +133,29 @@ def _redact_command(command: list[str]) -> list[str]:
     redacted: list[str] = []
     mask_next = False
     for argument in command:
+        # `--token VALUE`: the value is the next element — unless what follows
+        # is plainly another option, which would otherwise be masked away and
+        # lost from the record of what ran.
         if mask_next:
             mask_next = False
-            redacted.append(_REDACTED)
-            continue
-        if argument.startswith("-"):
-            name, separator, value = argument.partition("=")
-            if separator and _SECRET_OPTION.search(name):
-                redacted.append(f"{name}={_REDACTED}")
+            if not argument.startswith("-"):
+                redacted.append(_REDACTED)
                 continue
-            # `--token VALUE`: the secret is the next element, unless what
-            # follows is plainly another option rather than this one's value.
-            mask_next = not separator and bool(_SECRET_OPTION.search(name))
+        if argument.startswith("-"):
+            name, separator, _value = argument.partition("=")
+            if _names_a_secret(name):
+                if separator:
+                    redacted.append(f"{name}={_REDACTED}")
+                    continue
+                mask_next = True
         redacted.append(_mask_url_credentials(argument))
     return redacted
+
+
+def _names_a_secret(option: str) -> bool:
+    """Whether *option* is an option name whose value is likely a secret."""
+    segments = _NAME_SEPARATORS.split(option.lstrip("-").lower())
+    return any(segment in _SECRET_WORDS for segment in segments)
 
 
 def build_run_metadata(
@@ -345,11 +372,33 @@ def _report_port(value: Any) -> int | None:
     raise ValueError(f"Report destination 'port' must be a number or null, not {value!r}")
 
 
+def _report_family(value: Any) -> str:
+    """Validate a saved report's ``family`` field.
+
+    ``str()`` would turn any JSON value into a family name nothing matches,
+    which reads downstream as a destination no rule permits.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Report destination 'family' must be a string, not {value!r}")
+    return value
+
+
 def _report_count(value: Any) -> int:
-    """Validate a saved report's ``count`` field, which drives the ordering."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"Report destination 'count' must be a number, not {value!r}")
-    return int(value)
+    """Validate a saved report's ``count`` field, which drives the ordering.
+
+    Whole and not negative: a fraction would be silently truncated into a
+    number the report never stated, and ``int(inf)`` raises ``OverflowError``
+    past every caller's ``except ValueError``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+    return value
 
 
 def _report_tests(value: Any) -> set[str]:
@@ -374,7 +423,7 @@ def _destination_from(entry: dict[str, Any]) -> Destination:
     straight into a ``path_glob`` — which would never match, because the rule
     canonicalises what it is given.
     """
-    family = str(entry.get("family", ""))
+    family = _report_family(entry.get("family", ""))
     addr = _report_addr(entry.get("addr"))
     if family == "AF_UNIX" and addr is not None:
         addr = _canonical_path(addr)
