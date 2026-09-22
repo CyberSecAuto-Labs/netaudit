@@ -38,17 +38,38 @@ class StraceNotFoundError(RuntimeError):
     """Raised when strace is not available on PATH."""
 
 
-@functools.lru_cache(maxsize=1)
+_RESOLVED_STRACE: str | None = None
+
+
 def _resolve_strace() -> str | None:
     """The absolute path of the strace on PATH, or None if there is none.
 
-    Resolved once and reused, so the binary that was checked is the binary that
-    runs. netaudit's own target scenario is auditing a repository in CI, where
-    the repo commonly contributes entries to PATH: re-resolving the bare name
-    at exec time would let a repo-supplied ``./strace`` run instead, and
+    Held once found and reused, so the binary that was checked is the binary
+    that runs. netaudit's own target scenario is auditing a repository in CI,
+    where the repo commonly contributes entries to PATH: re-resolving the bare
+    name at exec time would let a repo-supplied ``./strace`` run instead, and
     netaudit trusts whatever reaches ``-o`` as ground truth.
+
+    Made absolute, because a relative ``PATH`` entry makes ``which`` return a
+    relative path — which names a different file after a ``chdir``. Symlinks
+    are left unresolved: a distribution that ships strace as a link to a
+    versioned name is not the case this guards against.
+
+    Only a hit is remembered. A caller that adds strace to PATH after a first
+    look found none gets a fresh one rather than the earlier answer.
     """
-    return shutil.which("strace")
+    global _RESOLVED_STRACE
+    if _RESOLVED_STRACE is None:
+        found = shutil.which("strace")
+        if found is not None:
+            _RESOLVED_STRACE = os.path.abspath(found)
+    return _RESOLVED_STRACE
+
+
+def _forget_strace() -> None:
+    """Drop the remembered path. For tests that change PATH underneath it."""
+    global _RESOLVED_STRACE
+    _RESOLVED_STRACE = None
 
 
 def _require_strace() -> str:

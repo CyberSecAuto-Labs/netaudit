@@ -22,6 +22,7 @@ from netaudit.runner import (
     StraceNotFoundError,
     StraceProcess,
     StraceRunner,
+    _forget_strace,
     _resolve_strace,
     _strace_cmd,
     _supports_kill_on_exit,
@@ -204,18 +205,38 @@ class TestStraceIsResolvedOnce:
         assert run.call_args.args[0][0] == _STRACE
 
     def test_the_path_is_resolved_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _resolve_strace.cache_clear()
+        _forget_strace()
         calls: list[str] = []
-        monkeypatch.setattr("netaudit.runner._resolve_strace.__wrapped__", None, raising=False)
         monkeypatch.setattr(
             "netaudit.runner.shutil.which", lambda name: calls.append(name) or _STRACE
         )
         try:
-            _resolve_strace()
-            _resolve_strace()
+            assert _resolve_strace() == _STRACE
+            assert _resolve_strace() == _STRACE
         finally:
-            _resolve_strace.cache_clear()
+            _forget_strace()
         assert calls == ["strace"]
+
+    def test_a_relative_path_is_made_absolute(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A relative PATH entry names a different file after a chdir."""
+        _forget_strace()
+        monkeypatch.setattr("netaudit.runner.shutil.which", lambda _: "bin/strace")
+        try:
+            resolved = _resolve_strace()
+        finally:
+            _forget_strace()
+        assert resolved is not None and Path(resolved).is_absolute()
+
+    def test_a_miss_is_not_remembered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A caller that installs strace after a first look must not be stuck with None."""
+        _forget_strace()
+        answers = iter([None, _STRACE])
+        monkeypatch.setattr("netaudit.runner.shutil.which", lambda _: next(answers))
+        try:
+            assert _resolve_strace() is None
+            assert _resolve_strace() == _STRACE
+        finally:
+            _forget_strace()
 
     def test_the_probe_answers_no_without_a_strace_to_probe(
         self, monkeypatch: pytest.MonkeyPatch
