@@ -454,6 +454,30 @@ class TestOwnDirectory:
             stranger.unlink()
             directory.rmdir()
 
+    def test_a_symlink_left_at_the_remembered_name_is_not_reused(self, tmp_path: Path) -> None:
+        """Replacing the directory with a link would redirect the next trace."""
+        first = _tempfiles.create(".strace").parent
+        _tempfiles.remove_tracked()
+        first.symlink_to(tmp_path)
+        try:
+            assert _tempfiles.own_directory() != first
+        finally:
+            first.unlink()
+
+    def test_a_directory_belonging_to_someone_else_is_not_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """rmdir on a foreign directory would fail anyway; not trying is clearer."""
+        path = _tempfiles.create(".strace")
+        directory = path.parent
+        directory.chmod(0o755)
+        try:
+            _tempfiles.remove_tracked()
+            assert directory.exists()
+        finally:
+            directory.chmod(0o700)
+            directory.rmdir()
+
     def test_a_removed_directory_is_made_again(self) -> None:
         """A second run in the same process still needs somewhere to write."""
         first = _tempfiles.create(".strace")
@@ -468,33 +492,71 @@ class TestOwnDirectory:
 
 
 class TestSweepRemovesRunDirectories:
+    """The sweep deletes a whole tree, so what it accepts has to stay narrow."""
+
+    _AGE = 48 * 3600
+
+    def _run_dir(self, root: Path, *children: str) -> Path:
+        directory = root / f"{_tempfiles.PREFIX}999999-abc"
+        directory.mkdir(mode=0o700)
+        for name in children:
+            (directory / name).write_text("x")
+        return directory
+
+    def _age(self, *paths: Path) -> None:
+        stale = time.time() - self._AGE
+        for path in paths:
+            os.utime(path, (stale, stale))
+
     def test_a_stale_run_directory_goes_with_its_contents(self, tmp_path: Path) -> None:
-        directory = tmp_path / f"{_tempfiles.PREFIX}999999-abc"
-        directory.mkdir()
-        (directory / f"{_tempfiles.PREFIX}999999-abc.strace").write_text("x")
-        old = time.time() - 48 * 3600
-        for path in (directory / f"{_tempfiles.PREFIX}999999-abc.strace", directory):
-            os.utime(path, (old, old))
+        name = f"{_tempfiles.PREFIX}999999-abc.strace"
+        directory = self._run_dir(tmp_path, name)
+        self._age(directory / name, directory)
 
         assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == [directory]
         assert not directory.exists()
 
     def test_a_directory_whose_trace_is_still_growing_is_kept(self, tmp_path: Path) -> None:
         """The directory's own mtime stops moving; the trace inside it does not."""
-        directory = tmp_path / f"{_tempfiles.PREFIX}999999-abc"
-        directory.mkdir()
-        (directory / f"{_tempfiles.PREFIX}999999-abc.strace").write_text("x")
-        old = time.time() - 48 * 3600
-        os.utime(directory, (old, old))
+        directory = self._run_dir(tmp_path, f"{_tempfiles.PREFIX}999999-abc.strace")
+        self._age(directory)
 
         assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
         assert directory.exists()
 
+    def test_a_directory_holding_anything_unexpected_is_kept(self, tmp_path: Path) -> None:
+        """Sharing the prefix is not evidence that the tree is netaudit's."""
+        directory = self._run_dir(tmp_path, "someone-elses-work.txt")
+        self._age(directory / "someone-elses-work.txt", directory)
+
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
+        assert directory.exists()
+
+    def test_a_world_readable_directory_is_kept(self, tmp_path: Path) -> None:
+        """own_directory makes its own 0700; anything else was made by someone else."""
+        directory = self._run_dir(tmp_path, f"{_tempfiles.PREFIX}999999-abc.strace")
+        directory.chmod(0o755)
+        self._age(directory)
+
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
+        assert directory.exists()
+
+    def test_a_symlinked_child_is_not_followed(self, tmp_path: Path) -> None:
+        """Its target's timestamp is not evidence about this run."""
+        outside = tmp_path / "fresh.txt"
+        outside.write_text("x")
+        directory = self._run_dir(tmp_path)
+        (directory / f"{_tempfiles.PREFIX}999999-abc.strace").symlink_to(outside)
+        self._age(directory, directory / f"{_tempfiles.PREFIX}999999-abc.strace")
+
+        # The symlink is not a regular file, so the directory is not swept at all.
+        assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
+        assert outside.exists()
+
     def test_an_unrelated_entry_is_left_alone(self, tmp_path: Path) -> None:
         stranger = tmp_path / f"{_tempfiles.PREFIX}999999-abc.log"
         stranger.write_text("x")
-        old = time.time() - 48 * 3600
-        os.utime(stranger, (old, old))
+        self._age(stranger)
 
         assert _tempfiles.sweep_stale(tmp_path, max_age=3600) == []
         assert stranger.exists()

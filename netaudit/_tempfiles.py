@@ -154,10 +154,19 @@ def own_directory() -> Path:
     global _OWN_DIRECTORY
     # Re-made rather than remembered blindly: a cleanup this process already
     # ran will have removed it, and a second run in the same process needs
-    # somewhere to write.
-    if _OWN_DIRECTORY is None or not _OWN_DIRECTORY.is_dir():
+    # somewhere to write. ``lstat`` rather than ``is_dir``, so a symlink left
+    # at the remembered name is not mistaken for the directory it replaced.
+    if _OWN_DIRECTORY is None or not _is_directory(_OWN_DIRECTORY):
         _OWN_DIRECTORY = Path(tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-"))
     return _OWN_DIRECTORY
+
+
+def _is_directory(path: Path) -> bool:
+    """Whether *path* is a directory in its own right, not a link to one."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
 
 
 def create(suffix: str, directory: Path | None = None) -> Path:
@@ -185,9 +194,29 @@ def owner_of(path: Path) -> str | None:
 
 
 def is_own_directory(path: Path) -> bool:
-    """Whether *path* is a private run directory :func:`own_directory` made."""
+    """Whether *path* is a private run directory :func:`own_directory` made.
+
+    The mode and owner are checked as well as the name. They do not separate
+    this process from another of the same uid — nothing in POSIX does, and such
+    a process could delete the trace directly rather than going through
+    netaudit — but they do keep a directory belonging to somebody *else* on a
+    shared temp dir out of reach.
+    """
+    return path.parent == Path(tempfile.gettempdir()) and _has_run_directory_shape(path)
+
+
+def _has_run_directory_shape(path: Path) -> bool:
+    """Name, mode and owner of a private run directory, wherever it sits."""
+    if _OWNER_IN_NAME.match(path.name) is None:
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
     return (
-        path.parent == Path(tempfile.gettempdir()) and _OWNER_IN_NAME.match(path.name) is not None
+        stat.S_ISDIR(info.st_mode)
+        and stat.S_IMODE(info.st_mode) == 0o700
+        and info.st_uid == os.getuid()
     )
 
 
@@ -234,17 +263,40 @@ def _owner_still_running(path: Path) -> bool:
     return True
 
 
-def _newest_mtime(path: Path) -> float:
+def _is_sweepable(path: Path, is_dir: bool) -> bool:
+    """Whether *path* is a leftover of this module's and nothing else.
+
+    The sweep deletes a whole directory tree, so what it accepts is kept
+    narrow: a run directory of this uid, mode 0700, holding nothing but the
+    trace and markers files that belong in one. A directory that merely shares
+    the prefix — someone else's, or one with anything unexpected inside — is
+    left where it is. Bare files are the layout that preceded the directory,
+    and are still recovered.
+    """
+    if not is_dir:
+        return path.suffix in _SUFFIXES and stat.S_ISREG(path.lstat().st_mode)
+    if not _has_run_directory_shape(path):
+        return False
+    return all(
+        child.suffix in _SUFFIXES
+        and _OWNER_IN_NAME.match(child.name) is not None
+        and stat.S_ISREG(child.lstat().st_mode)
+        for child in path.iterdir()
+    )
+
+
+def _newest_mtime(path: Path, is_dir: bool) -> float:
     """The most recent mtime of *path* or of anything directly inside it.
 
     A run directory's own mtime stops moving once both files exist, while the
     trace inside it grows for the whole run. Taking the newest keeps a long,
-    quiet suite from looking abandoned.
+    quiet suite from looking abandoned. ``lstat`` throughout: a symlink's own
+    timestamp, never its target's.
     """
-    newest = path.stat().st_mtime
-    if path.is_dir():
+    newest = path.lstat().st_mtime
+    if is_dir:
         for child in path.iterdir():
-            newest = max(newest, child.stat().st_mtime)
+            newest = max(newest, child.lstat().st_mtime)
     return newest
 
 
@@ -268,11 +320,10 @@ def sweep_stale(
     removed: list[Path] = []
     for path in sorted(root.glob(f"{PREFIX}*")):
         try:
-            is_dir = path.is_dir()
-            # A run directory, or a bare file from the layout that preceded it.
-            if not is_dir and path.suffix not in _SUFFIXES:
+            is_dir = _is_directory(path)
+            if not _is_sweepable(path, is_dir):
                 continue
-            age = now - _newest_mtime(path)
+            age = now - _newest_mtime(path, is_dir)
             if age <= max_age:
                 continue
             if age <= abandoned_age and _owner_still_running(path):
