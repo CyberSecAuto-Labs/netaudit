@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -62,6 +63,27 @@ def _event(
         result=0,
         raw_line="",
     )
+
+
+def _tracked(suffix: str) -> Path:
+    """A temp file named the way :func:`_tempfiles.create` names one.
+
+    The plugin only adopts a path from the environment when it has that shape,
+    so a bare ``tmp_path`` file is rejected and the run is never taken over.
+    """
+    path = _tempfiles.create(suffix)
+    _TRACKED_FOR_TESTS.append(path)
+    return path
+
+
+_TRACKED_FOR_TESTS: list[Path] = []
+
+
+@pytest.fixture(autouse=True)
+def _clean_up_tracked() -> Iterator[None]:
+    yield
+    while _TRACKED_FOR_TESTS:
+        _TRACKED_FOR_TESTS.pop().unlink(missing_ok=True)
 
 
 _CANARY = "/nonexistent/netaudit-canary-0123456789abcdef"
@@ -534,8 +556,8 @@ class TestPytestConfigure:
     ) -> None:
         """A test that shells out to pytest — or an xdist worker — inherits the
         environment, and would otherwise delete a trace that is still being written."""
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
-        monkeypatch.setenv(_ENV_MARKERS_OUT, "/tmp/netaudit-x.markers")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(_tracked(".strace")))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(_tracked(".markers")))
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
         registered: list[tuple[Path, ...]] = []
         monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
@@ -547,7 +569,8 @@ class TestPytestConfigure:
     def test_the_traced_session_recognises_itself_by_its_parent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        trace = _tracked(".strace")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid()))
         registered: list[tuple[Path, ...]] = []
@@ -555,51 +578,54 @@ class TestPytestConfigure:
 
         pytest_configure(self._make_config(enabled=True))
 
-        assert registered == [(Path("/tmp/netaudit-x.strace"),)]
+        assert registered == [(trace,)]
 
     def test_the_traced_process_takes_over_cleanup_of_the_temp_files(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The process that created them is gone — execvpe replaced it."""
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
-        monkeypatch.setenv(_ENV_MARKERS_OUT, "/tmp/netaudit-x.markers")
+        trace, markers = _tracked(".strace"), _tracked(".markers")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
         registered: list[tuple[Path, ...]] = []
         monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
 
         pytest_configure(self._make_config(enabled=True))
 
-        assert registered == [(Path("/tmp/netaudit-x.strace"), Path("/tmp/netaudit-x.markers"))]
+        assert registered == [(trace, markers)]
 
     def test_takes_over_cleanup_of_the_trace_alone_when_there_are_no_markers(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        trace = _tracked(".strace")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         registered: list[tuple[Path, ...]] = []
         monkeypatch.setattr(_tempfiles, "remove_on_cancel", lambda *p: registered.append(p))
 
         pytest_configure(self._make_config(enabled=True))
 
-        assert registered == [(Path("/tmp/netaudit-x.strace"),)]
+        assert registered == [(trace,)]
 
     def test_the_trace_path_does_not_survive_into_the_traced_session(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The tests about to run must not be handed the path to their own evidence."""
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        trace = _tracked(".strace")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
 
         pytest_configure(self._make_config(enabled=True))
 
         assert _ENV_STRACE_OUT not in os.environ
         assert pytest_plugin._RUN is not None
-        assert pytest_plugin._RUN.trace == Path("/tmp/netaudit-x.strace")
+        assert pytest_plugin._RUN.trace == trace
 
     def test_the_traced_session_plants_a_canary_connect(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Its absence from the trace is the only proof tracing never happened."""
-        monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(_tracked(".strace")))
         connected: list[str] = []
         monkeypatch.setattr(pytest_plugin, "_emit_canary", connected.append)
 
@@ -612,7 +638,7 @@ class TestPytestConfigure:
         monkeypatch.setattr(pytest_plugin, "_emit_canary", lambda _address: None)
         canaries = []
         for _ in range(2):
-            monkeypatch.setenv(_ENV_STRACE_OUT, "/tmp/netaudit-x.strace")
+            monkeypatch.setenv(_ENV_STRACE_OUT, str(_tracked(".strace")))
             pytest_configure(self._make_config(enabled=True))
             assert pytest_plugin._RUN is not None
             canaries.append(pytest_plugin._RUN.canary)
@@ -682,6 +708,78 @@ class TestPytestConfigure:
         pytest_configure(config)
 
 
+class TestPathsFromTheEnvironment:
+    """The plugin loads in every pytest run on the machine, via pytest11.
+
+    A path it takes from the environment is one it goes on to append to and
+    unlink, so an unchecked variable is an arbitrary-file delete.
+    """
+
+    def test_an_arbitrary_trace_path_is_not_adopted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        victim = tmp_path / "important.db"
+        victim.write_text("payload")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(victim))
+        monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
+        monkeypatch.setattr(os, "execvpe", lambda *a: pytest.fail("re-exec'd"))
+
+        pytest_configure(_spec_config())
+
+        assert pytest_plugin._RUN is None
+        assert victim.read_text() == "payload"
+
+    def test_an_arbitrary_markers_path_is_not_adopted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        victim = tmp_path / "important.db"
+        victim.write_text("payload")
+        monkeypatch.setenv(_ENV_STRACE_OUT, str(_tracked(".strace")))
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(victim))
+
+        pytest_configure(_mock_config())
+
+        assert pytest_plugin._RUN is not None
+        assert pytest_plugin._RUN.markers is None
+
+    def test_a_worker_ignores_an_arbitrary_markers_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        victim = tmp_path / "important.log"
+        victim.write_text("payload")
+        monkeypatch.setenv(_ENV_MARKERS_OUT, str(victim))
+        monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = "tests/test_foo.py::test_bar"
+        item.config = MagicMock(spec=pytest.Config)
+        item.config.workerinput = {"workerid": "gw0"}
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        next(gen)
+        with contextlib.suppress(StopIteration):
+            gen.send(None)
+
+        assert victim.read_text() == "payload"
+
+    def test_the_markers_file_is_not_written_through_a_symlink(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The name is opened after mkstemp closed its descriptor."""
+        victim = tmp_path / "important.log"
+        victim.write_text("payload")
+        markers = tmp_path / "markers"
+        markers.symlink_to(victim)
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers))
+        item = MagicMock(spec=pytest.Item)
+        item.nodeid = "tests/test_foo.py::test_bar"
+
+        gen = pytest_runtest_protocol(item=item, nextitem=None)
+        with pytest.raises(OSError):
+            next(gen)
+
+        assert victim.read_text() == "payload"
+
+
 # ---------------------------------------------------------------------------
 # pytest_runtest_protocol
 # ---------------------------------------------------------------------------
@@ -692,7 +790,8 @@ class TestPytestRuntestProtocol:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         markers_file = tmp_path / "markers"
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
+        markers_file.touch()
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers_file))
 
         item = MagicMock(spec=pytest.Item)
         item.nodeid = "tests/test_foo.py::test_bar"
@@ -738,7 +837,7 @@ class TestPytestRuntestProtocol:
 
         Disowning it would leave a ``pytest -n`` run with no attribution at all.
         """
-        markers_file = tmp_path / "markers"
+        markers_file = _tracked(".markers")
         monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers_file))
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
 
@@ -1606,7 +1705,8 @@ class TestEmitAttributedLocations:
 class TestRuntestProtocolLocation:
     def test_writes_location_field(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         markers = tmp_path / "m"
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        markers.touch()
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers))
         item = MagicMock()
         item.nodeid = "tests/test_api.py::test_a"
         item.location = ("tests/test_api.py", 41, "test_a")
@@ -1623,7 +1723,8 @@ class TestRuntestProtocolLocation:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         markers = tmp_path / "m"
-        monkeypatch.setenv(_ENV_MARKERS_OUT, str(markers))
+        markers.touch()
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "t.strace", markers))
         item = MagicMock()
         item.nodeid = "test_a"
         item.location = ("tests/test_api.py", None, "test_a")
@@ -1963,8 +2064,7 @@ class TestPolicyIsSettledBeforeTestsRun:
         return root, elsewhere
 
     def _configure(self, root: Path, monkeypatch: pytest.MonkeyPatch, **options: str) -> Path:
-        trace = root / "run.strace"
-        trace.write_text("")
+        trace = _tracked(".strace")
         monkeypatch.setenv(_ENV_STRACE_OUT, str(trace))
         monkeypatch.delenv(_ENV_MARKERS_OUT, raising=False)
         monkeypatch.chdir(root)

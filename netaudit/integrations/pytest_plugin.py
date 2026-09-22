@@ -46,6 +46,10 @@ _ENV_MARKERS_OUT = "NETAUDIT_MARKERS_OUT"
 _ENV_TRACER_PID = "NETAUDIT_TRACER_PID"
 _DEFAULT_ALLOWLIST = "netaudit.yaml"
 
+# The markers file is opened by name, after the mkstemp that created it closed
+# its descriptor. Windows has neither the flag nor strace.
+_NO_SYMLINK = getattr(os, "O_NOFOLLOW", 0)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -167,6 +171,26 @@ def _parse_markers(path: Path) -> list[_TestRange]:
             start, loc = pending.pop(nodeid)
             ranges.append(_TestRange(nodeid=nodeid, start=start, end=ts, location=loc))
     return ranges
+
+
+def _markers_target(config: pytest.Config) -> Path | None:
+    """The markers file this process may append to, or None.
+
+    The traced session uses the path its ``pytest_configure`` settled. An xdist
+    worker has no run of its own but runs this session's tests, so it takes the
+    path from the environment — checked, because the worker cannot tell the
+    re-exec's variable from anyone else's.
+    """
+    if _RUN is not None:
+        return _RUN.markers
+    return _from_env(_ENV_MARKERS_OUT) if _is_xdist_worker(config) else None
+
+
+def _append_marker(path: Path, kind: str, location: str, nodeid: str) -> None:
+    """Append one tab-separated marker record to *path*, never through a symlink."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | _NO_SYMLINK)
+    with os.fdopen(fd, "a") as f:
+        f.write(f"{kind}\t{_now_ts():.6f}\t{location}\t{nodeid}\n")
 
 
 def _group_events(events: list[ConnectEvent]) -> list[Violation]:
@@ -435,11 +459,25 @@ def _resolve_allowlist(config: pytest.Config) -> AllowList:
     return AllowList.empty()
 
 
-def _adopt_the_traced_run(strace_out: str, config: pytest.Config) -> _TracedRun:
+def _from_env(name: str) -> Path | None:
+    """The path *name* holds, when it is one netaudit itself could have made.
+
+    The re-exec passes the trace and markers paths in the environment, and this
+    process goes on to append to one and unlink both. Anything else that sets
+    the variable — the plugin loads in every pytest run on the machine, via the
+    ``pytest11`` entry point — would otherwise be choosing a file for netaudit
+    to delete.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    path = Path(value)
+    return path if _tempfiles.is_own_name(path) else None
+
+
+def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:
     """Take ownership of this run's files and settle the policy it is judged by."""
-    markers_out = os.environ.get(_ENV_MARKERS_OUT)
-    trace = Path(strace_out)
-    markers = Path(markers_out) if markers_out else None
+    markers = _from_env(_ENV_MARKERS_OUT)
     _tempfiles.remove_on_cancel(*(p for p in (trace, markers) if p is not None))
     return _TracedRun(
         trace=trace,
@@ -606,13 +644,15 @@ def pytest_configure(config: pytest.Config) -> None:
     # under audit empty its own evidence, and past this point nothing needs it
     # in the environment. Descendants are told they are inside a traced run by
     # _ENV_TRACER_PID alone.
-    strace_out = os.environ.pop(_ENV_STRACE_OUT, None)
-    if strace_out is not None or _ENV_TRACER_PID in os.environ:
+    trace = _from_env(_ENV_STRACE_OUT)
+    already_traced = _ENV_STRACE_OUT in os.environ or _ENV_TRACER_PID in os.environ
+    os.environ.pop(_ENV_STRACE_OUT, None)
+    if already_traced:
         # Already running under strace. The process that made these files is
         # gone — execvpe replaced it — so this one owns removing them, and its
         # sessionfinish is only reached if the run is allowed to finish.
-        if strace_out is not None and _owns_the_run():
-            _RUN = _adopt_the_traced_run(strace_out, config)
+        if trace is not None and _owns_the_run():
+            _RUN = _adopt_the_traced_run(trace, config)
             _emit_canary(_RUN.canary)
         return
 
@@ -655,20 +695,15 @@ def pytest_runtest_protocol(
     item: pytest.Item, nextitem: pytest.Item | None
 ) -> Generator[None, None, None]:
     """Write START/END timestamp markers around each test for violation attribution."""
-    writes_markers = _owns_the_run() or _is_xdist_worker(item.config)
-    markers_path = os.environ.get(_ENV_MARKERS_OUT) if writes_markers else None
+    markers_path = _markers_target(item.config)
     location = _item_location(item)
     if markers_path:
-        ts = _now_ts()
-        with open(markers_path, "a") as f:
-            f.write(f"START\t{ts:.6f}\t{location}\t{item.nodeid}\n")
+        _append_marker(markers_path, "START", location, item.nodeid)
 
     yield
 
     if markers_path:
-        ts = _now_ts()
-        with open(markers_path, "a") as f:
-            f.write(f"END\t{ts:.6f}\t{location}\t{item.nodeid}\n")
+        _append_marker(markers_path, "END", location, item.nodeid)
 
 
 def pytest_sessionfinish(

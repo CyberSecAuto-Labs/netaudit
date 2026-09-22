@@ -131,6 +131,24 @@ def create(suffix: str, directory: Path | None = None) -> Path:
     return path
 
 
+def is_own_name(path: Path) -> bool:
+    """Whether *path* is one :func:`create` could have produced.
+
+    The trace and markers paths reach the pytest plugin through the
+    environment, and it unlinks and appends to them. The plugin is registered
+    globally via the ``pytest11`` entry point, so it loads in every pytest run
+    on a machine where netaudit is installed — which makes an unchecked path
+    from the environment an arbitrary-file delete triggered by a variable.
+    Constraining the shape to this module's own names keeps the damage to
+    files this module would have owned anyway.
+    """
+    return (
+        path.parent == Path(tempfile.gettempdir())
+        and path.suffix in _SUFFIXES
+        and _OWNER_IN_NAME.match(path.name) is not None
+    )
+
+
 def _owner_still_running(path: Path) -> bool:
     """Whether the process that created *path* is still alive.
 

@@ -18,6 +18,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -334,3 +335,33 @@ class TestSweepStale:
         monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
         stale = self._aged(tmp_path / "netaudit-abc.strace", 48 * 3600)
         assert _tempfiles.sweep_stale() == [stale]
+
+
+class TestIsOwnName:
+    """The plugin unlinks paths that arrive in the environment; this is the gate."""
+
+    def test_accepts_a_name_create_produced(self) -> None:
+        path = _tempfiles.create(".strace")
+        try:
+            assert _tempfiles.is_own_name(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_rejects_a_path_outside_the_temp_directory(self, tmp_path: Path) -> None:
+        assert not _tempfiles.is_own_name(tmp_path / "netaudit-1-x.strace")
+
+    def test_rejects_an_unrelated_name_in_the_temp_directory(self) -> None:
+        root = Path(tempfile.gettempdir())
+        assert not _tempfiles.is_own_name(root / "important.strace")
+
+    def test_rejects_a_name_with_no_owner_pid(self) -> None:
+        root = Path(tempfile.gettempdir())
+        assert not _tempfiles.is_own_name(root / "netaudit-x.strace")
+
+    def test_rejects_a_suffix_this_module_never_creates(self) -> None:
+        root = Path(tempfile.gettempdir())
+        assert not _tempfiles.is_own_name(root / "netaudit-1-x.db")
+
+    def test_rejects_a_traversal_back_out_of_the_temp_directory(self) -> None:
+        root = Path(tempfile.gettempdir())
+        assert not _tempfiles.is_own_name(root / ".." / "netaudit-1-x.strace")
