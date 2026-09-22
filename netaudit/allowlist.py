@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import yaml
 
-from netaudit.parser import ConnectEvent
+from netaudit.parser import ConnectEvent, _canonical_path
 
 __all__ = [
     "AllowList",
@@ -100,10 +100,18 @@ class UnixSocketRule:
         self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
-        """Whether *event* is an AF_UNIX connection whose path matches the glob."""
+        """Whether *event* is an AF_UNIX connection whose path matches the glob.
+
+        The address is canonicalised first. ``fnmatch``'s ``*`` matches ``/``,
+        so without it a rule scoped to ``/run/gvmd/`` would also permit
+        ``/run/gvmd/../../tmp/attacker.sock`` — a path the audited process
+        chooses. The parser canonicalises too; this repeats it because the rule
+        is the boundary, and events also reach it from saved reports and from
+        library callers who built them by hand.
+        """
         if event.family != "AF_UNIX" or event.addr is None:
             return False
-        return fnmatch.fnmatch(event.addr, self._glob)
+        return fnmatch.fnmatch(_canonical_path(event.addr), self._glob)
 
 
 class NetlinkRule:

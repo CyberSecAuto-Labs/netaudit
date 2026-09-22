@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -99,15 +100,25 @@ def _normalise_result(result: int, raw_line: str) -> int:
     return result
 
 
-def _sanitise_path(path: str) -> str:
-    """Strip control characters from an AF_UNIX path.
+def _canonical_path(path: str) -> str:
+    """Strip control characters from an AF_UNIX path and collapse ``.`` and ``..``.
 
     strace renders binary bytes as \\xNN escape sequences, so the string we
     receive is already printable ASCII.  However, strace on some kernels emits
     raw control characters for very short paths; remove them defensively so
     downstream code doesn't choke on non-printable content.
+
+    The traversal is collapsed because the kernel resolves it before the socket
+    is reached: ``/run/gvmd/../../tmp/x.sock`` *is* ``/tmp/x.sock``, and an
+    allowlist rule scoped to ``/run/gvmd/`` must not be made to permit it by the
+    very process it is meant to constrain. ``posixpath`` rather than
+    ``os.path``: the trace describes Linux paths whatever host reads it.
+
+    Symlinks are left alone — the trace does not record what the filesystem
+    held at the time, so there is nothing to resolve them against.
     """
-    return "".join(ch for ch in path if not unicodedata.category(ch).startswith("C"))
+    cleaned = "".join(ch for ch in path if not unicodedata.category(ch).startswith("C"))
+    return posixpath.normpath(cleaned) if cleaned else cleaned
 
 
 def _parse_ts(ts: str) -> float:
@@ -239,7 +250,7 @@ class StraceParser:
                 pid=int(m.group("pid")),
                 timestamp=_parse_ts(m.group("ts")),
                 family=m.group("family"),
-                addr=_sanitise_path(m.group("path")),
+                addr=_canonical_path(m.group("path")),
                 port=None,
                 result=int(m.group("result")),
                 raw_line=line,

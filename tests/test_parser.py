@@ -326,6 +326,23 @@ class TestStraceParser:
             assert "\x01" not in (event.addr or "")
             assert "\x02" not in (event.addr or "")
 
+    def test_unix_path_traversal_is_collapsed(self, parser: StraceParser) -> None:
+        """The reported destination is the one the kernel resolved, not the argument."""
+        line = (
+            "9 12:00:00.000001 connect(5, {sa_family=AF_UNIX,"
+            ' sun_path="/run/gvmd/../../tmp/attacker.sock"}, 20) = 0'
+        )
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.addr == "/tmp/attacker.sock"
+
+    def test_a_path_of_only_control_chars_stays_empty(self, parser: StraceParser) -> None:
+        """normpath("") is ".", which would name the cwd rather than nothing."""
+        line = '9 12:00:00.000001 connect(5, {sa_family=AF_UNIX, sun_path="\x01"}, 20) = 0'
+        event = parser.parse_line(line)
+        assert event is not None
+        assert event.addr == ""
+
     # ------------------------------------------------------------------
     # Timestamp parsing
     # ------------------------------------------------------------------

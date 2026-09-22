@@ -80,6 +80,20 @@ class TestUnixSocketRule:
         rule = UnixSocketRule("*")
         assert not rule.matches(_event("AF_INET", "1.2.3.4"))
 
+    def test_traversal_out_of_the_prefix_is_not_permitted(self) -> None:
+        """The kernel resolves `..` before the socket is reached; so must the rule."""
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert not rule.matches(_event("AF_UNIX", "/run/gvmd/../../tmp/attacker.sock"))
+
+    def test_traversal_that_stays_inside_the_prefix_still_matches(self) -> None:
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert rule.matches(_event("AF_UNIX", "/run/gvmd/sub/../gvmd.sock"))
+
+    def test_redundant_segments_do_not_defeat_an_exact_rule(self) -> None:
+        rule = UnixSocketRule("/run/foo.sock")
+        assert rule.matches(_event("AF_UNIX", "/run/./foo.sock"))
+        assert rule.matches(_event("AF_UNIX", "/run//foo.sock"))
+
 
 class TestNetlinkRule:
     def test_matches_netlink(self) -> None:

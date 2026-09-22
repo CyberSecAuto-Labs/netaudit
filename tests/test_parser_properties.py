@@ -9,6 +9,7 @@ must never take the tool down.
 from __future__ import annotations
 
 import ipaddress
+import posixpath
 
 from hypothesis import assume, given
 from hypothesis import strategies as st
@@ -129,11 +130,20 @@ class TestInetRoundTrip:
 
     @given(pid=pids, ts=timestamps, path=unix_paths)
     def test_unix_path_survives_the_round_trip(self, pid: int, ts: str, path: str) -> None:
+        """Canonicalised, not verbatim: the rule matches the path the kernel resolves."""
         line = f'{pid} {ts} connect(3, {{sa_family=AF_UNIX, sun_path="{path}"}}, 20) = 0'
         event = StraceParser().parse_line(line)
         assert event is not None
         assert event.family == "AF_UNIX"
-        assert event.addr == path
+        assert event.addr == posixpath.normpath(path)
+
+    @given(pid=pids, ts=timestamps, path=unix_paths)
+    def test_a_parsed_unix_path_is_already_canonical(self, pid: int, ts: str, path: str) -> None:
+        """No second pass can change it — so no rule can be fooled by one."""
+        line = f'{pid} {ts} connect(3, {{sa_family=AF_UNIX, sun_path="{path}"}}, 20) = 0'
+        event = StraceParser().parse_line(line)
+        assert event is not None and event.addr is not None
+        assert posixpath.normpath(event.addr) == event.addr
 
 
 # ---------------------------------------------------------------------------
