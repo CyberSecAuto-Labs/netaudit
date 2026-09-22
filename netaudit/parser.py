@@ -186,6 +186,18 @@ def _canonical_path(path: str) -> str:
     return "/" + collapsed.lstrip("/") if collapsed.startswith("//") else collapsed
 
 
+def _port_or_none(text: str) -> int | None:
+    """The port *text* names, or None when no socket could carry it.
+
+    ``htons`` is 16-bit, so a real trace never holds anything else. A forged or
+    corrupted one might, and an event built from it would be written into a
+    report that ``load_report`` then refuses — so it is treated as a connect
+    that could not be read, and counted as such.
+    """
+    port = int(text)
+    return port if 0 <= port <= 65535 else None
+
+
 def _parse_ts(ts: str) -> float:
     """Convert HH:MM:SS.ffffff to seconds-since-midnight float."""
     h, m, rest = ts.split(":")
@@ -289,13 +301,14 @@ class StraceParser:
             struct = m.group("struct")
             addr_m = _RE_INET_ADDR.search(struct)
             port_m = _RE_INET_PORT.search(struct)
-            if addr_m and port_m:
+            port = _port_or_none(port_m.group("port")) if port_m else None
+            if addr_m and port is not None:
                 return ConnectEvent(
                     pid=int(m.group("pid")),
                     timestamp=_parse_ts(m.group("ts")),
                     family=m.group("family"),
                     addr=addr_m.group("addr"),
-                    port=int(port_m.group("port")),
+                    port=port,
                     result=_normalise_result(int(m.group("result")), line),
                     raw_line=line,
                 )
@@ -306,13 +319,14 @@ class StraceParser:
             struct = m.group("struct")
             addr_m6 = _RE_INET6_ADDR.search(struct)
             port_m6 = _RE_INET6_PORT.search(struct)
-            if addr_m6 and port_m6:
+            port6 = _port_or_none(port_m6.group("port")) if port_m6 else None
+            if addr_m6 and port6 is not None:
                 return ConnectEvent(
                     pid=int(m.group("pid")),
                     timestamp=_parse_ts(m.group("ts")),
                     family=m.group("family"),
                     addr=addr_m6.group("addr"),
-                    port=int(port_m6.group("port")),
+                    port=port6,
                     result=_normalise_result(int(m.group("result")), line),
                     raw_line=line,
                 )

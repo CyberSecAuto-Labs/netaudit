@@ -523,3 +523,40 @@ class TestUnparsedConnectLines:
         parser.parse_stream([bad])
         parser.parse_stream([])
         assert parser.unparsed == 0
+
+
+class TestPortsOutsideTheSocketRange:
+    """htons is 16-bit, so a real trace never holds anything else.
+
+    A forged one might, and an event built from it would be written into a
+    report `load_report` then refuses to read back.
+    """
+
+    def test_an_ipv4_port_above_the_range_is_counted_as_unreadable(
+        self, parser: StraceParser
+    ) -> None:
+        line = (
+            "1 12:00:00.000001 connect(3, {sa_family=AF_INET, "
+            'sin_addr=inet_addr("1.2.3.4"), sin_port=htons(65536)}, 16) = 0'
+        )
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_an_ipv6_port_above_the_range_is_counted_as_unreadable(
+        self, parser: StraceParser
+    ) -> None:
+        line = (
+            "1 12:00:00.000001 connect(3, {sa_family=AF_INET6, "
+            'sin6_addr=inet_pton(AF_INET6, "::1"), sin6_port=htons(99999)}, 28) = 0'
+        )
+        assert parser.parse_stream([line]) == []
+        assert parser.unparsed == 1
+
+    def test_the_boundaries_still_parse(self, parser: StraceParser) -> None:
+        for port in (0, 65535):
+            line = (
+                f"1 12:00:00.000001 connect(3, {{sa_family=AF_INET, "
+                f'sin_addr=inet_addr("1.2.3.4"), sin_port=htons({port})}}, 16) = 0'
+            )
+            event = parser.parse_line(line)
+            assert event is not None and event.port == port
