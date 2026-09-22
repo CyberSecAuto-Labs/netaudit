@@ -80,7 +80,8 @@ A failing command takes precedence over violations, so wrapping a test suite nev
 its failure.
 
 **Exit codes for `run`:** `0` clean · `83` violations · `84` strace not found · `85` allowlist
-rejected · any other value is the traced command's own exit code, passed through.
+rejected · `87` tracing failed · any other value is the traced command's own exit code,
+passed through.
 
 `analyze` and `triage` wrap nothing, so they use `0` clean · `1` findings · `2` bad input.
 
@@ -132,6 +133,29 @@ Full docs at **[netaudit.readthedocs.io](https://netaudit.readthedocs.io)**:
 `netaudit run` spawns your command under `strace -e trace=connect -f -tt`, parses every
 `connect()` syscall, and checks each against your allowlist. Built-in rules automatically
 permit loopback, Unix sockets, and AF_NETLINK — you only need to list external destinations.
+
+### What it sees, and what it does not
+
+netaudit traces `connect()` and nothing else. That covers the ordinary way a process
+reaches a destination — and so the overwhelming majority of egress — but it is not all of
+it:
+
+- **UDP sent without `connect()`.** `sendto()` and `sendmsg()` carry the destination in the
+  call itself, so a datagram sent on an unconnected socket never appears.
+- **TCP Fast Open.** `sendto()`/`sendmsg()` with `MSG_FASTOPEN` opens a TCP connection
+  without ever calling `connect()`.
+- **io_uring.** Connections submitted through an `io_uring` ring are issued by the kernel
+  on the process's behalf and are not `connect()` syscalls.
+- **A process netaudit never wrapped.** Only the traced command and its descendants are
+  observed.
+
+DNS usually *is* visible, because the glibc resolver connects its socket before sending —
+but that depends on the resolver configuration and on which retry path it takes, so treat
+it as the common case rather than a guarantee.
+
+Nothing in these categories is reported, so a run that reaches the internet only by one of
+them exits 0. If your threat model includes code that is trying not to be seen, netaudit is
+not the last line of defence — a network policy is.
 
 ## Development
 

@@ -21,6 +21,11 @@ Trace a command under strace and report network violations.
 netaudit run [OPTIONS] -- COMMAND [ARGS]...
 ```
 
+!!! note "`connect()` is the whole of what is traced"
+    UDP sent with `sendto()`/`sendmsg()` on an unconnected socket, and connections issued
+    through `io_uring`, make no `connect()` call and are therefore never reported. See
+    [what netaudit sees](index.md#what-it-sees-and-what-it-does-not).
+
 ### Options
 
 | Option | Default | Description |
@@ -42,10 +47,11 @@ netaudit run [OPTIONS] -- COMMAND [ARGS]...
 | 84 | `strace` binary not found on PATH |
 | 85 | The allowlist was rejected; the command was never started |
 | 86 | The run was cancelled by a signal; the traced command was stopped |
+| 87 | The trace could not be used: strace failed and wrote nothing, or it held `connect()` lines netaudit cannot read |
 | *other* | The traced command's own exit code, passed through unchanged |
 
 `run` wraps another process, so most of the exit-code space belongs to that process.
-`83` to `86` are netaudit's own; every other value is the command's, passed through.
+`83` to `87` are netaudit's own; every other value is the command's, passed through.
 
 A SIGTERM or SIGHUP aimed at `netaudit run` — `docker stop`, a CI cancellation — stops strace and
 the command it traces before exiting `86`, rather than leaving them running. Ctrl-C does the same.
@@ -57,7 +63,7 @@ violations found are still printed.
 Whenever the traced command exits non-zero, netaudit writes
 `netaudit: traced command exited with N` to stderr and records `run.command_exit_code` in
 the JSON report. That also resolves the ambiguous cases: a command that itself exits
-`83`, `84`, `85` or `86`.
+`83`, `84`, `85`, `86` or `87`.
 
 !!! tip "Scripting against the result"
     Read the JSON report rather than the exit code. It states the command's status and the
@@ -107,7 +113,25 @@ netaudit analyze [OPTIONS] STRACE_LOG
 |------|---------|
 | 0 | No violations found in log |
 | 1 | One or more violations found |
-| 2 | Bad input: log file could not be read / allowlist was rejected |
+| 2 | Bad input: log file could not be read / allowlist was rejected / the log held `connect()` lines netaudit cannot read |
+
+!!! warning "An unreadable `connect()` fails the run"
+    A `connect()` line netaudit cannot parse is a destination it cannot judge, so both
+    commands refuse the trace rather than report on the part of it they did read. This
+    settles *before* the traced command's own status, so `run` exits `87` even when the
+    command failed — it names the command's exit code on stderr rather than passing it
+    through, because netaudit cannot stand behind a verdict it could not reach.
+
+    Under `run` the trace is kept rather than removed when this happens, and its path is
+    printed — it is the only record of what the run did, and `netaudit analyze` can be
+    pointed at it once the cause is understood.
+
+    A log captured without `-f -tt` is refused for the same reason: without the pid and
+    timestamp prefix nothing parses, and "nothing parsed" must not read as "nothing
+    connected". A call that reached no destination — `AF_UNSPEC`, which *dis*connects a
+    socket, or a sockaddr the kernel refused to read — is not counted. Reaching this any
+    other way usually means an strace whose sockaddr rendering this version does not
+    cover; please open an issue with the line.
 
 ### Examples
 

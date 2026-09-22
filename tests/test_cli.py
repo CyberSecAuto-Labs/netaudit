@@ -922,6 +922,197 @@ class TestRunExitCodes:
         assert data["run"]["command_exit_code"] == 5
 
 
+class TestRunTracingFailure:
+    """strace failing to trace must never read as a run that saw nothing."""
+
+    def _invoke(self, tmp_path: Path, returncode: int, stderr: bytes) -> "object":
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text("")
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=returncode, stderr=stderr)
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+        ):
+            with patch("pathlib.Path.unlink"):
+                return CliRunner().invoke(main, ["run", "--", "pytest"])
+
+    def test_empty_trace_and_a_failing_strace_is_a_netaudit_failure(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"strace: ptrace(PTRACE_SEIZE): Operation not permitted")
+        assert result.exit_code == 87  # type: ignore[attr-defined]
+
+    def test_the_strace_diagnostic_is_surfaced(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"strace: Cannot find executable 'nope'")
+        assert "Cannot find executable" in result.output  # type: ignore[attr-defined]
+
+    def test_a_silent_strace_still_reports_the_failure(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, 1, b"")
+        assert result.exit_code == 87  # type: ignore[attr-defined]
+        assert "no trace" in result.output  # type: ignore[attr-defined]
+
+    def test_an_empty_trace_from_a_successful_run_is_still_analysed(self, tmp_path: Path) -> None:
+        """Only the pairing is conclusive: strace records the command's exit either way."""
+        result = self._invoke(tmp_path, 0, b"")
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+
+
+class TestTheReportNamesTheAllowlistThatJudgedIt:
+    """A clean report and a suppressed one must not read alike."""
+
+    _PERMISSIVE = "version: 1\nallowlist:\n  - family: AF_INET\n    cidr: 0.0.0.0/0\n"
+
+    def test_an_auto_discovered_allowlist_is_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_VIOLATION)
+        (tmp_path / "netaudit.yaml").write_text(self._PERMISSIVE)
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "netaudit.yaml").write_text(self._PERMISSIVE)
+        monkeypatch.chdir(project)
+
+        result = CliRunner().invoke(main, ["analyze", "--format", "json", str(log)])
+
+        report = json.loads(result.output)
+        assert report["summary"]["total"] == 0
+        assert report["run"]["allowlist"] == "netaudit.yaml"
+
+    def test_no_allowlist_at_all_records_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        result = CliRunner().invoke(main, ["analyze", "--format", "json", str(log)])
+
+        assert "allowlist" not in json.loads(result.output)["run"]
+
+    def test_an_explicit_allowlist_is_recorded_as_given(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+        custom = tmp_path / "custom.yaml"
+        custom.write_text("version: 1\nallowlist: []\n")
+
+        result = CliRunner().invoke(
+            main, ["analyze", "--allowlist", str(custom), "--format", "json", str(log)]
+        )
+
+        assert json.loads(result.output)["run"]["allowlist"] == str(custom)
+
+
+class TestMissingAllowlist:
+    """A named allowlist that is not there is the motivating failure, not malformed YAML."""
+
+    def test_analyze_exits_2(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(_STRACE_LOG_CLEAN)
+
+        result = CliRunner().invoke(
+            main, ["analyze", "--allowlist", str(tmp_path / "gone.yaml"), str(log)]
+        )
+
+        assert result.exit_code == 2
+        assert "Could not read allowlist" in result.output
+
+    def test_run_exits_85(self, tmp_path: Path) -> None:
+        with patch("netaudit.cli.StraceRunner", return_value=MagicMock()):
+            result = CliRunner().invoke(
+                main, ["run", "--allowlist", str(tmp_path / "gone.yaml"), "--", "true"]
+            )
+
+        assert result.exit_code == 85
+        assert "Could not read allowlist" in result.output
+
+
+class TestUnreadableTrace:
+    """A connect() netaudit cannot parse must not be reported as a clean run."""
+
+    _LOG = "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0\n"
+
+    def test_analyze_rejects_the_log(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(self._LOG)
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert result.exit_code == 2
+        assert "could not be parsed" in result.output
+
+    def test_run_exits_87(self, tmp_path: Path) -> None:
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+            patch("pathlib.Path.unlink"),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert "could not be parsed" in result.output
+
+    def test_a_headerless_log_is_refused_rather_than_read_as_clean(self, tmp_path: Path) -> None:
+        """A log captured without -f -tt parses to nothing at all."""
+        log = tmp_path / "trace.log"
+        log.write_text(
+            'connect(3, {sa_family=AF_INET, sin_addr=inet_addr("8.8.8.8"), '
+            "sin_port=htons(53)}, 16) = 0\n"
+        )
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert result.exit_code == 2
+        assert "could not be parsed" in result.output
+
+    def test_a_failing_command_is_still_reported(self, tmp_path: Path) -> None:
+        """The exit code is netaudit's, so the command's status must be said out loud."""
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=7, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+            patch("pathlib.Path.unlink"),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert "traced command exited 7" in result.output
+
+    def test_run_keeps_the_trace_it_could_not_judge(self, tmp_path: Path) -> None:
+        """Naming the trace and then deleting it would leave nothing to act on."""
+        strace_log = tmp_path / "out.strace"
+        strace_log.write_text(self._LOG)
+        mock_runner = MagicMock()
+        mock_runner.run.return_value = MagicMock(returncode=0, stderr=b"")
+        with (
+            patch("netaudit.cli.StraceRunner", return_value=mock_runner),
+            patch("netaudit.cli._tempfiles.create", return_value=strace_log),
+        ):
+            result = CliRunner().invoke(main, ["run", "--", "pytest"])
+
+        assert result.exit_code == 87
+        assert strace_log.exists(), "the trace the message points at was deleted"
+        assert str(strace_log) in result.output
+
+    def test_the_count_is_reported(self, tmp_path: Path) -> None:
+        log = tmp_path / "trace.log"
+        log.write_text(self._LOG * 3)
+
+        result = CliRunner().invoke(main, ["analyze", str(log)])
+
+        assert "3 connect() lines" in result.output
+
+
 class TestRunReservedCodesAreDistinct:
     """netaudit's own codes must not be reachable by the traced command."""
 
@@ -949,7 +1140,7 @@ class TestRunReservedCodesAreDistinct:
         bad.write_text("allowlist:\n  - family: AF_INET\n    addr: 1.2.3.4\n")
         result = CliRunner().invoke(main, ["analyze", "--allowlist", str(bad), str(log)])
         assert result.exit_code == 2
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
         assert "Traceback" not in result.output
 
     def test_triage_reports_a_malformed_allowlist(self, tmp_path: Path) -> None:
@@ -959,7 +1150,7 @@ class TestRunReservedCodesAreDistinct:
         bad.write_text("version: 2\nallowlist: []\n")
         result = CliRunner().invoke(main, ["triage", "--allowlist", str(bad), str(report)])
         assert result.exit_code == 2
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
 
     def test_reserved_codes_do_not_overlap(self) -> None:
         from netaudit.cli import (
@@ -967,6 +1158,7 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_CANCELLED,
             _EXIT_CLEAN,
             _EXIT_STRACE_MISSING,
+            _EXIT_TRACE_FAILED,
             _EXIT_TRACED_VIOLATIONS,
         )
 
@@ -976,14 +1168,16 @@ class TestRunReservedCodesAreDistinct:
             _EXIT_STRACE_MISSING,
             _EXIT_BAD_ALLOWLIST,
             _EXIT_CANCELLED,
+            _EXIT_TRACE_FAILED,
         }
-        assert len(codes) == 5
+        assert len(codes) == 6
         # Every netaudit-originated code sits in the band left clear of sysexits,
         # the Linux socket errno block, shell codes and signal-derived values.
         assert 79 <= _EXIT_TRACED_VIOLATIONS <= 87
         assert 79 <= _EXIT_STRACE_MISSING <= 87
         assert 79 <= _EXIT_BAD_ALLOWLIST <= 87
         assert 79 <= _EXIT_CANCELLED <= 87
+        assert 79 <= _EXIT_TRACE_FAILED <= 87
 
     def test_run_never_borrows_an_exit_code_the_command_could_return(self) -> None:
         # The whole point of the reserved band: `run` passes the traced
@@ -999,5 +1193,5 @@ class TestRunReservedCodesAreDistinct:
         with patch("netaudit.cli.StraceRunner"):
             result = CliRunner().invoke(main, ["run", "--allowlist", str(bad), "--", "true"])
         assert result.exit_code == 85
-        assert "netaudit: Unsupported allowlist version" in result.output
+        assert "unsupported version" in result.output
         assert "Traceback" not in result.output

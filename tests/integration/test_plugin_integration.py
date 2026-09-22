@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.integration
@@ -221,6 +224,24 @@ class TestPluginAutoEnable:
         result = pytester.runpytest_subprocess()
         assert result.ret != 0
         result.stdout.fnmatch_lines(["*netaudit*violation*"])
+
+    def test_a_named_allowlist_that_cannot_be_loaded_ends_the_session(
+        self, pytester: pytest.Pytester
+    ) -> None:
+        """Falling back to the built-ins would widen the policy, not preserve it."""
+        pytester.makepyfile("def test_nothing(): pass")
+        pytester.makepyprojecttoml('[tool.netaudit]\nenabled = true\nallowlist = "gone.yaml"\n')
+
+        before = set(Path(tempfile.gettempdir()).glob("netaudit-*"))
+
+        result = pytester.runpytest_subprocess()
+
+        assert result.ret == pytest.ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*netaudit*gone.yaml*"])
+        # No terminal summary at all: the session ended before collection.
+        assert "passed" not in result.stdout.str()
+        leaked = set(Path(tempfile.gettempdir()).glob("netaudit-*")) - before
+        assert leaked == set(), f"the aborted run left its temp files behind: {leaked}"
 
     def test_pyproject_enabled_false_does_not_trace(self, pytester: pytest.Pytester) -> None:
         pytester.makepyfile(
@@ -478,6 +499,7 @@ class TestNestedPytestRuns:
             import os
             import subprocess
             import sys
+            import tempfile
             from pathlib import Path
 
 
@@ -490,10 +512,36 @@ class TestNestedPytestRuns:
                     text=True,
                 )
                 assert inner.returncode == 0, inner.stdout + inner.stderr
-                trace = Path(os.environ["NETAUDIT_STRACE_OUT"])
-                assert trace.exists(), "the nested run deleted the outer run's trace"
+                # execvpe kept the pid, so the run directory is named after the tracer.
+                tracer = os.environ["NETAUDIT_TRACER_PID"]
+                tmp = Path(tempfile.gettempdir())
+                traces = list(tmp.glob(f"netaudit-{tracer}-*/*.strace"))
+                assert traces, "the nested run deleted the outer run's trace"
             """
         )
         result = pytester.runpytest_subprocess("--netaudit")
         result.assert_outcomes(passed=1)
         assert result.ret == 0
+
+
+class TestTraceIntegrity:
+    """A session that was not observed must not be reported as a clean one."""
+
+    def test_a_session_that_truncates_its_own_trace_fails(self, pytester: pytest.Pytester) -> None:
+        pytester.makepyfile(
+            """
+            import os
+            import tempfile
+            from pathlib import Path
+
+
+            def test_empties_the_trace():
+                tracer = os.environ["NETAUDIT_TRACER_PID"]
+                tmp = Path(tempfile.gettempdir())
+                for trace in tmp.glob(f"netaudit-{tracer}-*/*.strace"):
+                    trace.write_text("")
+            """
+        )
+        result = pytester.runpytest_subprocess("--netaudit")
+        assert result.ret != 0
+        result.stdout.fnmatch_lines(["*not audited*"])

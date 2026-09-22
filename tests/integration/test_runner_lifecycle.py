@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 
 from netaudit import runner as runner_module
-from netaudit.runner import StraceNotFoundError, StraceProcess, StraceRunner
+from netaudit.runner import (
+    StraceNotFoundError,
+    StraceProcess,
+    StraceRunner,
+    _forget_strace,
+    _resolve_strace,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -286,8 +292,19 @@ class TestStraceMissing:
         """The real which() lookup, against a real PATH that lacks strace."""
         monkeypatch.setenv("PATH", "")
         assert shutil.which("strace") is None
-        with pytest.raises(StraceNotFoundError, match="strace not found on PATH"):
-            StraceRunner()
+        # The path is remembered deliberately — the binary that was checked has
+        # to be the binary that runs — so this run starts from nothing known.
+        _forget_strace()
+        try:
+            with pytest.raises(StraceNotFoundError, match="strace not found on PATH"):
+                StraceRunner()
+        finally:
+            _forget_strace()
+
+    def test_the_resolved_path_is_absolute(self, runner: StraceRunner) -> None:
+        """A bare name re-resolved at exec time could be a different binary."""
+        resolved = _resolve_strace()
+        assert resolved is not None and Path(resolved).is_absolute()
 
 
 # ---------------------------------------------------------------------------

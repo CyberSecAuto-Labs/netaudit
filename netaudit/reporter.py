@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import math
 import os
+import re
 import socket
 import sys
 from dataclasses import dataclass, field
@@ -13,8 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+import yaml
+
 from netaudit.allowlist import AllowList
-from netaudit.parser import ConnectEvent
+from netaudit.parser import ConnectEvent, _canonical_path
 
 __all__ = [
     "Destination",
@@ -77,6 +81,112 @@ def is_external(addr: str | None) -> bool:
         return False
 
 
+# Option names whose value is a secret often enough to be worth masking. Not a
+# guarantee — see :func:`_redact_command`. Matched against whole segments of a
+# name — ``--api-key`` splits to {"api", "key"} — rather than as a substring,
+# so ``--tokenize`` and ``--authors`` are left alone.
+#
+# Some of these are just as often boolean flags: ``--auth`` and ``--key`` turn
+# up as switches, and ``--cookie`` as a structural option. For those, masking
+# the *next* argument would destroy a filename or a path that is no secret at
+# all, so only the ``--name=value`` form — where the ``=`` proves the option
+# takes a value — is masked.
+_ALWAYS_TAKES_A_VALUE = frozenset(
+    {
+        "apisecret",
+        "apitoken",
+        "authorization",
+        "credential",
+        "credentials",
+        "dsn",
+        "passphrase",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "token",
+    }
+)
+_SECRET_WORDS = _ALWAYS_TAKES_A_VALUE | {"auth", "bearer", "cookie", "key"}
+
+# Compound names that read as a secret only with their separators removed, and
+# whose parts are not enough on their own: ``--api-key`` splits to {"api",
+# "key"}, and ``key`` alone is too often a switch to mask the argument after.
+# Disjoint from the sets above — joining against those too would make
+# ``--to-ken`` read as ``token`` — and every name here takes a value, so it
+# counts for both the ``=value`` and the separate-argument form.
+_JOINED_SECRET_NAMES = frozenset({"apikey", "privatekey"})
+_NAME_SEPARATORS = re.compile(r"[-_.]+")
+
+# scheme://user:password@host — the password half is what is masked.
+_URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^/\s@]+)@")
+
+_REDACTED = "***"
+"""What :func:`_redact_command` puts in place of a value it masked."""
+
+
+def _mask_url_credentials(argument: str) -> str:
+    """Mask the password in any ``scheme://user:password@host`` inside *argument*."""
+    return _URL_CREDENTIALS.sub(rf"\1\2:{_REDACTED}@", argument)
+
+
+def _redact_command(command: list[str]) -> list[str]:
+    """*command* with the values of secret-looking options masked.
+
+    A saved report records the traced command's whole argument vector, and the
+    docs recommend publishing those reports as CI artifacts. A ``--token=`` or
+    a DSN with embedded credentials would otherwise be copied verbatim into a
+    file meant to be shared.
+
+    This is a filter over the shapes secrets usually take — ``--password=x``,
+    ``--token x``, ``postgres://user:pw@host`` — not a guarantee. A secret
+    passed as a bare positional argument, or under a name this does not
+    recognise, still reaches the report. The only thing that rules that out is
+    not putting secrets on a command line.
+
+    It is also deliberately conservative in the other direction: masking the
+    argument after a boolean flag would silently rewrite the record of what
+    ran, so the separate-argument form is only masked for names that are
+    practically never switches.
+    """
+    redacted: list[str] = []
+    mask_next = False
+    for argument in command:
+        # `--token VALUE`: the value is the next element — unless what follows
+        # is plainly another option, which would otherwise be masked away and
+        # lost from the record of what ran. The cost of that choice is that a
+        # secret which itself begins with `-` is left in; there is no way to
+        # tell one from a flag without knowing the command's own grammar, and
+        # rewriting the record is the worse of the two errors.
+        if mask_next:
+            mask_next = False
+            if not argument.startswith("-"):
+                redacted.append(_REDACTED)
+                continue
+        if argument.startswith("-"):
+            name, separator, _value = argument.partition("=")
+            if separator and _names_a_secret(name, _SECRET_WORDS):
+                redacted.append(f"{name}={_REDACTED}")
+                continue
+            mask_next = not separator and _names_a_secret(name, _ALWAYS_TAKES_A_VALUE)
+        redacted.append(_mask_url_credentials(argument))
+    return redacted
+
+
+def _names_a_secret(option: str, words: frozenset[str] | set[str]) -> bool:
+    """Whether the option name *option* names one of *words*.
+
+    Whole segments rather than substrings, so ``--tokenize`` is not one of
+    these; plus the joined form for the compound names that are written both
+    ways, so ``--api-key`` and ``--apikey`` are read alike.
+    """
+    segments = _NAME_SEPARATORS.split(option.lstrip("-").lower())
+    if any(segment in words for segment in segments):
+        return True
+    # The compound names always take a value, so they count for both callers.
+    return "".join(segments) in _JOINED_SECRET_NAMES
+
+
 def build_run_metadata(
     command: list[str] | None = None,
     allowlist: str | None = None,
@@ -89,6 +199,10 @@ def build_run_metadata(
     which command, against which allowlist, on which host, when, and with what
     version of netaudit. Callers supply what they know — ``command`` for a live
     trace, ``source`` for offline analysis of an existing log.
+
+    ``command`` goes through :func:`_redact_command` first. The hostname is
+    recorded as it is: it is what ties a report to the machine that produced
+    it, and it is not a credential.
     """
     from netaudit import __version__
 
@@ -98,7 +212,7 @@ def build_run_metadata(
         "netaudit_version": __version__,
     }
     if command is not None:
-        meta["command"] = list(command)
+        meta["command"] = _redact_command(command)
     if allowlist is not None:
         meta["allowlist"] = allowlist
     if source is not None:
@@ -106,6 +220,50 @@ def build_run_metadata(
     if command_exit_code is not None:
         meta["command_exit_code"] = command_exit_code
     return meta
+
+
+# Every C0 and C1 control character, plus DEL. \t and \n are in the range on
+# purpose: both break a fixed-width table, and neither belongs in an address,
+# a nodeid or a filename.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable(text: str) -> str:
+    """*text* with control characters shown rather than acted on.
+
+    Addresses, test nodeids and report names all reach a terminal and all come
+    from outside netaudit: a trace line the audited process can append to, a
+    repo's own test ids, a filename given on the command line. An address
+    containing ``\x1b[2K\r`` erases and rewrites the line it is printed on, so
+    a violation can be made to render as a clean one — and the violation block
+    is the last thing on stdout, where a reader's eye lands.
+
+    Escaped rather than stripped: removing the bytes could turn an address that
+    is not one into something that reads like a real destination.
+    """
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+def _rule_yaml(rule: dict[str, Any]) -> str:
+    """*rule* as an indented YAML list item, quoted however its values require.
+
+    Built by a dumper rather than by formatting, because the values are not
+    netaudit's: they come out of a saved JSON report, and the docs recommend
+    collecting those as CI artifacts from elsewhere. A newline in an address
+    would otherwise inject whatever the writer chose into the very file the
+    tool tells the user to paste into their allowlist — including broader
+    rules than the ones it is showing them.
+    """
+    body = yaml.safe_dump([rule], sort_keys=False, default_flow_style=False, width=10**6)
+    return "".join(f"  {line}\n" for line in body.splitlines())
+
+
+def _comment(text: str) -> str:
+    """*text* as a single YAML comment line, whatever whitespace it holds.
+
+    A newline would end the comment and let the rest be read as YAML.
+    """
+    return "# " + " ".join(_printable(text).split())
 
 
 def _paint(text: str, code: str, color: bool) -> str:
@@ -142,11 +300,13 @@ class Violation:
         return (self.family, self.addr, self.port)
 
     def _addr_str(self) -> str:
+        """The destination as it is rendered — never with live control characters."""
         if self.addr is None:
             return "<unknown>"
+        addr = _printable(self.addr)
         if self.port is not None:
-            return f"{self.addr}:{self.port}"
-        return self.addr
+            return f"{addr}:{self.port}"
+        return addr
 
     def __str__(self) -> str:
         pids_str = ", ".join(str(p) for p in sorted(self.pids))
@@ -210,6 +370,103 @@ class MergedDestination:
         return Violation(family=self.family, addr=self.addr, port=self.port, count=self.count)
 
 
+def _report_addr(value: Any) -> str | None:
+    """Validate a saved report's ``addr`` field.
+
+    An integer here is worse than a wrong string: ``IPv4Address(12345)`` is
+    valid and silently means a different address, and AF_UNIX with an int
+    raises out of ``fnmatch`` at the point of matching.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"Report destination 'addr' must be a string or null, not {value!r}")
+
+
+def _report_port(value: Any) -> int | None:
+    """Validate a saved report's ``port`` field.
+
+    A string here does not raise — it quietly fails to match. ``'443' != 443``
+    is True, so a rule the allowlist explicitly declares does not fire, and
+    ``triage`` reports a destination that is in fact permitted. The range is
+    checked too: a number no socket can carry would otherwise become a
+    suggested rule the allowlist parser then rejects.
+    """
+    if value is None:
+        return None
+    # bool is a subclass of int, so `"port": true` would otherwise become 1.
+    if isinstance(value, bool):
+        raise ValueError(f"Report destination 'port' must be a port number, not {value!r}")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if not isinstance(value, int) or not 0 <= value <= 65535:
+        raise ValueError(f"Report destination 'port' must be a port number, not {value!r}")
+    return value
+
+
+def _report_family(value: Any) -> str:
+    """Validate a saved report's ``family`` field.
+
+    ``str()`` would turn any JSON value into a family name nothing matches,
+    which reads downstream as a destination no rule permits.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Report destination 'family' must be a string, not {value!r}")
+    return value
+
+
+def _report_count(value: Any) -> int:
+    """Validate a saved report's ``count`` field, which drives the ordering.
+
+    Whole and not negative: a fraction would be silently truncated into a
+    number the report never stated, and ``int(inf)`` raises ``OverflowError``
+    past every caller's ``except ValueError``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"Report destination 'count' must be a whole number, not {value!r}")
+    return value
+
+
+def _report_tests(value: Any) -> set[str]:
+    """Validate a saved report's ``tests`` field."""
+    if value is None:
+        return set()
+    if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+        raise ValueError(f"Report destination 'tests' must be a list of strings, not {value!r}")
+    return set(value)
+
+
+def _destination_from(entry: dict[str, Any]) -> Destination:
+    """Build one :class:`Destination` from a saved report's ``by_destination`` row.
+
+    Every field is typed on the way in. A report is untrusted JSON — the docs
+    recommend collecting them as CI artifacts from elsewhere — and downstream
+    they are turned back into events and matched against an allowlist, where a
+    value of the wrong type does not fail loudly but simply stops matching.
+
+    AF_UNIX paths are canonicalised here too. A report written before the
+    parser did so holds the literal ``sun_path``, and ``triage`` turns that
+    straight into a ``path_glob`` — which would never match, because the rule
+    canonicalises what it is given.
+    """
+    family = _report_family(entry.get("family", ""))
+    addr = _report_addr(entry.get("addr"))
+    if family == "AF_UNIX" and addr is not None:
+        addr = _canonical_path(addr)
+    return Destination(
+        family=family,
+        addr=addr,
+        port=_report_port(entry.get("port")),
+        count=_report_count(entry.get("count", 0)),
+        tests=_report_tests(entry.get("tests")),
+    )
+
+
 def load_report(path: Path) -> LoadedReport:
     """Read a saved JSON report, rejecting anything this version cannot parse.
 
@@ -218,37 +475,46 @@ def load_report(path: Path) -> LoadedReport:
     """
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError: a deeply nested document. Every way a file on disk
+        # can refuse to become an object is one error type, because that is
+        # what callers catch.
         raise ValueError(f"Could not read report {path.name}: {exc}") from None
     if not isinstance(data, dict):
         raise ValueError(f"Report {path.name} is not a JSON object")
 
     version = data.get("version")
-    if version != REPORT_VERSION:
+    # bool is a subclass of int, so `"version": true` would otherwise pass.
+    if isinstance(version, bool) or version != REPORT_VERSION:
         raise ValueError(
             f"Report {path.name} has unsupported schema version {version!r} "
             f"(this netaudit reads version {REPORT_VERSION})"
         )
 
-    summary = data.get("summary") or {}
-    raw = summary.get("by_destination") or [] if isinstance(summary, dict) else []
-    destinations = [
-        Destination(
-            family=str(d.get("family", "")),
-            addr=d.get("addr"),
-            port=d.get("port"),
-            count=int(d.get("count", 0)),
-            tests=set(d.get("tests") or []),
-        )
-        for d in raw
-        if isinstance(d, dict)
-    ]
-    run = data.get("run") or {}
-    return LoadedReport(
-        label=path.name,
-        run=run if isinstance(run, dict) else {},
-        destinations=destinations,
-    )
+    summary = data.get("summary")
+    if summary is None:
+        summary = {}
+    if not isinstance(summary, dict):
+        raise ValueError(f"Report {path.name}: 'summary' must be an object")
+    raw = summary.get("by_destination")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        # Iterating a string or a mapping would quietly yield nothing; a number
+        # would raise TypeError past the caller's ``except ValueError``.
+        raise ValueError(f"Report {path.name}: 'summary.by_destination' must be a list")
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Report {path.name}: each destination must be an object")
+    destinations = [_destination_from(d) for d in raw]
+    run = data.get("run")
+    if run is None:
+        run = {}
+    if not isinstance(run, dict):
+        # Replacing it with {} would present a report that says nothing about
+        # where it came from as one that simply did not record it.
+        raise ValueError(f"Report {path.name}: 'run' must be an object")
+    return LoadedReport(label=path.name, run=run, destinations=destinations)
 
 
 def merge_reports(reports: list[LoadedReport]) -> list[MergedDestination]:
@@ -350,9 +616,10 @@ class Reporter:
         def _addr_str(event: ConnectEvent) -> str:
             if event.addr is None:
                 return "-"
+            addr = _printable(event.addr)
             if event.port is not None:
-                return f"{event.addr}:{event.port}"
-            return event.addr
+                return f"{addr}:{event.port}"
+            return addr
 
         header = f"{'FAMILY':<{col_family}} {'ADDR:PORT':<{col_addr}} {'STATUS':<{col_status}} RULE"
         sep = f"{'-' * col_family} {'-' * col_addr} {'-' * col_status} {'-' * 24}"
@@ -363,7 +630,7 @@ class Reporter:
         for event in events:
             rule = allowlist.match(event)
             status = "OK" if rule is not None else "VIOLATION"
-            rule_name = rule.name if rule is not None else "-"
+            rule_name = _printable(rule.name) if rule is not None else "-"
             addr = _addr_str(event)
             # Pad first, then paint — ANSI codes must not count toward the width.
             status_cell = _paint(
@@ -406,7 +673,9 @@ class Reporter:
         # Loudest destination first; ties broken by address for stable output.
         for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
             if tests_by_key is not None:
-                third = ", ".join(sorted(tests_by_key.get(v.key, set()))) or "-"
+                third = (
+                    ", ".join(_printable(t) for t in sorted(tests_by_key.get(v.key, set()))) or "-"
+                )
             else:
                 third = ", ".join(str(pid) for pid in sorted(v.pids))
             addr = _paint(f"{v._addr_str():<{col_addr}}", _RED, color)
@@ -435,18 +704,14 @@ class Reporter:
         buf = io.StringIO()
         buf.write(_paint("# Suggested rules to allow these connections:", _BOLD, color) + "\n")
         for v in sorted(violations, key=lambda x: (-x.count, x._addr_str())):
+            rule: dict[str, Any] = {"name": f"allow {v._addr_str()}", "family": v.family}
             if v.family == "AF_UNIX":
-                buf.write(f'  - name: "allow {v.addr}"\n')
-                buf.write("    family: AF_UNIX\n")
-                buf.write(f"    path_glob: {v.addr}\n")
-                continue
-            # Quote IPv6 literals — bare colons are not valid YAML scalars here.
-            addr = f'"{v.addr}"' if v.family == "AF_INET6" else str(v.addr)
-            buf.write(f'  - name: "allow {v._addr_str()}"\n')
-            buf.write(f"    family: {v.family}\n")
-            buf.write(f"    addr: {addr}\n")
-            if v.port is not None:
-                buf.write(f"    port: {v.port}\n")
+                rule["path_glob"] = v.addr
+            else:
+                rule["addr"] = v.addr
+                if v.port is not None:
+                    rule["port"] = v.port
+            buf.write(_rule_yaml(rule))
 
         result = buf.getvalue()
         if stream is not None:
@@ -516,17 +781,18 @@ class Reporter:
             if d.tests:
                 evidence += " · tests: " + ", ".join(sorted(d.tests))
 
-            addr_str = f"{d.addr}:{d.port}" if d.port is not None else str(d.addr)
-            addr = f'"{d.addr}"' if d.family == "AF_INET6" else str(d.addr)
-            buf.write(f'  - name: "allow {addr_str}"\n')
-            buf.write(f"    # {evidence}\n")
-            buf.write(f"    family: {d.family}\n")
+            rule: dict[str, Any] = {
+                "name": f"allow {d.as_violation()._addr_str()}",
+                "family": d.family,
+            }
             if d.family == "AF_UNIX":
-                buf.write(f"    path_glob: {d.addr}\n")
-                continue
-            buf.write(f"    addr: {addr}\n")
-            if d.port is not None:
-                buf.write(f"    port: {d.port}\n")
+                rule["path_glob"] = d.addr
+            else:
+                rule["addr"] = d.addr
+                if d.port is not None:
+                    rule["port"] = d.port
+            buf.write("  " + _comment(evidence) + "\n")
+            buf.write(_rule_yaml(rule))
 
         result = buf.getvalue()
         if stream is not None:

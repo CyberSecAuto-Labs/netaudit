@@ -84,6 +84,29 @@ Fields:
 | `path_glob` | one of `path_glob`/`path_prefix` | Full glob pattern |
 | `path_prefix` | one of `path_glob`/`path_prefix` | Prefix; expands to `prefix*` |
 
+One of the two is required, and both must be strings: an `AF_UNIX` entry that names no path
+is rejected rather than read as "every socket".
+
+Socket paths are canonicalised before they are matched: `.` and `..` are collapsed the way
+the kernel collapses them, so `/run/gvmd/../../tmp/attacker.sock` is judged as
+`/tmp/attacker.sock` and a rule scoped to `/run/gvmd/` does not permit it. Write rules in
+canonical form — a `..` inside a pattern is matched literally and will never fire.
+
+Canonicalisation is lexical, so it does not follow symlinks: if `/run/gvmd/out` is a
+symlink to `/tmp`, a rule scoped to `/run/gvmd/` still permits `/run/gvmd/out/x.sock`,
+which the kernel resolves to `/tmp/x.sock`. A trace records the path a process asked for,
+not what the filesystem held at the time, so there is nothing to resolve it against.
+
+Abstract-namespace sockets (`@name`) are **not observed at all** in this release — the
+parser reads only `sun_path="..."`, which is the pathname form. A connection to one produces
+no event and therefore no violation, and no rule is needed for it. Where such a name does
+reach a rule — from a saved report, or from an event a library caller built — it is matched
+literally rather than as a path: its bytes are opaque, so a `/` or `..` inside one is part
+of the name.
+
+`path_prefix` is a string prefix, not a directory boundary: `path_prefix: /run/gvm` also
+permits `/run/gvmd-other/x.sock`. Include the trailing slash when you mean the directory.
+
 ### `AF_NETLINK` — Netlink
 
 Allow all AF_NETLINK connections (used by glibc resolver internals).

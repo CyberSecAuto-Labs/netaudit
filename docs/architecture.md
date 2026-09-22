@@ -65,6 +65,13 @@ Spawns a command wrapped in `strace -e trace=connect -f -tt -o <file>`. Supports
 
 Raises `StraceNotFoundError` if `strace` is not on PATH.
 
+`connect` is the whole of the traced syscall set, which bounds what any part of netaudit
+can report on. Egress that never issues one — `sendto()`/`sendmsg()` to an explicit
+destination on an unconnected UDP socket, the same pair with `MSG_FASTOPEN` opening a TCP
+connection, or a connection submitted through `io_uring` — produces no event, and
+therefore no violation. Widening the set is a parser change as much
+as a runner one: each syscall renders its destination in a different shape.
+
 ### `parser.py` — `StraceParser`, `ConnectEvent`
 
 Line-by-line regex parser. Handles:
@@ -142,7 +149,8 @@ Two Click commands:
 
 Both accept `--allowlist` (defaults to `netaudit.yaml` in cwd) and `--format {text,json}`.
 
-Exit codes: **0** clean, **83** violations, **84** strace missing, anything else the traced
+Exit codes: **0** clean, **83** violations, **84** strace missing, **87** tracing failed,
+anything else the traced
 command's own status passed through. `run` shares its exit space with the process it wraps,
 so violations take a reserved code and a failing command is never masked; `analyze` and
 `triage` wrap nothing and use **1** for findings.

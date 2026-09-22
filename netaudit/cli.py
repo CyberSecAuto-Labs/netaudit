@@ -40,6 +40,7 @@ _EXIT_TRACED_VIOLATIONS = 83
 _EXIT_STRACE_MISSING = 84
 _EXIT_BAD_ALLOWLIST = 85
 _EXIT_CANCELLED = 86
+_EXIT_TRACE_FAILED = 87
 
 
 def _cli_cancel_handler(signum: int, frame: FrameType | None = None) -> NoReturn:
@@ -67,19 +68,61 @@ def _handle_cancellation_as_interrupt() -> None:
             return
 
 
-def _load_allowlist(allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT) -> AllowList:
+def _echo_strace_error(stderr: bytes | None) -> None:
+    """Relay what strace said when it could not trace, and nothing when it said nothing."""
+    message = (stderr or b"").decode("utf-8", errors="replace").strip()
+    if message:
+        click.echo(message, err=True)
+
+
+def _echo_unreadable(unparsed: int) -> None:
+    """Say that the trace holds connect() calls netaudit could not read."""
+    noun = "line" if unparsed == 1 else "lines"
+    click.echo(
+        f"netaudit: {unparsed} connect() {noun} could not be parsed; the trace cannot be judged",
+        err=True,
+    )
+
+
+def _parse_trace(lines: list[str], unreadable_code: int) -> list[ConnectEvent]:
+    """Parse *lines* into events, or exit *unreadable_code* if any was unreadable.
+
+    A ``connect()`` netaudit cannot read is a destination it cannot judge. The
+    rest of the trace is still parsed, but reporting on it would present part
+    of a run as the whole of it — and an empty result as a clean one.
+    """
+    parser = StraceParser()
+    events = parser.parse_stream(lines)
+    if parser.unparsed:
+        _echo_unreadable(parser.unparsed)
+        sys.exit(unreadable_code)
+    return events
+
+
+def _load_allowlist(
+    allowlist: str | None, bad_input_code: int = _EXIT_BAD_INPUT
+) -> tuple[AllowList, str | None]:
     """Load the allowlist, or exit *bad_input_code* if it cannot be used.
+
+    Returns the rule set together with the path it actually came from, which is
+    not the same as the argument: with ``--allowlist`` omitted a repo-local
+    ``netaudit.yaml`` is picked up, and a report that recorded only the option
+    would name no allowlist at all. A run whose violations were suppressed by
+    an undeclared config would then be indistinguishable from a clean one.
 
     Callers pass the code appropriate to their exit-code space: `run` reserves
     one clear of the traced command's range, the others use plain bad input.
+
+    ``from_yaml`` reports every way a file can be unusable as ``ValueError`` —
+    a missing path included — so one clause covers them all.
     """
     try:
         if allowlist is not None:
-            return AllowList.from_yaml(Path(allowlist))
+            return AllowList.from_yaml(Path(allowlist)), allowlist
         default = Path(_DEFAULT_ALLOWLIST)
         if default.exists():
-            return AllowList.from_yaml(default)
-        return AllowList.empty()
+            return AllowList.from_yaml(default), str(default)
+        return AllowList.empty(), None
     except ValueError as exc:
         # Report it the way click reports a usage error, not as a traceback.
         click.echo(f"netaudit: {exc}", err=True)
@@ -241,7 +284,7 @@ def run_cmd(
         click.echo(f"netaudit: {exc}", err=True)
         sys.exit(_EXIT_STRACE_MISSING)
 
-    al = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
+    al, allowlist_used = _load_allowlist(allowlist, _EXIT_BAD_ALLOWLIST)
 
     # Recover the traces of earlier runs that were killed outright, then take a
     # name the same sweep will recognise if this run is the one that is killed.
@@ -249,6 +292,7 @@ def run_cmd(
     _tempfiles.sweep_stale()
     strace_out = _tempfiles.create(".strace")
 
+    keep_trace = False
     try:
         try:
             completed = runner.run(list(command), strace_out)
@@ -256,7 +300,30 @@ def run_cmd(
             click.echo("netaudit: cancelled; the traced command was stopped", err=True)
             sys.exit(_EXIT_CANCELLED)
         command_code = completed.returncode
-        events = StraceParser().parse_stream(strace_out.read_text().splitlines())
+        trace = strace_out.read_text()
+        if command_code != 0 and not trace:
+            # strace records the command's exit even when it makes no connect()
+            # call, so an empty trace means the command never ran under it: no
+            # ptrace permission, a seccomp filter, an unusable command. Parsing
+            # that into zero violations would report it as a clean run.
+            click.echo(f"netaudit: strace wrote no trace and exited {command_code}", err=True)
+            _echo_strace_error(completed.stderr)
+            sys.exit(_EXIT_TRACE_FAILED)
+        parser = StraceParser()
+        events = parser.parse_stream(trace.splitlines())
+        if parser.unparsed:
+            # Whether the audit happened at all is settled before the traced
+            # command's own status, so that status is said out loud rather than
+            # lost: the exit code this takes is netaudit's.
+            _echo_unreadable(parser.unparsed)
+            if command_code != 0:
+                click.echo(f"netaudit: the traced command exited {command_code}", err=True)
+            # The trace is the only evidence of what the run did. Naming it and
+            # then deleting it on the way out would leave nothing to act on.
+            keep_trace = True
+            _tempfiles.keep(strace_out)
+            click.echo(f"netaudit: the trace is kept at {strace_out}", err=True)
+            sys.exit(_EXIT_TRACE_FAILED)
         violations = Reporter.check(events, al)
         _emit(
             violations,
@@ -268,7 +335,7 @@ def run_cmd(
             suggest_rules=suggest_rules,
             run=build_run_metadata(
                 command=list(command),
-                allowlist=allowlist,
+                allowlist=allowlist_used,
                 command_exit_code=command_code,
             ),
             output=output,
@@ -285,7 +352,8 @@ def run_cmd(
             sys.exit(command_code)
         sys.exit(_EXIT_TRACED_VIOLATIONS if violations else _EXIT_CLEAN)
     finally:
-        strace_out.unlink(missing_ok=True)
+        if not keep_trace:
+            strace_out.unlink(missing_ok=True)
 
 
 @main.command("analyze")
@@ -335,8 +403,8 @@ def analyze_cmd(
     strace_log: str,
 ) -> None:
     """Analyze an existing strace log file for network violations."""
-    al = _load_allowlist(allowlist)
-    events = StraceParser().parse_stream(Path(strace_log).read_text().splitlines())
+    al, allowlist_used = _load_allowlist(allowlist)
+    events = _parse_trace(Path(strace_log).read_text().splitlines(), _EXIT_BAD_INPUT)
     violations = Reporter.check(events, al)
     _emit(
         violations,
@@ -346,7 +414,7 @@ def analyze_cmd(
         allowlist=al,
         color=_resolve_color(no_color),
         suggest_rules=suggest_rules,
-        run=build_run_metadata(source=strace_log, allowlist=allowlist),
+        run=build_run_metadata(source=strace_log, allowlist=allowlist_used),
         output=output,
     )
     sys.exit(_EXIT_VIOLATIONS if violations else _EXIT_CLEAN)
@@ -413,7 +481,7 @@ def triage_cmd(
     merged = merge_reports(loaded)
 
     if allowlist is not None:
-        al = _load_allowlist(allowlist)
+        al, _ = _load_allowlist(allowlist)
         merged = [d for d in merged if not al.is_allowed(_as_event(d))]
 
     if not merged:

@@ -80,6 +80,38 @@ class TestUnixSocketRule:
         rule = UnixSocketRule("*")
         assert not rule.matches(_event("AF_INET", "1.2.3.4"))
 
+    def test_traversal_out_of_the_prefix_is_not_permitted(self) -> None:
+        """The kernel resolves `..` before the socket is reached; so must the rule."""
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert not rule.matches(_event("AF_UNIX", "/run/gvmd/../../tmp/attacker.sock"))
+
+    def test_traversal_that_stays_inside_the_prefix_still_matches(self) -> None:
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert rule.matches(_event("AF_UNIX", "/run/gvmd/sub/../gvmd.sock"))
+
+    def test_an_abstract_name_is_matched_literally(self) -> None:
+        """Its bytes are opaque: `/` and `..` inside one are not path syntax."""
+        rule = UnixSocketRule("\\0run/gvmd/../x")
+        assert rule.matches(_event("AF_UNIX", "\\0run/gvmd/../x"))
+
+    def test_a_pathname_socket_starting_with_at_cannot_escape_its_rule(self) -> None:
+        """A leading `@` in a *pathname* socket is part of the name, not a marker."""
+        rule = UnixSocketRule("@trusted/*")
+        assert not rule.matches(_event("AF_UNIX", "@trusted/../../outside.sock"))
+
+    def test_an_address_with_nothing_identifying_left_matches_nothing(self) -> None:
+        """`fnmatch("", "*")` is true, so the empty case has to be refused outright."""
+        assert not UnixSocketRule("*").matches(_event("AF_UNIX", "\x01\x02"))
+
+    def test_a_doubled_leading_slash_still_matches_the_prefix(self) -> None:
+        rule = UnixSocketRule("/run/gvmd/*")
+        assert rule.matches(_event("AF_UNIX", "//run/gvmd/gvmd.sock"))
+
+    def test_redundant_segments_do_not_defeat_an_exact_rule(self) -> None:
+        rule = UnixSocketRule("/run/foo.sock")
+        assert rule.matches(_event("AF_UNIX", "/run/./foo.sock"))
+        assert rule.matches(_event("AF_UNIX", "/run//foo.sock"))
+
 
 class TestNetlinkRule:
     def test_matches_netlink(self) -> None:
@@ -453,3 +485,79 @@ class TestMalformedAddress:
 
     def test_ipv6_rule_rejects_an_ipv4_literal(self) -> None:
         assert not IPv6Rule("::/0").matches(_event("AF_INET6", "10.1.2.3"))
+
+
+class TestFromYamlReportsOneErrorType:
+    """Callers stop on an allowlist they cannot load; one error type is what lets them."""
+
+    def _load(self, tmp_path: Path, body: str) -> AllowList:
+        path = tmp_path / "netaudit.yaml"
+        path.write_text(body)
+        return AllowList.from_yaml(path)
+
+    def test_a_missing_file_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(tmp_path / "gone.yaml")
+
+    def test_malformed_yaml_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            self._load(tmp_path, "allowlist: [[[\n")
+
+    def test_a_top_level_list_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not a mapping"):
+            self._load(tmp_path, "- version: 1\n")
+
+    def test_a_non_list_allowlist_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="must be a list"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  name: oops\n")
+
+    def test_a_non_mapping_entry_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="must be a mapping"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - just-a-string\n")
+
+    def test_an_entry_without_addr_or_cidr_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'addr' or 'cidr'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_INET\n")
+
+    def test_an_ipv6_entry_without_addr_or_cidr_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="needs 'addr' or 'cidr'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_INET6\n")
+
+    def test_a_non_boolean_includes_builtins_is_rejected(self, tmp_path: Path) -> None:
+        """A truthy string would re-enable the permissive end of the policy."""
+        with pytest.raises(ValueError, match="must be true or false"):
+            self._load(tmp_path, 'version: 1\nincludes_builtins: "false"\nallowlist: []\n')
+
+    def test_an_empty_allowlist_key_still_loads(self, tmp_path: Path) -> None:
+        assert isinstance(self._load(tmp_path, "version: 1\nallowlist:\n"), AllowList)
+
+    def test_a_falsy_allowlist_value_is_rejected(self, tmp_path: Path) -> None:
+        """Reading `allowlist: {}` as "no entries" would leave the built-ins standing."""
+        with pytest.raises(ValueError, match="must be a list"):
+            self._load(tmp_path, "version: 1\nallowlist: {}\n")
+
+    def test_a_non_string_path_prefix_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'path_prefix' must be a string"):
+            self._load(
+                tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n    path_prefix: 1\n"
+            )
+
+    def test_a_non_string_path_glob_is_rejected(self, tmp_path: Path) -> None:
+        """It would otherwise build a rule that only failed later, inside fnmatch."""
+        with pytest.raises(ValueError, match="'path_glob' must be a string"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n    path_glob: 1\n")
+
+    def test_a_unix_entry_naming_no_path_is_rejected(self, tmp_path: Path) -> None:
+        """It used to expand to "*", which permits every Unix socket there is."""
+        with pytest.raises(ValueError, match="needs 'path_glob' or 'path_prefix'"):
+            self._load(tmp_path, "version: 1\nallowlist:\n  - family: AF_UNIX\n")
+
+    def test_a_non_utf8_file_is_a_value_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "netaudit.yaml"
+        path.write_bytes(b"version: 1\nallowlist: []\n\xff\xfe")
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(path)
+
+    def test_a_directory_is_a_value_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="Could not read allowlist"):
+            AllowList.from_yaml(tmp_path)

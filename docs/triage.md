@@ -149,3 +149,24 @@ parsed optimistically — misreading evidence is worse than failing.
 ```bash
 netaudit triage --format json reports/*.json
 ```
+
+## What a report carries
+
+A saved report records the traced command's argument vector and the hostname that produced
+it, so a reviewer can tell where the evidence came from. Values of options whose names look
+like secrets — `--token`, `--password`, `--api-key`, `--dsn` and similar — are masked as
+`***`, as are passwords embedded in `scheme://user:password@host` arguments.
+
+That is a filter over the shapes secrets usually take, not a guarantee: a secret passed as
+a bare positional argument, or under a name netaudit does not recognise, still reaches the
+report. It is conservative in the other direction too — for names that are often boolean
+switches (`--auth`, `--key`, `--cookie`) only the `--name=value` form is masked, because
+masking the argument *after* a flag would silently rewrite the record of what ran. For the
+same reason a value that itself begins with `-` is left in: nothing short of knowing the
+command's own grammar tells it apart from another flag.
+
+Reports are meant to be published as CI artifacts — treat them as such before uploading one
+from a job that handles credentials.
+
+Destinations are type-checked when a report is read, so a `port` or `addr` of the wrong
+type is refused outright rather than quietly failing to match the allowlist.

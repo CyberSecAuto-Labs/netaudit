@@ -37,9 +37,10 @@ Resolution order for `enabled`:
 | 2 | `enabled = true` in `[tool.netaudit]` in `pyproject.toml` |
 | 3 | Default: off |
 
-The `pyproject.toml` is read from the current working directory. Because activation
-re-executes the test process under strace, it is resolved before collection starts —
-so `enabled` must live in `pyproject.toml`, not in a conftest or an ini option.
+The `pyproject.toml` is read from pytest's rootdir, so running pytest from a
+subdirectory audits the same way. Because activation re-executes the test process under
+strace, it is resolved before collection starts — so `enabled` must live in
+`pyproject.toml`, not in a conftest or an ini option.
 
 ## Allowlist resolution
 
@@ -49,8 +50,49 @@ The plugin resolves the allowlist in this priority order:
 |---|---|
 | 1 | `--netaudit-allowlist <file>` CLI flag |
 | 2 | `allowlist = "..."` in `[tool.netaudit]` in `pyproject.toml` |
-| 3 | `netaudit.yaml` in the current working directory |
+| 3 | `netaudit.yaml` in pytest's rootdir |
 | 4 | Built-in defaults only (loopback, Unix sockets, Netlink) |
+
+Every one of these is resolved when the session starts, before the first test runs: a test
+that changes the working directory cannot move the allowlist the run is judged against, nor
+the destination of `--netaudit-report`.
+
+An allowlist that is *named* but cannot be loaded — missing, malformed, or written to a
+schema version this release does not read — ends the session with a usage error. It does
+not fall back to level 4: the built-in defaults permit every Unix socket path, all of
+`127.0.0.0/8`, `::1` and all of AF_NETLINK, so a policy with `includes_builtins: false`
+would be replaced by a broader one the moment its file moved. Level 4 applies only when no
+allowlist was named at all.
+
+## Trace integrity
+
+The audited session plants a `connect()` of its own before collection and expects to find it
+in the trace afterwards. If it is missing — strace has no ptrace permission, a seccomp
+profile blocked it, the trace did not survive the run — the session fails rather than
+reporting the run as clean. "Nothing connected" and "nothing was watching" are not the same
+result.
+
+A session whose trace holds a `connect()` netaudit cannot parse fails the same way: the
+destination is unknown, so the part of the trace that did parse cannot stand for the whole
+run.
+
+This is a check against breakage, not a sandbox: it catches a trace that never happened, was
+emptied, or vanished, not one that was rewritten around the marker. The tests share the
+interpreter that runs the audit, so code that sets out to defeat the check can reach its
+internals. Where the code under audit is not trusted, run it as a separate process under
+`netaudit run -- pytest`.
+
+## When the report cannot be written
+
+`--netaudit-report` is written **after** the violations are printed and the session is
+failed, so a destination that cannot be written — a read-only filesystem, a full disk, a
+path component that is an existing file — costs the artifact and nothing else. The failure
+is reported and fails the session in its own right; the violations above it stand.
+
+If the audit ends without a verdict — the trace holds a `connect()` netaudit cannot read,
+the canary is missing, or something raised — the trace is kept instead of removed and its
+path is printed, so `netaudit analyze` can be pointed at it. An empty trace holds nothing
+to act on and is removed.
 
 ## CLI options
 

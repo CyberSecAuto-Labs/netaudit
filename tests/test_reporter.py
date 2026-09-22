@@ -4,10 +4,12 @@ import io
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
-from netaudit.allowlist import AllowList
+from netaudit.allowlist import AllowList, IPv4Rule
 from netaudit.parser import ConnectEvent
 from netaudit.reporter import (
     Destination,
@@ -21,6 +23,17 @@ from netaudit.reporter import (
     merge_reports,
     supports_color,
 )
+
+
+def _rules_from(body: str) -> list[dict[str, Any]]:
+    """Parse the rule list out of suggestion output, as a user pasting it would.
+
+    The evidence lives in comments, so this is exactly what an allowlist file
+    holds once those lines are copied under its ``allowlist:`` key.
+    """
+    parsed = yaml.safe_load("version: 1\nallowlist:\n" + body)
+    rules: list[dict[str, Any]] = parsed["allowlist"] or []
+    return rules
 
 
 def _event(
@@ -430,11 +443,18 @@ class TestFormatSuggestions:
         assert "addr: 198.51.100.1" in out
         assert "port: 443" in out
 
-    def test_ipv6_suggestion_quotes_the_address(self) -> None:
+    def test_ipv6_suggestion_round_trips_into_a_working_rule(self) -> None:
+        """What matters is that the rule parses back and matches, not how it is quoted."""
         out = Reporter.format_suggestions(self._violations(_event("AF_INET6", "2001:db8::1", 8080)))
         assert "family: AF_INET6" in out
-        assert 'addr: "2001:db8::1"' in out
-        assert "port: 8080" in out
+        assert _rules_from(out) == [
+            {
+                "name": "allow 2001:db8::1:8080",
+                "family": "AF_INET6",
+                "addr": "2001:db8::1",
+                "port": 8080,
+            }
+        ]
 
     def test_unix_socket_suggestion_uses_path_glob(self) -> None:
         # Built-ins allow every AF_UNIX socket, so this path is only reachable
@@ -594,6 +614,30 @@ class TestLoadReport:
         assert len(rpt.destinations) == 1
         assert rpt.destinations[0].addr == "1.2.3.4"
         assert rpt.destinations[0].count == 3
+
+    def test_a_unix_path_is_canonicalised_on_the_way_in(self, tmp_path: Path) -> None:
+        """A report written before the parser canonicalised holds the raw sun_path.
+
+        `triage` turns it straight into a `path_glob`, and the rule that glob
+        becomes canonicalises what it matches — so an uncanonical one never fires.
+        """
+        rpt = load_report(
+            self._write(
+                tmp_path / "r.json",
+                summary={
+                    "total": 1,
+                    "by_destination": [
+                        {
+                            "family": "AF_UNIX",
+                            "addr": "/run/gvmd/../x.sock",
+                            "port": None,
+                            "count": 1,
+                        }
+                    ],
+                },
+            )
+        )
+        assert rpt.destinations[0].addr == "/run/x.sock"
 
     def test_label_is_the_file_name(self, tmp_path: Path) -> None:
         assert load_report(self._write(tmp_path / "ci-42.json")).label == "ci-42.json"
@@ -1039,3 +1083,320 @@ class TestFormatSuggestionsWithEvidenceMultiple:
         )
         assert "path_glob: /run/foo.sock" in out
         assert "addr: 1.2.3.4" in out
+
+
+class TestSuggestionsSurviveHostileInput:
+    """The values come out of saved reports, which the docs say to collect from CI."""
+
+    _INJECTION = "1.2.3.4\n  - name: everything\n    family: AF_INET\n    cidr: 0.0.0.0/0"
+
+    def test_a_newline_in_an_address_injects_no_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_INET", addr=self._INJECTION, port=80, count=1)]
+        )
+        rules = _rules_from(out)
+        assert len(rules) == 1
+        assert rules[0]["family"] == "AF_INET"
+        assert "0.0.0.0/0" not in str(rules[0].get("cidr", ""))
+
+    def test_a_newline_in_a_unix_path_injects_no_rule(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_UNIX", addr="/run/x\n  - family: AF_NETLINK", port=None, count=1)]
+        )
+        assert len(_rules_from(out)) == 1
+
+    def test_a_newline_in_triage_evidence_injects_no_rule(self) -> None:
+        """The evidence is a comment; a newline would end it and open YAML."""
+        dest = MergedDestination(
+            family="AF_INET",
+            addr="1.2.3.4",
+            port=80,
+            count=1,
+            reports=["r.json"],
+            total_reports=1,
+            tests={"t.py::a\n  - name: everything\n    family: AF_NETLINK"},
+        )
+        out = Reporter.format_suggestions_with_evidence([dest])
+        rules = _rules_from("\n".join(line for line in out.splitlines() if line.startswith("  ")))
+        assert len(rules) == 1
+        assert rules[0]["family"] == "AF_INET"
+
+    def test_a_newline_in_a_triage_address_injects_no_rule(self) -> None:
+        dest = MergedDestination(
+            family="AF_INET",
+            addr=self._INJECTION,
+            port=80,
+            count=1,
+            reports=["r.json"],
+            total_reports=1,
+        )
+        out = Reporter.format_suggestions_with_evidence([dest])
+        rules = _rules_from("\n".join(line for line in out.splitlines() if line.startswith("  ")))
+        assert len(rules) == 1
+
+
+class TestControlCharactersAreShownNotActed:
+    """An address that erases the line it is printed on can hide a violation."""
+
+    _ERASER = "8.8.8.8\x1b[2K\rnetaudit: no violations"
+
+    def test_the_violation_block_escapes_them(self) -> None:
+        out = Reporter.format([Violation(family="AF_INET", addr=self._ERASER, port=53, count=1)])
+        assert "\x1b" not in out
+        assert "\\x1b" in out
+
+    def test_the_verbose_table_escapes_them(self) -> None:
+        out = Reporter.format_verbose([_event("AF_INET", self._ERASER, 53)], AllowList.empty())
+        assert "\x1b" not in out
+
+    def test_the_summary_escapes_a_test_nodeid(self) -> None:
+        v = Violation(family="AF_INET", addr="1.2.3.4", port=80, count=1)
+        out = Reporter.format_summary([v], tests_by_key={v.key: {"t.py::a\x1b[2K\r"}})
+        assert "\x1b" not in out
+
+    def test_a_rule_name_is_escaped_in_the_verbose_table(self) -> None:
+        allowlist = AllowList([IPv4Rule("1.2.3.4/32", name="ok\x1b[2K\r")], includes_builtins=False)
+        out = Reporter.format_verbose([_event("AF_INET", "1.2.3.4", 80)], allowlist)
+        assert "\x1b" not in out
+
+    def test_suggestions_escape_them(self) -> None:
+        out = Reporter.format_suggestions(
+            [Violation(family="AF_INET", addr=self._ERASER, port=53, count=1)]
+        )
+        assert "\x1b" not in out
+
+
+class TestSavedReportFieldsAreTyped:
+    """A report is untrusted JSON, and a wrong type does not fail — it stops matching."""
+
+    def _load(self, tmp_path: Path, **destination: object) -> LoadedReport:
+        path = tmp_path / "r.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "summary": {"total": 1, "by_destination": [destination]},
+                },
+                allow_nan=True,
+            )
+        )
+        return load_report(path)
+
+    def test_a_string_port_is_rejected(self, tmp_path: Path) -> None:
+        """`'443' != 443`, so an allowlist rule that permits it would not fire."""
+        with pytest.raises(ValueError, match="'port' must be a port number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port="443", count=1)
+
+    def test_a_boolean_port_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'port' must be a port number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=True, count=1)
+
+    def test_a_whole_float_port_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=443.0, count=1)
+        assert report.destinations[0].port == 443
+
+    def test_a_fractional_port_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'port' must be a port number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80.5, count=1)
+
+    @pytest.mark.parametrize("port", [-1, 65536])
+    def test_a_port_no_socket_could_carry_is_rejected(self, tmp_path: Path, port: int) -> None:
+        with pytest.raises(ValueError, match="'port' must be a port number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=port, count=1)
+
+    def test_an_integer_address_is_rejected(self, tmp_path: Path) -> None:
+        """`IPv4Address(12345)` is valid and means a different address entirely."""
+        with pytest.raises(ValueError, match="'addr' must be a string"):
+            self._load(tmp_path, family="AF_INET", addr=12345, port=80, count=1)
+
+    def test_a_null_address_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_NETLINK", addr=None, port=None, count=1)
+        assert report.destinations[0].addr is None
+
+    def test_a_non_numeric_count_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count="many")
+
+    def test_a_family_that_is_not_a_string_is_rejected(self, tmp_path: Path) -> None:
+        """str() would turn it into a family name nothing matches."""
+        with pytest.raises(ValueError, match="'family' must be a string"):
+            self._load(tmp_path, family=["AF_INET"], addr="1.2.3.4", port=80, count=1)
+
+    @pytest.mark.parametrize("count", [1.9, -1, float("inf"), float("nan")])
+    def test_a_count_that_is_not_a_whole_number_is_rejected(
+        self, tmp_path: Path, count: float
+    ) -> None:
+        """int(inf) raises OverflowError, past every caller's except ValueError."""
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=count)
+
+    def test_a_boolean_count_is_rejected(self, tmp_path: Path) -> None:
+        """bool is a subclass of int, so `true` would otherwise become 1."""
+        with pytest.raises(ValueError, match="'count' must be a whole number"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=True)
+
+    def test_a_whole_float_count_is_accepted(self, tmp_path: Path) -> None:
+        report = self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=3.0)
+        assert report.destinations[0].count == 3
+
+    def test_a_destination_list_that_is_not_a_list_is_rejected(self, tmp_path: Path) -> None:
+        """Iterating a number raises TypeError, past the caller's except ValueError."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"by_destination": 1}}))
+        with pytest.raises(ValueError, match="'summary.by_destination' must be a list"):
+            load_report(path)
+
+    def test_a_destination_that_is_not_an_object_is_rejected(self, tmp_path: Path) -> None:
+        """Skipping it silently would drop evidence the report claims to carry."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"by_destination": ["nope"]}}))
+        with pytest.raises(ValueError, match="each destination must be an object"):
+            load_report(path)
+
+    def test_an_absent_destination_list_is_an_empty_one(self, tmp_path: Path) -> None:
+        """A report that observed nothing is still a report."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {"total": 0}}))
+        assert load_report(path).destinations == []
+
+    def test_a_boolean_version_is_rejected(self, tmp_path: Path) -> None:
+        """bool is a subclass of int, so `true == 1` would pass the version check."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": True, "summary": {}}))
+        with pytest.raises(ValueError, match="unsupported schema version"):
+            load_report(path)
+
+    @pytest.mark.parametrize("run", [[], "", 0, False, 1])
+    def test_a_run_block_that_is_not_an_object_is_rejected(
+        self, tmp_path: Path, run: object
+    ) -> None:
+        """Replacing it with {} would read as a report that did not record it."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {}, "run": run}))
+        with pytest.raises(ValueError, match="'run' must be an object"):
+            load_report(path)
+
+    def test_an_absent_run_block_is_an_empty_one(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": {}}))
+        assert load_report(path).run == {}
+
+    def test_an_absent_summary_is_an_empty_one(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1}))
+        assert load_report(path).destinations == []
+
+    @pytest.mark.parametrize("summary", [[], "", 0, False])
+    def test_a_falsy_summary_that_is_not_an_object_is_still_rejected(
+        self, tmp_path: Path, summary: object
+    ) -> None:
+        """`or {}` would have read all of these as "no summary"."""
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": summary}))
+        with pytest.raises(ValueError, match="'summary' must be an object"):
+            load_report(path)
+
+    def test_a_summary_that_is_not_an_object_is_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "r.json"
+        path.write_text(json.dumps({"version": 1, "summary": [1, 2]}))
+        with pytest.raises(ValueError, match="'summary' must be an object"):
+            load_report(path)
+
+    def test_a_tests_field_that_is_not_strings_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'tests' must be a list of strings"):
+            self._load(tmp_path, family="AF_INET", addr="1.2.3.4", port=80, count=1, tests=[1])
+
+
+class TestSecretsAreMaskedInTheRecordedCommand:
+    """Reports are meant to be published as CI artifacts; argv often is not."""
+
+    def _command(self, *args: str) -> list[str]:
+        meta = build_run_metadata(command=list(args))
+        recorded: list[str] = meta["command"]
+        return recorded
+
+    def test_an_attached_value_is_masked(self) -> None:
+        assert self._command("curl", "--token=s3cr3t") == ["curl", "--token=***"]
+
+    def test_a_separate_value_is_masked(self) -> None:
+        assert self._command("curl", "--token", "s3cr3t") == ["curl", "--token", "***"]
+
+    def test_the_option_name_itself_survives(self) -> None:
+        """What the run did is still legible; only the value goes."""
+        assert "--password" in " ".join(self._command("app", "--password", "hunter2"))
+
+    def test_credentials_in_a_url_are_masked(self) -> None:
+        assert self._command("psql", "postgres://alice:hunter2@db:5432/x") == [
+            "psql",
+            "postgres://alice:***@db:5432/x",
+        ]
+
+    def test_an_ordinary_argument_is_untouched(self) -> None:
+        assert self._command("pytest", "-q", "tests/unit") == ["pytest", "-q", "tests/unit"]
+
+    def test_an_option_following_a_secret_option_is_not_eaten(self) -> None:
+        """`--token --verbose` would otherwise mask a flag and lose it from the record."""
+        assert self._command("app", "--token", "--verbose", "x") == [
+            "app",
+            "--token",
+            "--verbose",
+            "x",
+        ]
+
+    @pytest.mark.parametrize("option", ["--tokenize", "--authors", "--keyword", "-p"])
+    def test_an_option_that_only_looks_secret_is_left_alone(self, option: str) -> None:
+        """The name is matched by whole segments, not as a substring."""
+        assert self._command("app", option, "value") == ["app", option, "value"]
+
+    @pytest.mark.parametrize(
+        "option",
+        ["--token", "--api-key", "--apikey", "--db_password", "--authorization", "--dsn"],
+    )
+    def test_a_separate_value_is_masked_for_names_that_always_take_one(self, option: str) -> None:
+        assert self._command("app", option, "s3cr3t") == ["app", option, "***"]
+
+    @pytest.mark.parametrize("option", ["--auth", "--key", "--cookie"])
+    def test_a_separate_value_is_left_for_names_that_are_often_switches(self, option: str) -> None:
+        """Masking the next argument after a boolean flag would rewrite the record."""
+        assert self._command("app", option, "report.txt") == ["app", option, "report.txt"]
+
+    @pytest.mark.parametrize("option", ["--auth", "--key", "--cookie"])
+    def test_an_attached_value_is_masked_even_for_those(self, option: str) -> None:
+        """The `=` proves the option takes a value."""
+        assert self._command("app", f"{option}=s3cr3t") == ["app", f"{option}=***"]
+
+    def test_a_positional_secret_is_not_caught(self) -> None:
+        """Documented limit: this filters shapes, it does not understand the command."""
+        assert self._command("app", "hunter2") == ["app", "hunter2"]
+
+    def test_the_hostname_is_still_recorded(self) -> None:
+        """It ties a report to the machine that made it, and is not a credential."""
+        assert build_run_metadata(command=["pytest"])["hostname"]
+
+
+class TestRedactionEdges:
+    def _command(self, *args: str) -> list[str]:
+        recorded: list[str] = build_run_metadata(command=list(args))["command"]
+        return recorded
+
+    def test_a_secret_that_begins_with_a_dash_is_left_in(self) -> None:
+        """A documented trade-off: masking it would mean masking every flag too."""
+        assert self._command("app", "--token", "-s3cr3t") == ["app", "--token", "-s3cr3t"]
+
+    def test_a_private_key_option_is_masked_either_way_it_is_written(self) -> None:
+        assert self._command("app", "--private-key", "k") == ["app", "--private-key", "***"]
+
+    def test_a_name_that_only_joins_into_a_secret_word_is_left_alone(self) -> None:
+        """`--to-ken` is not `--token`; joining is only for the compound names."""
+        assert self._command("app", "--to-ken", "report.txt") == ["app", "--to-ken", "report.txt"]
+
+    @pytest.mark.parametrize("option", ["--api-key", "--apikey", "--access-token"])
+    def test_a_compound_name_is_masked_either_way_it_is_written(self, option: str) -> None:
+        assert self._command("app", option, "s3cr3t") == ["app", option, "***"]
+
+
+def test_the_secret_name_sets_are_disjoint() -> None:
+    """The joined names exist because their parts are not enough on their own."""
+    from netaudit.reporter import _JOINED_SECRET_NAMES, _SECRET_WORDS
+
+    assert not (_JOINED_SECRET_NAMES & _SECRET_WORDS)

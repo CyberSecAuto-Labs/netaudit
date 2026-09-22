@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import yaml
 
-from netaudit.parser import ConnectEvent
+from netaudit.parser import ConnectEvent, _canonical_path
 
 __all__ = [
     "AllowList",
@@ -100,10 +100,23 @@ class UnixSocketRule:
         self.name = name
 
     def matches(self, event: ConnectEvent) -> bool:
-        """Whether *event* is an AF_UNIX connection whose path matches the glob."""
+        """Whether *event* is an AF_UNIX connection whose path matches the glob.
+
+        The address is canonicalised first. ``fnmatch``'s ``*`` matches ``/``,
+        so without it a rule scoped to ``/run/gvmd/`` would also permit
+        ``/run/gvmd/../../tmp/attacker.sock`` — a path the audited process
+        chooses. The parser canonicalises too; this repeats it because the rule
+        is the boundary, and events also reach it from saved reports and from
+        library callers who built them by hand.
+        """
         if event.family != "AF_UNIX" or event.addr is None:
             return False
-        return fnmatch.fnmatch(event.addr, self._glob)
+        addr = _canonical_path(event.addr)
+        if not addr:
+            # Nothing identifying survived the strip: there is no path to permit,
+            # and ``fnmatch("", "*")`` would otherwise say every rule covers it.
+            return False
+        return fnmatch.fnmatch(addr, self._glob)
 
 
 class NetlinkRule:
@@ -160,19 +173,50 @@ def _parse_port(value: Any) -> int | None:
     return port
 
 
+def _cidr_from(entry: dict[str, Any], host_bits: str) -> str:
+    """The CIDR an entry declares, from ``cidr`` or a bare ``addr``.
+
+    An entry with neither is a rule the file meant to write and did not: it is
+    reported rather than allowed to raise ``KeyError`` at whatever caught it.
+    """
+    cidr = entry.get("cidr")
+    if cidr:
+        return str(cidr)
+    addr = entry.get("addr")
+    if addr is None:
+        raise ValueError(f"Allowlist entry needs 'addr' or 'cidr': {entry!r}")
+    return f"{addr}{host_bits}"
+
+
+def _glob_from(entry: dict[str, Any]) -> str:
+    """The pattern an AF_UNIX entry declares, from ``path_glob`` or ``path_prefix``.
+
+    Both are type-checked here: a non-string ``path_prefix`` would otherwise
+    raise ``TypeError`` out of the concatenation, and a non-string
+    ``path_glob`` would build a rule that only failed later, inside
+    ``fnmatch``, on an event that happened to reach it.
+    """
+    for key, suffix in (("path_glob", ""), ("path_prefix", "*")):
+        value = entry.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"Allowlist entry '{key}' must be a string, not {value!r}")
+        return value + suffix
+    # Neither given: an AF_UNIX entry that names no path at all permits none.
+    raise ValueError(f"Allowlist entry needs 'path_glob' or 'path_prefix': {entry!r}")
+
+
 def _rule_from_dict(entry: dict[str, Any]) -> Rule:
     name = entry.get("name", "")
     family = entry.get("family", "")
     port = _parse_port(entry.get("port"))
     if family == "AF_INET":
-        cidr = entry.get("cidr") or f"{entry['addr']}/32"
-        return IPv4Rule(cidr, name=name, port=port)
+        return IPv4Rule(_cidr_from(entry, "/32"), name=name, port=port)
     if family == "AF_INET6":
-        cidr = entry.get("cidr") or f"{entry['addr']}/128"
-        return IPv6Rule(cidr, name=name, port=port)
+        return IPv6Rule(_cidr_from(entry, "/128"), name=name, port=port)
     if family == "AF_UNIX":
-        glob = entry.get("path_glob") or entry.get("path_prefix", "") + "*"
-        return UnixSocketRule(glob, name=name)
+        return UnixSocketRule(_glob_from(entry), name=name)
     if family == "AF_NETLINK":
         return NetlinkRule(name=name)
     raise ValueError(f"Unknown family in allowlist entry: {family!r}")
@@ -193,16 +237,51 @@ class AllowList:
 
     @classmethod
     def from_yaml(cls, path: Path) -> "AllowList":
-        """Load an allowlist from a YAML file at *path*."""
-        raw = yaml.safe_load(path.read_text()) or {}
+        """Load an allowlist from a YAML file at *path*.
+
+        Every way this can fail — the file missing or unreadable, the YAML
+        malformed, a version this release does not know, an entry it cannot
+        make a rule of — is raised as :class:`ValueError`. Callers treat an
+        allowlist they cannot load as a hard stop, and one error type is what
+        lets them do that without enumerating the ways a file can be wrong.
+        """
+        try:
+            raw = yaml.safe_load(path.read_text()) or {}
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+            # RecursionError: a deeply nested document. Read together with the
+            # rest, these are every way a file on disk can refuse to become a
+            # mapping — which is the promise this method's docstring makes.
+            raise ValueError(f"Could not read allowlist {path}: {exc}") from None
+        if not isinstance(raw, dict):
+            raise ValueError(f"Allowlist {path} is not a mapping")
+
         version = raw.get("version")
         if isinstance(version, bool) or version != _SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported allowlist version: {version!r} (expected {_SCHEMA_VERSION})"
+                f"Allowlist {path}: unsupported version {version!r} (expected {_SCHEMA_VERSION})"
             )
+
         includes_builtins = raw.get("includes_builtins", True)
+        # A truthy string would otherwise re-enable the built-ins, which are the
+        # permissive end of the policy — the opposite of what the file asked for.
+        if not isinstance(includes_builtins, bool):
+            raise ValueError(
+                f"Allowlist {path}: 'includes_builtins' must be true or false, "
+                f"not {includes_builtins!r}"
+            )
+
+        # Only an absent key means "no entries": a falsy one — {}, "", false —
+        # is a malformed file, and reading it as an empty rule list would leave
+        # the built-ins standing in for whatever the file meant to say.
+        entries = raw.get("allowlist")
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise ValueError(f"Allowlist {path}: 'allowlist' must be a list, not {entries!r}")
         rules: list[Rule] = []
-        for entry in raw.get("allowlist", []):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"Allowlist {path}: entry must be a mapping, not {entry!r}")
             rules.append(_rule_from_dict(entry))
         return cls(rules, includes_builtins=includes_builtins)
 

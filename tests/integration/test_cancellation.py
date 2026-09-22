@@ -255,7 +255,10 @@ class TestSigkillIsRecoveredByTheNextRun:
         assert leaked, "premise broken: SIGKILL is supposed to leak the temp files"
         stale = time.time() - 48 * 3600
         for path in leaked:
-            os.utime(path, (stale, stale))
+            # The run directory and the trace inside it: the sweep takes the
+            # newest of the two, so ageing only the directory proves nothing.
+            for target in (path, *path.rglob("*")):
+                os.utime(target, (stale, stale))
 
         second = _launch(_write_project(tmp_path / "project2", _FAST_TEST), temp_dir)
         try:
