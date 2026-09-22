@@ -127,9 +127,16 @@ def _spec_config() -> MagicMock:
     return config
 
 
-def _run_state(trace: Path, markers: Path | None = None, **policy: object) -> _TracedRun:
+def _run_state(
+    trace: Path,
+    markers: Path | None = None,
+    config: object | None = None,
+    **policy: object,
+) -> _TracedRun:
     """A traced run with the policy its configure would have settled."""
     settled: dict[str, object] = {
+        "config": config if config is not None else _spec_config(),
+        "pid": os.getpid(),
         "allowlist": AllowList.empty(),
         "verbose": False,
         "report": None,
@@ -138,6 +145,25 @@ def _run_state(trace: Path, markers: Path | None = None, **policy: object) -> _T
     }
     settled.update(policy)
     return _TracedRun(trace=trace, markers=markers, canary=_CANARY, **settled)  # type: ignore[arg-type]
+
+
+def _owning_session(config: object | None = None) -> MagicMock:
+    """A session double whose config is the one the adopted run carries.
+
+    ``pytest_sessionfinish`` disowns a session that is not the one that adopted
+    the run — a nested ``pytest.main()`` inherits the module state — so the two
+    have to be the same object. Passing *config* adopts it into the run, for
+    tests that need a particular one to resolve colour or verbosity from.
+    """
+    run = pytest_plugin._RUN
+    if config is None:
+        config = run.config if run is not None else _spec_config()
+    elif run is not None:
+        run.config = config  # type: ignore[assignment]
+    session = MagicMock()
+    session.exitstatus = pytest.ExitCode.OK
+    session.config = config
+    return session
 
 
 def _traced_run(
@@ -300,10 +326,7 @@ class TestAReportFailureDoesNotSwallowTheVerdict:
     """The report is an artifact; the violations are the result."""
 
     def _session(self) -> MagicMock:
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
-        return session
+        return _owning_session()
 
     def _traced(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: Path) -> Path:
         strace_file = tmp_path / "strace.out"
@@ -1232,14 +1255,92 @@ class TestPytestSessionfinish:
         strace_file.write_text(_STRACE_EXTERNAL)
         monkeypatch.setenv(_ENV_TRACER_PID, str(os.getppid() + 100000))
         pytest_configure(_mock_config())
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert strace_file.exists(), "deleted a trace the outer run is still writing"
         assert capsys.readouterr().out == ""
         assert session.exitstatus == pytest.ExitCode.OK
+
+    def test_a_nested_in_process_pytest_does_not_touch_the_outer_runs_trace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`pytest.main()` from a test runs here and inherits the module state.
+
+        Its sessionfinish arrives long before the outer run's, and reporting on
+        — or deleting — that trace there loses the audit.
+        """
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        _traced_run(monkeypatch, strace_file)
+        nested = MagicMock()
+        nested.exitstatus = pytest.ExitCode.OK
+        nested.config = _spec_config()  # a session of its own
+
+        pytest_sessionfinish(session=nested, exitstatus=0)
+
+        assert strace_file.exists(), "deleted a trace the outer run is still writing"
+        assert capsys.readouterr().out == ""
+        assert nested.exitstatus == pytest.ExitCode.OK
+
+    def test_a_forked_process_does_not_touch_the_runs_trace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fork carries the module globals, including the run, with it."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        _traced_run(monkeypatch, strace_file)
+        session = _owning_session()
+        assert pytest_plugin._RUN is not None
+        pytest_plugin._RUN.pid = os.getpid() + 100000
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert strace_file.exists()
+        assert session.exitstatus == pytest.ExitCode.OK
+
+    def test_an_unreadable_trace_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """It is the only record of the run; `netaudit run` keeps it too."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(
+            "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0\n"
+        )
+        _traced_run(monkeypatch, strace_file)
+        session = _owning_session()
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert strace_file.exists()
+        assert "trace is kept at" in capsys.readouterr().out
+
+    def test_a_trace_without_the_canary_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text(_STRACE_EXTERNAL)
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
+        session = _owning_session()
+
+        pytest_sessionfinish(session=session, exitstatus=0)
+
+        assert strace_file.exists()
+        assert "trace is kept at" in capsys.readouterr().out
+
+    def test_an_empty_trace_is_not_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """There is nothing in it to act on."""
+        strace_file = tmp_path / "strace.out"
+        strace_file.write_text("")
+        monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
+
+        pytest_sessionfinish(session=_owning_session(), exitstatus=0)
+
+        assert not strace_file.exists()
+        assert "trace is kept at" not in capsys.readouterr().out
 
     def test_an_empty_trace_fails_the_session(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1248,8 +1349,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text("")
         monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -1263,8 +1363,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text(_STRACE_EXTERNAL)
         monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(strace_file))
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -1280,8 +1379,7 @@ class TestPytestSessionfinish:
             "1234 12:00:00.000001 connect(3, {sa_family=AF_VSOCK, cid=2, port=9}, 16) = 0\n"
         )
         _traced_run(monkeypatch, strace_file)
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -1294,8 +1392,7 @@ class TestPytestSessionfinish:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         monkeypatch.setattr(pytest_plugin, "_RUN", _run_state(tmp_path / "gone.strace"))
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -1307,9 +1404,7 @@ class TestPytestSessionfinish:
         strace_file = tmp_path / "strace.out"
         strace_file.write_text("")
         _traced_run(monkeypatch, strace_file)
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
+        session = _owning_session()
 
         pytest_sessionfinish(session=session, exitstatus=0)
 
@@ -1332,10 +1427,7 @@ class TestPytestSessionfinish:
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)  # no netaudit.yaml → builtin-only allowlist
 
-        config = _mock_config()
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = config
+        session = _owning_session(_mock_config())
         pytest_sessionfinish(session=session, exitstatus=0)
 
         out = capsys.readouterr().out
@@ -1361,10 +1453,7 @@ class TestPytestSessionfinish:
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
 
-        config = _mock_config()
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = config
+        session = _owning_session(_mock_config())
         pytest_sessionfinish(session=session, exitstatus=0)
 
         # exitstatus should NOT have been set to TESTS_FAILED
@@ -1385,9 +1474,7 @@ class TestPytestSessionfinish:
         _traced_run(monkeypatch, strace_file, markers_file)
         monkeypatch.chdir(tmp_path)
 
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert not strace_file.exists()
@@ -1405,9 +1492,7 @@ class TestPytestSessionfinish:
         _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
 
         out = capsys.readouterr().out
@@ -1592,11 +1677,7 @@ _STRACE_LOOPBACK = (
 
 class TestPytestSessionfinishVerbose:
     def _make_session(self, verbose: bool = True) -> MagicMock:
-        config = _mock_config_verbose(verbose=verbose)
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = config
-        return session
+        return _owning_session(_mock_config_verbose(verbose=verbose))
 
     def test_verbose_with_markers_shows_table_headers(
         self,
@@ -2249,10 +2330,7 @@ class TestSessionfinishWritesReport:
             return default[0] if default else None
 
         config.getoption.side_effect = _getoption
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = config
-        return session
+        return _owning_session(config)
 
     def _setup(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: Path | None = None
@@ -2359,9 +2437,7 @@ class TestSessionfinishCleanWithoutMarkers:
         _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert session.exitstatus == pytest.ExitCode.OK
@@ -2379,9 +2455,7 @@ class TestSessionfinishCleanWithoutMarkers:
         _traced_run(monkeypatch, strace_file)
         monkeypatch.chdir(tmp_path)
 
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _mock_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert not strace_file.exists()
@@ -2432,9 +2506,7 @@ class TestPolicyIsSettledBeforeTestsRun:
         self._configure(root, monkeypatch)
 
         monkeypatch.chdir(elsewhere)  # where the tests left the process
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _spec_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
 
         assert "198.51.100.1" in capsys.readouterr().out
@@ -2452,9 +2524,7 @@ class TestPolicyIsSettledBeforeTestsRun:
         pytest_plugin._RUN.markers = root / "markers"
 
         monkeypatch.chdir(elsewhere)
-        session = MagicMock()
-        session.exitstatus = pytest.ExitCode.OK
-        session.config = _spec_config()
+        session = _owning_session()
         pytest_sessionfinish(session=session, exitstatus=0)
         capsys.readouterr()
 

@@ -79,6 +79,12 @@ class _TracedRun:
     cwd, not against code that means to defeat it.
     """
 
+    config: pytest.Config
+    """The session's own config. A nested ``pytest.main()`` runs in this
+    interpreter and inherits :data:`_RUN`; its config is a different object, and
+    that is what tells the two sessions apart."""
+    pid: int
+    """The pid that adopted the run — a ``fork()`` inherits :data:`_RUN` too."""
     trace: Path
     markers: Path | None
     canary: str
@@ -554,6 +560,8 @@ def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:
     markers = _from_env(_ENV_MARKERS_OUT)
     _tempfiles.remove_on_cancel(*(p for p in (trace, markers) if p is not None))
     return _TracedRun(
+        config=config,
+        pid=os.getpid(),
         trace=trace,
         markers=markers,
         canary=f"/nonexistent/netaudit-canary-{secrets.token_hex(8)}",
@@ -563,6 +571,23 @@ def _adopt_the_traced_run(trace: Path, config: pytest.Config) -> _TracedRun:
         suggest_rules=_resolve_suggest_rules(config),
         invocation=_invocation(config),
     )
+
+
+def _keep_the_trace(path: Path, contents: str) -> bool:
+    """Keep the trace and say where it is, when there is anything in it to keep.
+
+    A trace netaudit could not judge is the only record of what the run did;
+    reporting that and then deleting it would leave nothing to act on. An empty
+    one holds nothing, so it goes — ``netaudit run`` makes the same distinction.
+
+    Returns whether it was kept, for the caller's cleanup to honour.
+    """
+    if not contents:
+        return False
+    _tempfiles.keep(path)
+    print(f"  The trace is kept at {path}")
+    print(f"  Re-run the analysis with: netaudit analyze {path}\n")
+    return True
 
 
 def _discard(path: Path | None) -> None:
@@ -834,6 +859,13 @@ def pytest_sessionfinish(
     if run is None:
         # Not the traced session: a nested pytest, or auditing was never enabled.
         return
+    if run.config is not session.config or run.pid != os.getpid():
+        # A session that inherited this module's state rather than one that
+        # adopted the run: `pytest.main()` called from a test runs in this
+        # interpreter, and a fork carries the globals with it. Either would
+        # otherwise report on — and delete — a trace that is still being
+        # written by the run it came from.
+        return
 
     strace_file = run.trace
     keep_trace = False
@@ -844,9 +876,11 @@ def pytest_sessionfinish(
         events = parser.parse_stream(trace.splitlines())
         if parser.unparsed:
             _emit_unreadable(session, parser.unparsed)
+            keep_trace = _keep_the_trace(strace_file, trace)
             return
         if not any(e.addr == run.canary for e in events):
             _emit_untraced(session)
+            keep_trace = _keep_the_trace(strace_file, trace)
             return
         events = [e for e in events if e.addr != run.canary]
 
